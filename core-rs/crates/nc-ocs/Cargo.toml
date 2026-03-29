@@ -1,0 +1,25 @@
+[package]
+name = "nc-ocs"
+description = "OCS v1/v2 envelope, format negotiation, capabilities, core OCS endpoints"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+quick-xml.workspace = true
+md-5.workspace = true
+hex.workspace = true
+
+nc-db.workspace = true
+nc-auth.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+axum-test = "16"

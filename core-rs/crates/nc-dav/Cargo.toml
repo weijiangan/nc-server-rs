@@ -1,0 +1,37 @@
+[package]
+name = "nc-dav"
+description = "DavFileSystem, DavProp, DavLockSystem — Nextcloud storage adapter for dav-server-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dav-server = "0.11"
+axum.workspace = true
+bytes.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+quick-xml.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+adler.workspace = true
+hex.workspace = true
+uuid.workspace = true
+http = "1"
+httpdate = "1"
+mime_guess = "2"
+xmltree = "0.12"
+
+nc-db.workspace = true
+nc-auth.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

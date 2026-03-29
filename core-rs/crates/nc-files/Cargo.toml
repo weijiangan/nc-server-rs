@@ -1,0 +1,27 @@
+[package]
+name = "nc-files"
+description = "Files app REST + OCS endpoints, upload flows (PUT, chunked v1/v2, bulk, ZIP)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+md-5.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+nc-db.workspace = true
+nc-auth.workspace = true
+nc-dav.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -1,0 +1,335 @@
+#![forbid(unsafe_code)]
+
+mod handlers;
+mod middleware;
+mod router;
+mod state;
+
+use std::path::PathBuf;
+
+use anyhow::Context;
+use clap::Parser;
+
+use state::AppState;
+
+#[derive(Parser, Debug)]
+#[command(name = "nc-server", about = "Nextcloud core+files Rust server")]
+struct Args {
+    /// Path to the Nextcloud installation root (contains config/config.php).
+    /// Defaults to the current working directory.
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+
+    /// Bind address.
+    #[arg(long, default_value = "0.0.0.0:7000")]
+    listen: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // ── Tracing ──────────────────────────────────────────────────────────────
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let args = Args::parse();
+
+    // ── Config ───────────────────────────────────────────────────────────────
+    let config =
+        nc_db::NcConfig::load(&args.root).context("Failed to load Nextcloud configuration")?;
+    tracing::info!(dbtype = ?config.dbtype, "Configuration loaded");
+
+    // ── Database pool ────────────────────────────────────────────────────────
+    let pool = nc_db::pool::build_pool(&config)
+        .await
+        .context("Failed to build database pool")?;
+
+    // ── Migrations ───────────────────────────────────────────────────────────
+    nc_db::migrate::run(&pool)
+        .await
+        .context("Database migration failed")?;
+
+    // ── Startup caches ───────────────────────────────────────────────────────
+    let prefix = &config.dbtableprefix;
+    let table_prefix = config.dbtableprefix.clone(); // saved before config is moved into Arc
+    let mime_cache = nc_db::mime::load_mime_cache(&pool, prefix)
+        .await
+        .context("Failed to load mime-type cache")?;
+    let appconfig_cache = nc_db::appconfig::load_appconfig_cache(&pool, prefix)
+        .await
+        .context("Failed to load app config cache")?;
+    let capability_cache = nc_ocs::load_capability_cache(&appconfig_cache);
+    let token_cache = nc_auth::new_token_cache();
+
+    {
+        let ac = appconfig_cache.read().expect("appconfig cache lock");
+        if ac.is_maintenance() {
+            tracing::warn!("Server starting in MAINTENANCE MODE");
+        }
+    }
+
+    // ── FastCGI state ────────────────────────────────────────────────────────
+    // Build FastCGI state from config (None when fastcgi_socket is absent).
+    let fastcgi = nc_fastcgi::FastCgiState::from_config(&config, &args.root);
+    if let Some(ref fpm) = fastcgi {
+        tracing::info!(socket = %fpm.socket_path.display(), "PHP-FPM proxy enabled");
+    } else {
+        tracing::info!("PHP-FPM proxy disabled (fastcgi_socket not set in config)");
+    }
+
+    // ── Route registry (Phase 7.5) ───────────────────────────────────────────
+    // Scan apps/*/appinfo/routes.php to build the list of URL prefixes that
+    // need to be registered as PHP-FPM-proxied routes.  This replaces the
+    // static `/apps/{*path}` catch-all with explicit per-app entries.
+    let php_routes = nc_fastcgi::build_route_registry(&args.root);
+
+    // ── Phase 7.7: Merge PHP-app capabilities ────────────────────────────────
+    // After FastCGI state is ready, fetch the PHP-app capability block
+    // (`files_sharing`, `text`, etc.) by making one synthetic OCS request to
+    // PHP-FPM with an admin identity, then shallow-merge it into the native
+    // capability cache so the `/ocs/.../cloud/capabilities` response is
+    // complete before the first client request arrives.
+    if let Some(ref fpm) = fastcgi {
+        let admin_uid: Option<String> = sqlx::query_scalar(
+            &format!(
+                "SELECT uid FROM {prefix}group_user WHERE gid = 'admin' LIMIT 1",
+                prefix = &table_prefix
+            ),
+        )
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten();
+
+        match admin_uid {
+            Some(ref uid) => {
+                tracing::info!(uid = %uid, "Fetching PHP-app capabilities from PHP-FPM");
+                match nc_fastcgi::fetch_php_capabilities(fpm, uid).await {
+                    Some(php_caps) => {
+                        capability_cache
+                            .write()
+                            .expect("capability cache write lock")
+                            .apply_php_capabilities(php_caps);
+                        tracing::info!("PHP-app capabilities merged into capability cache");
+                    }
+                    None => {
+                        tracing::warn!(
+                            "PHP-app capabilities fetch failed; \
+                             serving native-only authenticated capabilities"
+                        );
+                    }
+                }
+
+                // Fetch the IPublicCapability-only subset for unauthenticated requests.
+                // The PHP shim whitelists /cloud/capabilities so the guard passes
+                // without HTTP_X_NC_USER; PHP sees no session and calls
+                // getCapabilities(true) naturally.
+                match nc_fastcgi::fetch_php_public_capabilities(fpm).await {
+                    Some(php_pub_caps) => {
+                        capability_cache
+                            .write()
+                            .expect("capability cache write lock")
+                            .apply_php_public_capabilities(php_pub_caps);
+                        tracing::info!("PHP-app public (IPublicCapability) capabilities merged");
+                    }
+                    None => {
+                        tracing::warn!(
+                            "PHP-app public capabilities fetch failed; \
+                             public capabilities will be native-only"
+                        );
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "No admin user found in {prefix}group_user; \
+                     skipping PHP-app capabilities fetch",
+                    prefix = &table_prefix
+                );
+            }
+        }
+    }
+
+    let state = AppState {
+        pool,
+        mime_cache,
+        appconfig_cache,
+        capability_cache,
+        token_cache,
+        nc_config: std::sync::Arc::new(config),
+        nc_root: args.root.clone(),
+        table_prefix,
+        fastcgi,
+    };
+
+    // ── Phase 7.7: Background capability refresh ──────────────────────────────
+    // Spawn a background task that wakes every 30 seconds to reload appconfig
+    // from DB and rebuild the capability payload.  This picks up any
+    // `oc_appconfig` writes that went through PHP-FPM since startup so that
+    // capabilities stay fresh without requiring a server restart.
+    spawn_capability_refresh_task(
+        state.pool.clone(),
+        state.table_prefix.clone(),
+        state.appconfig_cache.clone(),
+        state.capability_cache.clone(),
+        state.fastcgi.clone(),
+    );
+
+    // ── Router ───────────────────────────────────────────────────────────────
+    let app = router::build(state, php_routes);
+
+    // ── Listener ─────────────────────────────────────────────────────────────
+    let listener = tokio::net::TcpListener::bind(&args.listen)
+        .await
+        .with_context(|| format!("Failed to bind to {}", args.listen))?;
+
+    tracing::info!(listen = %args.listen, "HTTP listener ready");
+
+    // ── Graceful shutdown on SIGTERM ─────────────────────────────────────────
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("HTTP server error")?;
+
+    tracing::info!("Server shut down cleanly");
+    Ok(())
+}
+
+/// Spawn a background task that periodically refreshes the capability cache
+/// (Phase 7.7 — "refresh on `oc_appconfig` writes").
+///
+/// All `oc_appconfig` writes during normal operation go through PHP-FPM, so
+/// the Rust process cannot intercept them inline.  Instead, this task wakes
+/// task that wakes every 30 seconds, reloads the whole `oc_appconfig` table from the database,
+/// rebuilds the native capability payload, and — if PHP-FPM is configured —
+/// re-fetches the PHP-app capability block from PHP-FPM and merges it.  This
+/// ensures the served `/ocs/…/cloud/capabilities` response reflects config
+/// changes (e.g. enabling an app, changing quota defaults, updating forbidden
+/// filename lists) within one refresh interval.
+fn spawn_capability_refresh_task(
+    pool: nc_db::pool::DbPool,
+    table_prefix: String,
+    appconfig_cache: nc_db::appconfig::SharedAppConfigCache,
+    capability_cache: nc_ocs::SharedCapabilityCache,
+    fastcgi: Option<nc_fastcgi::FastCgiState>,
+) {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(30); // 30 seconds
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(INTERVAL).await;
+
+            // 1. Reload appconfig from DB so PHP-FPM writes are visible.
+            if let Err(e) = nc_db::appconfig::reload_appconfig_cache(
+                &pool,
+                &table_prefix,
+                &appconfig_cache,
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "capability-refresh: failed to reload appconfig cache; skipping cycle"
+                );
+                continue;
+            }
+
+            // 2. Rebuild native capability payload from fresh appconfig,
+            //    re-merging existing PHP-app capabilities so they are not lost.
+            nc_ocs::handlers::rebuild_capability_cache(&appconfig_cache, &capability_cache).await;
+
+            // 3. If PHP-FPM is available, re-fetch the PHP-app capability block.
+            if let Some(ref fpm) = fastcgi {
+                // Re-query admin UID in case group membership changed since startup.
+                let admin_uid: Option<String> = sqlx::query_scalar(
+                    &format!(
+                        "SELECT uid FROM {p}group_user WHERE gid = 'admin' LIMIT 1",
+                        p = &table_prefix
+                    ),
+                )
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten();
+
+                match admin_uid {
+                    Some(ref uid) => {
+                        match nc_fastcgi::fetch_php_capabilities(fpm, uid).await {
+                            Some(php_caps) => {
+                                capability_cache
+                                    .write()
+                                    .expect("capability cache write lock")
+                                    .apply_php_capabilities(php_caps);
+                                tracing::debug!("capability-refresh: PHP-app authenticated capabilities updated");
+                            }
+                            None => {
+                                tracing::warn!(
+                                    "capability-refresh: PHP-app capabilities fetch failed; \
+                                     retaining existing cached PHP caps"
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            "capability-refresh: no admin user found in {p}group_user; \
+                             skipping PHP-app authenticated capabilities refresh",
+                            p = &table_prefix
+                        );
+                    }
+                }
+
+                // The public (IPublicCapability-only) fetch is unauthenticated —
+                // it does not require an admin UID and always runs independently.
+                match nc_fastcgi::fetch_php_public_capabilities(fpm).await {
+                    Some(php_pub_caps) => {
+                        capability_cache
+                            .write()
+                            .expect("capability cache write lock")
+                            .apply_php_public_capabilities(php_pub_caps);
+                        tracing::debug!("capability-refresh: PHP-app public capabilities updated");
+                    }
+                    None => {
+                        tracing::warn!(
+                            "capability-refresh: PHP-app public capabilities fetch failed; \
+                             retaining existing cached public caps"
+                        );
+                    }
+                }
+            }
+
+            tracing::debug!("capability-refresh: cycle complete");
+        }
+    });
+}
+
+/// Resolves when SIGTERM or Ctrl-C is received.
+/// Drains in-flight requests for up to 30 s (axum handles the timeout).
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let sigterm = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let sigterm = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => { tracing::info!("Received Ctrl-C, shutting down"); },
+        _ = sigterm => { tracing::info!("Received SIGTERM, shutting down"); },
+    }
+}

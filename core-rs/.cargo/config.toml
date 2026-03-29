@@ -1,0 +1,16 @@
+# Workspace-local Cargo configuration.
+#
+# The global ~/.cargo/config.toml sets `[registry] default = "artifactory"`,
+# which causes transitive dependencies of explicitly-registried crates (like
+# fastcgi-client) to be locked to `sparse+https://artifactory...` in the lock
+# file.  That creates duplicate crate identities for shared deps (tokio, etc.)
+# that also appear as `registry+https://github.com...` from the crates-io
+# source replacement path — breaking cross-boundary trait compatibility.
+#
+# Resetting the default to `crates-io` here ensures that ALL transitive deps
+# resolve through a single canonical source path.  The global
+# `[source.crates-io] replace-with = "artifactory-remote"` mapping continues
+# to serve every crate from the Artifactory mirror at fetch time.
+
+[registry]
+default = "crates-io"

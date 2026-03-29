@@ -1,0 +1,25 @@
+[package]
+name = "nc-fastcgi"
+description = "FastCGI client, route registry, PHP-FPM dispatch with identity injection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+nc-db.workspace = true
+nc-auth.workspace = true
+fastcgi-client = { workspace = true, features = ["runtime-tokio"] }
+regex-lite.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

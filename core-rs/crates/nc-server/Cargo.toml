@@ -1,0 +1,36 @@
+[package]
+name = "nc-server"
+description = "Nextcloud core+files Rust HTTP server — binary entry point"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nc-server"
+path = "src/main.rs"
+
+[features]
+default = ["sqlite"]
+postgres = ["nc-db/postgres"]
+sqlite = ["nc-db/sqlite"]
+
+[dependencies]
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+sqlx.workspace = true
+
+nc-db.workspace = true
+nc-auth.workspace = true
+nc-ocs.workspace = true
+nc-dav.workspace = true
+nc-files.workspace = true
+nc-fastcgi.workspace = true
