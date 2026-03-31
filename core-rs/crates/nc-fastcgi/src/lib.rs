@@ -73,13 +73,27 @@ pub struct FastCgiState {
 impl FastCgiState {
     /// Construct from `NcConfig` and the server's installation root.
     ///
-    /// Returns `None` when `fastcgi_socket` is absent in `config.php`.
+    /// Uses `NC_FASTCGI_SOCKET` and `NC_PHP_SHIM` environment variables as
+    /// defaults if `config.php` doesn't specify them.
+    ///
+    /// Returns `None` when no socket is configured.
     pub fn from_config(config: &NcConfig, nc_root: &Path) -> Option<Self> {
-        config.fastcgi_socket.as_ref().map(|path| Self {
-            socket_path: path.clone(),
+        let socket_path = config.fastcgi_socket.clone().or_else(|| {
+            std::env::var("NC_FASTCGI_SOCKET")
+                .ok()
+                .map(PathBuf::from)
+        })?;
+
+        let shim_path = std::env::var("NC_PHP_SHIM")
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| nc_root.join("core-rs/php-shim/index.php"));
+
+        Some(Self {
+            socket_path,
             timeout_ms: config.fastcgi_timeout_ms,
             nc_root: nc_root.to_path_buf(),
-            shim_path: nc_root.join("core-rs/php-shim/index.php"),
+            shim_path,
         })
     }
 }
@@ -142,6 +156,7 @@ pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> R
     let content_length = header_str(&parts.headers, header::CONTENT_LENGTH);
 
     // ── 5. Build FastCGI params ───────────────────────────────────────────────
+    let document_root = fpm.nc_root.to_string_lossy().to_string();
     let mut params: fastcgi_client::Params<'static> = fastcgi_client::Params::default()
         .gateway_interface("CGI/1.1")
         .server_software("nc-server/0.1")
@@ -149,6 +164,7 @@ pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> R
         .request_method(method)
         .script_filename(shim_path_str)
         .custom("NC_ORIGINAL_SCRIPT", nc_original_script)
+        .custom("DOCUMENT_ROOT", document_root)
         .custom("SCRIPT_NAME", script_rel_owned)
         .custom("REQUEST_URI", request_uri)
         .custom("QUERY_STRING", query_string)
@@ -705,6 +721,7 @@ pub async fn fetch_php_capabilities(
 
     let shim_path = fpm.shim_path.to_string_lossy().into_owned();
     let nc_original = fpm.nc_root.join("ocs/v2.php").to_string_lossy().into_owned();
+    let document_root = fpm.nc_root.to_string_lossy().into_owned();
 
     // OCS-APIREQUEST bypasses CSRF; format=json for easy parsing.
     let params = fastcgi_client::Params::default()
@@ -714,6 +731,7 @@ pub async fn fetch_php_capabilities(
         .request_method("GET")
         .script_filename(shim_path)
         .custom("NC_ORIGINAL_SCRIPT", nc_original)
+        .custom("DOCUMENT_ROOT", document_root)
         .custom("SCRIPT_NAME", "/ocs/v2.php")
         .custom("REQUEST_URI", "/ocs/v2.php/cloud/capabilities?format=json")
         .custom("QUERY_STRING", "format=json")
@@ -848,6 +866,7 @@ pub async fn fetch_php_public_capabilities(
 
     let shim_path = fpm.shim_path.to_string_lossy().into_owned();
     let nc_original = fpm.nc_root.join("ocs/v2.php").to_string_lossy().into_owned();
+    let document_root = fpm.nc_root.to_string_lossy().into_owned();
 
     // No HTTP_X_NC_USER — shim whitelists this path and PHP sees no session.
     let params = fastcgi_client::Params::default()
@@ -857,6 +876,7 @@ pub async fn fetch_php_public_capabilities(
         .request_method("GET")
         .script_filename(shim_path)
         .custom("NC_ORIGINAL_SCRIPT", nc_original)
+        .custom("DOCUMENT_ROOT", document_root)
         .custom("SCRIPT_NAME", "/ocs/v2.php")
         .custom("REQUEST_URI", "/ocs/v2.php/cloud/capabilities?format=json")
         .custom("QUERY_STRING", "format=json")

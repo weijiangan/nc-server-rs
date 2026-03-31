@@ -41,9 +41,14 @@ declare(strict_types=1);
 $_NC_IS_AUTHENTICATED = reject_unauthenticated_shim_request();
 
 // ── Locate Nextcloud SERVERROOT ───────────────────────────────────────────────
-// Shim lives at {NC_ROOT}/core-rs/php-shim/index.php, so NC_ROOT is two
-// dirname() levels up.
-$_NC_ROOT = dirname(__DIR__, 2);
+// The shim can be deployed in two ways:
+// 1. Inside NC root at core-rs/php-shim/index.php (development)
+// 2. In a separate location like /usr/local/share/nc-server/php-shim/index.php (Docker)
+//
+// The Rust proxy passes DOCUMENT_ROOT as the Nextcloud root directory.
+// Fall back to NC_ORIGINAL_SCRIPT or dirname(__DIR__, 2) if not available.
+$_NC_ROOT = $_SERVER['DOCUMENT_ROOT'] 
+    ?? (!empty($_SERVER['NC_ORIGINAL_SCRIPT']) ? dirname(dirname($_SERVER['NC_ORIGINAL_SCRIPT'])) : dirname(__DIR__, 2));
 
 // ── Load the Nextcloud framework ──────────────────────────────────────────────
 // versioncheck.php only outputs a friendly error if PHP is too old, then dies.

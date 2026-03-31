@@ -128,6 +128,33 @@ impl NcConfig {
     pub fn load(base_dir: &Path) -> anyhow::Result<Self> {
         let php_path = base_dir.join("config/config.php");
         if php_path.exists() {
+            // Use PHP CLI to convert config to JSON for reliable parsing
+            // We read the file and extract just the $CONFIG array assignment
+            let abs_path = php_path.canonicalize()?;
+            let json_output = std::process::Command::new("php")
+                .arg("-r")
+                .arg(format!(
+                    r#"
+                    $CONFIG = [];
+                    include '{}';
+                    // Remove internal fields that shouldn't be serialized
+                    unset($CONFIG['composerAutoloader']);
+                    echo json_encode($CONFIG);
+                    "#,
+                    abs_path.display()
+                ))
+                .output();
+
+            if let Ok(output) = json_output {
+                if output.status.success() {
+                    let json_str = String::from_utf8_lossy(&output.stdout);
+                    return Ok(serde_json::from_str(&json_str)?);
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!("PHP config parse failed: {}", stderr);
+            }
+
+            // Fallback to manual parsing if PHP CLI fails
             let src = std::fs::read_to_string(&php_path)?;
             return Self::from_php_config(&src)
                 .ok_or_else(|| anyhow::anyhow!("Failed to parse {}", php_path.display()));
