@@ -48,6 +48,8 @@ async fn main() -> anyhow::Result<()> {
         .context("Failed to build database pool")?;
 
     // ── Migrations ───────────────────────────────────────────────────────────
+    // Currently a no-op: sqlx migrations are disabled because PHP owns the
+    // schema (see SPECS/IMPROVEMENTS.md §I.3 and nc_db::migrate::run docs).
     nc_db::migrate::run(&pool)
         .await
         .context("Database migration failed")?;
@@ -93,12 +95,10 @@ async fn main() -> anyhow::Result<()> {
     // capability cache so the `/ocs/.../cloud/capabilities` response is
     // complete before the first client request arrives.
     if let Some(ref fpm) = fastcgi {
-        let admin_uid: Option<String> = sqlx::query_scalar(
-            &format!(
-                "SELECT uid FROM {prefix}group_user WHERE gid = 'admin' LIMIT 1",
-                prefix = &table_prefix
-            ),
-        )
+        let admin_uid: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT uid FROM {prefix}group_user WHERE gid = 'admin' LIMIT 1",
+            prefix = &table_prefix
+        ))
         .fetch_optional(&pool)
         .await
         .ok()
@@ -153,6 +153,21 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Resolve instanceid before config is moved into the Arc (§7.9.1).
+    // On an installed Nextcloud this is always present; the empty-string
+    // fallback is safe for pre-install / test states where no session
+    // cookie matching is needed.
+    let instanceid = config.instanceid.clone().unwrap_or_default();
+
+    // ── Phase 7.9.5: Session identity cache ───────────────────────────────────
+    // Only allocated when PHP-FPM is configured — without a FastCGI backend
+    // there is no `__session_resolve` to call and no session cookies to cache.
+    let session_cache: Option<nc_auth::SharedSessionCache> = if fastcgi.is_some() {
+        Some(nc_auth::new_session_cache())
+    } else {
+        None
+    };
+
     let state = AppState {
         pool,
         mime_cache,
@@ -163,6 +178,8 @@ async fn main() -> anyhow::Result<()> {
         nc_root: args.root.clone(),
         table_prefix,
         fastcgi,
+        instanceid,
+        session_cache,
     };
 
     // ── Phase 7.7: Background capability refresh ──────────────────────────────
@@ -177,6 +194,12 @@ async fn main() -> anyhow::Result<()> {
         state.capability_cache.clone(),
         state.fastcgi.clone(),
     );
+
+    // ── Phase 7.9.5: Session cache eviction task ──────────────────────────────
+    // Periodically remove expired entries so the map doesn't grow unboundedly.
+    if let Some(ref sc) = state.session_cache {
+        spawn_session_cache_eviction_task(sc.clone());
+    }
 
     // ── Router ───────────────────────────────────────────────────────────────
     let app = router::build(state, php_routes);
@@ -223,12 +246,9 @@ fn spawn_capability_refresh_task(
             tokio::time::sleep(INTERVAL).await;
 
             // 1. Reload appconfig from DB so PHP-FPM writes are visible.
-            if let Err(e) = nc_db::appconfig::reload_appconfig_cache(
-                &pool,
-                &table_prefix,
-                &appconfig_cache,
-            )
-            .await
+            if let Err(e) =
+                nc_db::appconfig::reload_appconfig_cache(&pool, &table_prefix, &appconfig_cache)
+                    .await
             {
                 tracing::warn!(
                     error = %e,
@@ -244,12 +264,10 @@ fn spawn_capability_refresh_task(
             // 3. If PHP-FPM is available, re-fetch the PHP-app capability block.
             if let Some(ref fpm) = fastcgi {
                 // Re-query admin UID in case group membership changed since startup.
-                let admin_uid: Option<String> = sqlx::query_scalar(
-                    &format!(
-                        "SELECT uid FROM {p}group_user WHERE gid = 'admin' LIMIT 1",
-                        p = &table_prefix
-                    ),
-                )
+                let admin_uid: Option<String> = sqlx::query_scalar(&format!(
+                    "SELECT uid FROM {p}group_user WHERE gid = 'admin' LIMIT 1",
+                    p = &table_prefix
+                ))
                 .fetch_optional(&pool)
                 .await
                 .ok()
@@ -302,6 +320,34 @@ fn spawn_capability_refresh_task(
             }
 
             tracing::debug!("capability-refresh: cycle complete");
+        }
+    });
+}
+
+/// Spawn a background task that periodically evicts expired entries from the
+/// session identity cache (Phase 7.9.5).
+///
+/// Runs every [`nc_auth::SESSION_CACHE_EVICT_INTERVAL`] (5 minutes).
+/// Each eviction pass calls [`nc_auth::cache_evict_expired`] which removes all
+/// entries whose `inserted_at` age exceeds [`nc_auth::SESSION_CACHE_TTL`] (60 s).
+///
+/// This prevents unbounded growth: a warm Nextcloud instance may accumulate one
+/// entry per active browser session, and without periodic eviction those entries
+/// would never be freed.
+fn spawn_session_cache_eviction_task(cache: nc_auth::SharedSessionCache) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(nc_auth::SESSION_CACHE_EVICT_INTERVAL).await;
+            let before = cache.len();
+            nc_auth::cache_evict_expired(&cache);
+            let after = cache.len();
+            if before > after {
+                tracing::debug!(
+                    removed = before - after,
+                    remaining = after,
+                    "session-cache: evicted expired entries"
+                );
+            }
         }
     });
 }

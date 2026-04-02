@@ -7,7 +7,7 @@ use std::{
 /// Maximum age of a token cache entry before it is considered stale.
 pub const TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
 
-/// SHA-512 / HMAC-SHA512 digest of the raw bearer token string (64 bytes).
+/// SHA-512 digest of the raw bearer token string, optionally concatenated with app_secret (64 bytes).
 pub type TokenHash = [u8; 64];
 
 /// In-process hot cache keyed on the token hash.

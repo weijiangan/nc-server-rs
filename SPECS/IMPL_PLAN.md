@@ -141,6 +141,7 @@ The Rust server must be able to both connect to an existing Nextcloud DB and cre
 	- Basic/session auth semantics (including CSRF rules: POST **always** requires CSRF check, even when DAV-authenticated).
 	- Bearer token auth semantics: on failure return 401 with **no `WWW-Authenticate`** header (exception: send challenge for `mirall` UA when `oauth2.enable_oc_clients = true`).
 	- Brute-force throttling and 429 behavior.
+	- **Session cookie → uid resolution (requires Phase 7 FastCGI):** when no `Authorization` header is present but the `{instanceid}` cookie (PHP session cookie — named after `config.php`'s `instanceid`, NOT `nc_session_id`) or `nc_token` cookie exists, resolve the session to a uid via a FastCGI call to PHP. The `__session_resolve` shim endpoint bootstraps OC normally (session resumes from `{instanceid}` cookie), calls `OC::handleLogin()` which runs `tryTokenLogin()` (looks up PHP session ID in `oc_authtoken`) and `loginWithCookie()` (validates `nc_token` against `oc_preferences`). Cache results keyed on `SHA-256({instanceid}_cookie_value)` with 60-second TTL. For DAV routes, check `AUTHENTICATED_TO_DAV_BACKEND` — a **UID string** in `$_SESSION` (not a boolean; `Auth.php:91`) — per the 3-way check in `Auth.php:185-192`. SameSite strict cookie failure returns **412 Precondition Failed** (not 401 — `base.php:596`). The existing `session.rs` hardcodes `nc_session_id` as the trigger cookie name — must be fixed to use `{instanceid}` (§7.9.5). See PHASE-7.md §7.9 for full specification. This is the auth path used by the web browser Files app.
 4. Implement the auth token hot cache — this is the highest-impact single cache in the system:
 	- Structure: `Arc<RwLock<HashMap<[u8; 64], CachedToken>>>` keyed on the SHA-512 of the bearer value.
 	- `CachedToken` holds: `uid`, `type`, `scope`, `expires`, `last_activity`, cached-at timestamp.
@@ -293,7 +294,9 @@ Rust is the sole HTTP server. For routes registered by Nextcloud apps (`files_sh
    - Document clearly: the FastCGI socket must never be exposed to the network or to untrusted local processes.
 4. Build a route registry: on startup Rust scans `apps/*/appinfo/routes.php` (or a pre-generated manifest) and registers which URL prefixes map to PHP-FPM vs native Rust handlers.
 5. For PHP-FPM-dispatched requests: forward original headers + body, inject `HTTP_X_NC_USER`, `HTTP_X_NC_SESSION_TOKEN`, return PHP response verbatim.
-6. Apps that need rewriting in Rust (to be decided): replace their PHP-FPM entry with a native Rust handler registered under the same route prefix.
+6. Implement a `__session_resolve` internal FastCGI endpoint in the PHP shim: receives the full `Cookie:` header via `HTTP_COOKIE` FastCGI param, bootstraps OC (`require base.php` → `OC::init()` resumes the PHP session from the `{instanceid}` cookie), calls `OC::handleLogin()` to resolve identity via the same auth chain PHP uses (`tryTokenLogin` → `loginWithCookie` → `tryBasicAuthLogin`), returns `{uid, dav_authenticated_uid}` as JSON plus any `Set-Cookie` headers from token rotation. See PHASE-7.md §7.9 for full specification.
+7. Fix token hash: PHP uses `hash('sha512', $token . $secret)` (concatenation, `PublicKeyTokenProvider.php:414`), Rust uses `HMAC-SHA512(secret, token)` (different output). Replace `hmac_hash` in `bearer.rs` with concatenation hash. See PHASE-7.md §7.10.
+8. Apps that need rewriting in Rust (to be decided): replace their PHP-FPM entry with a native Rust handler registered under the same route prefix.
 
 ### What stays in PHP-FPM (no rewrite needed)
 - `files_sharing` OCS share/sharees API

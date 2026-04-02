@@ -45,8 +45,8 @@ use std::task::{Context, Poll};
 
 use axum::{body::Body, response::Response};
 use bytes::{Bytes, BytesMut};
-use fastcgi_client::StreamExt as _;          // brings .next() onto ResponseStream
 use fastcgi_client::response::{Content, ResponseStream};
+use fastcgi_client::StreamExt as _; // brings .next() onto ResponseStream
 use futures::Stream;
 use nc_db::config::NcConfig;
 use tokio_util::io::StreamReader;
@@ -66,23 +66,28 @@ pub struct FastCgiState {
     /// Nextcloud installation root (parent of `config/`, `apps/`, etc.).
     pub nc_root: PathBuf,
     /// Absolute path to the PHP bootstrap shim invoked for every proxied
-    /// request: `{nc_root}/core-rs/php-shim/index.php`.
+    /// request.  Defaults to `{nc_root}/core-rs/php-shim/index.php` (in-tree
+    /// development layout).  Override with the `NC_PHP_SHIM` environment
+    /// variable for deployments where the shim lives outside the NC root
+    /// (e.g. Docker: `/usr/local/share/nc-server/php-shim/index.php`).
     pub shim_path: PathBuf,
 }
 
 impl FastCgiState {
     /// Construct from `NcConfig` and the server's installation root.
     ///
-    /// Uses `NC_FASTCGI_SOCKET` and `NC_PHP_SHIM` environment variables as
-    /// defaults if `config.php` doesn't specify them.
+    /// `fastcgi_socket` in `config.php` takes priority over the
+    /// `NC_FASTCGI_SOCKET` environment variable for the socket path.
+    /// The shim path is resolved from `NC_PHP_SHIM` first (deployment-time
+    /// override for Docker / out-of-tree installs), falling back to
+    /// `{nc_root}/core-rs/php-shim/index.php` for the in-tree dev layout.
     ///
     /// Returns `None` when no socket is configured.
     pub fn from_config(config: &NcConfig, nc_root: &Path) -> Option<Self> {
-        let socket_path = config.fastcgi_socket.clone().or_else(|| {
-            std::env::var("NC_FASTCGI_SOCKET")
-                .ok()
-                .map(PathBuf::from)
-        })?;
+        let socket_path = config
+            .fastcgi_socket
+            .clone()
+            .or_else(|| std::env::var("NC_FASTCGI_SOCKET").ok().map(PathBuf::from))?;
 
         let shim_path = std::env::var("NC_PHP_SHIM")
             .ok()
@@ -164,7 +169,7 @@ pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> R
         .request_method(method)
         .script_filename(shim_path_str)
         .custom("NC_ORIGINAL_SCRIPT", nc_original_script)
-        .custom("DOCUMENT_ROOT", document_root)
+        .custom("NC_ROOT", document_root)
         .custom("SCRIPT_NAME", script_rel_owned)
         .custom("REQUEST_URI", request_uri)
         .custom("QUERY_STRING", query_string)
@@ -232,38 +237,39 @@ pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> R
     // uploads are served natively by the DAV layer.  64 MiB cap matches a
     // generous OCS/REST payload; POST bodies larger than this return 413.
     const MAX_BODY: usize = 64 * 1024 * 1024; // 64 MiB
-    let body_bytes: Bytes =
-        match axum::body::to_bytes(body, MAX_BODY).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "fastcgi: failed to read request body");
-                return error_response(502, "Failed to read request body\n");
-            }
-        };
+    let body_bytes: Bytes = match axum::body::to_bytes(body, MAX_BODY).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "fastcgi: failed to read request body");
+            return error_response(502, "Failed to read request body\n");
+        }
+    };
 
     // ── 9. Open Unix socket ───────────────────────────────────────────────────
     let timeout = std::time::Duration::from_millis(fpm.timeout_ms);
-    let stream =
-        match tokio::time::timeout(timeout, tokio::net::UnixStream::connect(&fpm.socket_path))
-            .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    socket = %fpm.socket_path.display(),
-                    error = %e,
-                    "fastcgi: PHP-FPM socket unavailable"
-                );
-                return error_response(502, "PHP-FPM unavailable\n");
-            }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    socket = %fpm.socket_path.display(),
-                    "fastcgi: timed out connecting to PHP-FPM"
-                );
-                return error_response(504, "PHP-FPM gateway timeout\n");
-            }
-        };
+    let stream = match tokio::time::timeout(
+        timeout,
+        tokio::net::UnixStream::connect(&fpm.socket_path),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                socket = %fpm.socket_path.display(),
+                error = %e,
+                "fastcgi: PHP-FPM socket unavailable"
+            );
+            return error_response(502, "PHP-FPM unavailable\n");
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                socket = %fpm.socket_path.display(),
+                "fastcgi: timed out connecting to PHP-FPM"
+            );
+            return error_response(504, "PHP-FPM gateway timeout\n");
+        }
+    };
 
     // ── 10. Build and execute FastCGI request (streaming) ─────────────────────
     //
@@ -271,9 +277,10 @@ pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> R
     // provides the `tokio::io::AsyncRead` that `Request::new_tokio` expects
     // for stdin.  The body is already fully buffered (step 8) so this is a
     // zero-copy hand-off.
-    let stdin = StreamReader::new(futures::stream::once(std::future::ready(
-        Ok::<Bytes, std::io::Error>(body_bytes),
-    )));
+    let stdin = StreamReader::new(futures::stream::once(std::future::ready(Ok::<
+        Bytes,
+        std::io::Error,
+    >(body_bytes))));
     let client = fastcgi_client::Client::new_tokio(stream);
     let fcgi_req = fastcgi_client::Request::new_tokio(params, stdin);
 
@@ -405,7 +412,14 @@ impl<S: fastcgi_client::io::AsyncRead + Unpin> Stream for CgiBodyStream<S> {
 /// separator is not found before the stream ends.
 async fn parse_streaming_headers<S>(
     mut stream: ResponseStream<S>,
-) -> Result<(axum::http::StatusCode, Vec<(String, String)>, CgiBodyStream<S>), Response>
+) -> Result<
+    (
+        axum::http::StatusCode,
+        Vec<(String, String)>,
+        CgiBodyStream<S>,
+    ),
+    Response,
+>
 where
     S: fastcgi_client::io::AsyncRead + Unpin,
 {
@@ -426,7 +440,14 @@ where
                     let (status, headers) = parse_cgi_header_block(&header_bytes)
                         .map_err(|_| error_response(502, "Invalid CGI headers from PHP-FPM\n"))?;
 
-                    return Ok((status, headers, CgiBodyStream { prefix: body_prefix, inner: stream }));
+                    return Ok((
+                        status,
+                        headers,
+                        CgiBodyStream {
+                            prefix: body_prefix,
+                            inner: stream,
+                        },
+                    ));
                 }
                 // Separator not yet in buffer — keep reading.
             }
@@ -444,7 +465,15 @@ where
             }
             None => {
                 // Stream ended before we found a complete header block.
-                return Err(error_response(502, "FastCGI response missing header separator\n"));
+                tracing::warn!(
+                    accum_len = header_accum.len(),
+                    accum_preview = %String::from_utf8_lossy(&header_accum[..header_accum.len().min(500)]),
+                    "fastcgi: PHP-FPM stream ended without header separator (\\r\\n\\r\\n)"
+                );
+                return Err(error_response(
+                    502,
+                    "FastCGI response missing header separator\n",
+                ));
             }
         }
     }
@@ -513,7 +542,13 @@ fn parse_cgi_response(stdout: Vec<u8>) -> Response {
 ///
 /// The `Status:` pseudo-header is consumed and not included in the returned
 /// header list.  All other headers are forwarded verbatim to the HTTP response.
-fn parse_cgi_header_block(header_bytes: &[u8]) -> Result<(axum::http::StatusCode, Vec<(String, String)>), ()> {
+///
+/// Splits on the first `:` in each line (per RFC 3875 §6.3 / RFC 9110 §5.1)
+/// and trims optional whitespace from the value.  This handles both
+/// `Name: Value` and `Name:Value` forms that PHP-FPM may emit.
+fn parse_cgi_header_block(
+    header_bytes: &[u8],
+) -> Result<(axum::http::StatusCode, Vec<(String, String)>), ()> {
     let mut status = axum::http::StatusCode::OK;
     let mut headers = Vec::new();
 
@@ -631,7 +666,10 @@ pub fn build_route_registry(nc_root: &Path) -> Vec<RouteEntry> {
     for app in &app_names {
         let base = format!("/apps/{}", app);
         if seen.insert(base.clone()) {
-            entries.push(RouteEntry { base, app: app.clone() });
+            entries.push(RouteEntry {
+                base,
+                app: app.clone(),
+            });
         }
     }
 
@@ -678,7 +716,10 @@ pub fn build_route_registry(nc_root: &Path) -> Vec<RouteEntry> {
                             base = %base,
                             "route-registry: root-level route prefix"
                         );
-                        entries.push(RouteEntry { base, app: app.clone() });
+                        entries.push(RouteEntry {
+                            base,
+                            app: app.clone(),
+                        });
                     }
                 }
             }
@@ -729,7 +770,11 @@ pub async fn fetch_php_capabilities(
     };
 
     let shim_path = fpm.shim_path.to_string_lossy().into_owned();
-    let nc_original = fpm.nc_root.join("ocs/v2.php").to_string_lossy().into_owned();
+    let nc_original = fpm
+        .nc_root
+        .join("ocs/v2.php")
+        .to_string_lossy()
+        .into_owned();
     let document_root = fpm.nc_root.to_string_lossy().into_owned();
 
     // OCS-APIREQUEST bypasses CSRF; format=json for easy parsing.
@@ -740,7 +785,7 @@ pub async fn fetch_php_capabilities(
         .request_method("GET")
         .script_filename(shim_path)
         .custom("NC_ORIGINAL_SCRIPT", nc_original)
-        .custom("DOCUMENT_ROOT", document_root)
+        .custom("NC_ROOT", document_root)
         .custom("SCRIPT_NAME", "/ocs/v2.php")
         .custom("REQUEST_URI", "/ocs/v2.php/cloud/capabilities?format=json")
         .custom("QUERY_STRING", "format=json")
@@ -753,29 +798,28 @@ pub async fn fetch_php_capabilities(
         .custom("HTTP_X_NC_IS_ADMIN", "1")
         .custom("HTTP_X_NC_PROXIED", "1"); // proxy trust marker required by shim (§7.3/§7.8)
 
-    let stdin = StreamReader::new(futures::stream::once(std::future::ready(
-        Ok::<Bytes, std::io::Error>(Bytes::new()),
-    )));
+    let stdin = StreamReader::new(futures::stream::once(std::future::ready(Ok::<
+        Bytes,
+        std::io::Error,
+    >(
+        Bytes::new()
+    ))));
     let client = fastcgi_client::Client::new_tokio(stream);
     let fcgi_req = fastcgi_client::Request::new_tokio(params, stdin);
 
     // ── Execute ────────────────────────────────────────────────────────────
-    let mut response_stream = match tokio::time::timeout(
-        timeout,
-        client.execute_once_stream(fcgi_req),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "capabilities-fetch: FastCGI execution failed");
-            return None;
-        }
-        Err(_) => {
-            tracing::warn!("capabilities-fetch: timed out waiting for PHP-FPM response");
-            return None;
-        }
-    };
+    let mut response_stream =
+        match tokio::time::timeout(timeout, client.execute_once_stream(fcgi_req)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "capabilities-fetch: FastCGI execution failed");
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!("capabilities-fetch: timed out waiting for PHP-FPM response");
+                return None;
+            }
+        };
 
     // ── Collect full response ──────────────────────────────────────────────
     let mut full_output = BytesMut::new();
@@ -850,9 +894,7 @@ pub async fn fetch_php_capabilities(
 ///
 /// Returns `None` on any failure (socket unavailable, PHP error, JSON parse
 /// failure).  The caller falls back to native-only public capabilities silently.
-pub async fn fetch_php_public_capabilities(
-    fpm: &FastCgiState,
-) -> Option<serde_json::Value> {
+pub async fn fetch_php_public_capabilities(fpm: &FastCgiState) -> Option<serde_json::Value> {
     let timeout = std::time::Duration::from_millis(fpm.timeout_ms);
 
     // ── Connect ────────────────────────────────────────────────────────────
@@ -874,7 +916,11 @@ pub async fn fetch_php_public_capabilities(
     };
 
     let shim_path = fpm.shim_path.to_string_lossy().into_owned();
-    let nc_original = fpm.nc_root.join("ocs/v2.php").to_string_lossy().into_owned();
+    let nc_original = fpm
+        .nc_root
+        .join("ocs/v2.php")
+        .to_string_lossy()
+        .into_owned();
     let document_root = fpm.nc_root.to_string_lossy().into_owned();
 
     // No HTTP_X_NC_USER — shim whitelists this path and PHP sees no session.
@@ -885,7 +931,7 @@ pub async fn fetch_php_public_capabilities(
         .request_method("GET")
         .script_filename(shim_path)
         .custom("NC_ORIGINAL_SCRIPT", nc_original)
-        .custom("DOCUMENT_ROOT", document_root)
+        .custom("NC_ROOT", document_root)
         .custom("SCRIPT_NAME", "/ocs/v2.php")
         .custom("REQUEST_URI", "/ocs/v2.php/cloud/capabilities?format=json")
         .custom("QUERY_STRING", "format=json")
@@ -895,32 +941,31 @@ pub async fn fetch_php_public_capabilities(
         .custom("HTTP_OCS_APIREQUEST", "true")
         .custom("HTTP_ACCEPT", "application/json")
         .custom("HTTP_X_NC_PROXIED", "1"); // proxy trust marker required by shim (§7.3/§7.8)
-    // Deliberately omit HTTP_X_NC_USER and HTTP_X_NC_IS_ADMIN so PHP receives
-    // an unauthenticated context and calls getCapabilities(true).
+                                           // Deliberately omit HTTP_X_NC_USER and HTTP_X_NC_IS_ADMIN so PHP receives
+                                           // an unauthenticated context and calls getCapabilities(true).
 
-    let stdin = StreamReader::new(futures::stream::once(std::future::ready(
-        Ok::<Bytes, std::io::Error>(Bytes::new()),
-    )));
+    let stdin = StreamReader::new(futures::stream::once(std::future::ready(Ok::<
+        Bytes,
+        std::io::Error,
+    >(
+        Bytes::new()
+    ))));
     let client = fastcgi_client::Client::new_tokio(stream);
     let fcgi_req = fastcgi_client::Request::new_tokio(params, stdin);
 
     // ── Execute ────────────────────────────────────────────────────────────
-    let mut response_stream = match tokio::time::timeout(
-        timeout,
-        client.execute_once_stream(fcgi_req),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "public-caps-fetch: FastCGI execution failed");
-            return None;
-        }
-        Err(_) => {
-            tracing::warn!("public-caps-fetch: timed out waiting for PHP-FPM response");
-            return None;
-        }
-    };
+    let mut response_stream =
+        match tokio::time::timeout(timeout, client.execute_once_stream(fcgi_req)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "public-caps-fetch: FastCGI execution failed");
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!("public-caps-fetch: timed out waiting for PHP-FPM response");
+                return None;
+            }
+        };
 
     // ── Collect full response ──────────────────────────────────────────────
     let mut full_output = BytesMut::new();
@@ -976,6 +1021,250 @@ pub async fn fetch_php_public_capabilities(
     }
 
     caps
+}
+
+// ── session_resolver ──────────────────────────────────────────────────────────
+
+/// Resolve a PHP session to a user identity via the `__session_resolve`
+/// endpoint in the PHP bootstrap shim (§7.9.3 / §7.9.4).
+///
+/// # Purpose
+///
+/// When both `Authorization: Basic` and `Authorization: Bearer` headers are
+/// absent, native Rust routes return `401`.  This breaks the web UI: after a
+/// user logs in via the PHP login flow, subsequent browser requests carry only
+/// cookies — no `Authorization` header.
+///
+/// This function allows the Rust auth middleware to resolve a session cookie to
+/// a `SessionIdentity` (uid + `AUTHENTICATED_TO_DAV_BACKEND`) by asking PHP
+/// to run its own `OC::handleLogin()` chain.
+///
+/// # FastCGI request built
+///
+/// ```text
+/// NC_ORIGINAL_SCRIPT  = "__session_resolve"
+/// HTTP_COOKIE         = {raw_cookie_header}   (raw Cookie: header forwarded as-is)
+/// HTTP_X_NC_PROXIED   = "1"                   (proxy trust marker — no HTTP_X_NC_USER)
+/// REQUEST_METHOD      = "GET"
+/// REQUEST_URI         = "/__session_resolve"
+/// SCRIPT_FILENAME     = {shim_path}
+/// CONTENT_TYPE        = ""
+/// CONTENT_LENGTH      = "0"
+/// QUERY_STRING        = ""
+/// ```
+///
+/// The shim intercepts `NC_ORIGINAL_SCRIPT == "__session_resolve"` before any
+/// other handling and runs the full PHP auth chain from cookies.
+///
+/// # Response
+///
+/// The shim emits:
+/// - `Content-Type: application/json; charset=UTF-8`
+/// - JSON body: `{"uid":"alice","dav_authenticated_uid":"alice"}` or
+///   `{"uid":null}` when no auth path succeeded.
+/// - `Set-Cookie` headers when the remember-me path rotated `nc_token`.
+///
+/// # Return value
+///
+/// Returns `Some(SessionResolveResult)` on success (uid is non-null in the
+/// JSON).  Returns `None` on any error: timeout, socket unavailable, invalid
+/// JSON, `uid: null` (unauthenticated), unexpected status code, etc.
+///
+/// # Timeout
+///
+/// A fixed **5-second** timeout is applied (separate from `fpm.timeout_ms`)
+/// because this function is called on the hot path of every browser request
+/// that hits a native Rust DAV/OCS route without an `Authorization` header.
+pub async fn resolve_session(
+    fpm: &FastCgiState,
+    raw_cookie_header: &str,
+) -> Option<nc_auth::SessionResolveResult> {
+    const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // ── Connect ────────────────────────────────────────────────────────────
+    let stream = match tokio::time::timeout(
+        RESOLVE_TIMEOUT,
+        tokio::net::UnixStream::connect(&fpm.socket_path),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "session-resolve: PHP-FPM socket unavailable");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("session-resolve: timed out connecting to PHP-FPM");
+            return None;
+        }
+    };
+
+    let shim_path = fpm.shim_path.to_string_lossy().into_owned();
+
+    // Build minimal CGI params per §7.9.4 spec.
+    //
+    // Key points:
+    //   - NC_ORIGINAL_SCRIPT = "__session_resolve" so the shim intercepts
+    //     before its normal security gate (no HTTP_X_NC_USER injected).
+    //   - HTTP_COOKIE carries the raw Cookie: header so the shim's manual
+    //     $_COOKIE parsing picks up the {instanceid} session cookie,
+    //     oc_sessionPassphrase, nc_username, nc_token, nc_session_id, and
+    //     all SameSite guard cookies.
+    //   - HTTP_X_NC_PROXIED=1 is the trust marker; the shim's
+    //     session_resolve_handler() checks this first and returns 403 without
+    //     it.  HTTP_X_NC_USER is intentionally absent — this endpoint's whole
+    //     purpose is to resolve an unauthenticated-looking request.
+    //   - SCRIPT_FILENAME points to the shim, not index.php.
+    let document_root = fpm.nc_root.to_string_lossy().into_owned();
+
+    let params = fastcgi_client::Params::default()
+        .gateway_interface("CGI/1.1")
+        .server_software("nc-server/0.1")
+        .server_protocol("HTTP/1.1")
+        .request_method("GET")
+        .script_filename(shim_path)
+        .custom("NC_ORIGINAL_SCRIPT", "__session_resolve")
+        .custom("SCRIPT_NAME", "/__session_resolve")
+        .custom("REQUEST_URI", "/__session_resolve")
+        .custom("QUERY_STRING", "")
+        .custom("CONTENT_TYPE", "")
+        .custom("CONTENT_LENGTH", "0")
+        .custom("PATH_INFO", "")
+        .custom("NC_ROOT", document_root)
+        .custom("HTTP_COOKIE", raw_cookie_header.to_owned())
+        .custom("HTTP_X_NC_PROXIED", "1");
+    // Deliberately omit HTTP_X_NC_USER — the shim resolves identity from cookies.
+
+    let stdin = StreamReader::new(futures::stream::once(std::future::ready(Ok::<
+        Bytes,
+        std::io::Error,
+    >(
+        Bytes::new()
+    ))));
+    let client = fastcgi_client::Client::new_tokio(stream);
+    let fcgi_req = fastcgi_client::Request::new_tokio(params, stdin);
+
+    // ── Execute ────────────────────────────────────────────────────────────
+    let mut response_stream =
+        match tokio::time::timeout(RESOLVE_TIMEOUT, client.execute_once_stream(fcgi_req)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "session-resolve: FastCGI execution failed");
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!("session-resolve: timed out waiting for PHP-FPM response");
+                return None;
+            }
+        };
+
+    // ── Collect full response ──────────────────────────────────────────────
+    // We need the full output so we can parse CGI headers (including any
+    // Set-Cookie lines from loginWithCookie token rotation) before the body.
+    let mut full_output = BytesMut::new();
+    while let Some(item) = response_stream.next().await {
+        match item {
+            Ok(Content::Stdout(b)) => full_output.extend_from_slice(&b),
+            Ok(Content::Stderr(b)) => {
+                if !b.is_empty() {
+                    tracing::debug!(
+                        stderr = %String::from_utf8_lossy(&b),
+                        "session-resolve: PHP-FPM stderr"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "session-resolve: stream error");
+                return None;
+            }
+        }
+    }
+
+    // ── Parse CGI header block and body ────────────────────────────────────
+    parse_resolve_response(&full_output)
+}
+
+/// Parse a raw FastCGI stdout blob from a `__session_resolve` response into a
+/// `SessionResolveResult`, or `None` on any error.
+///
+/// Separated from `resolve_session` so it can be unit-tested without a live
+/// PHP-FPM socket.
+///
+/// # Format
+///
+/// ```text
+/// Content-Type: application/json; charset=UTF-8\r\n
+/// Set-Cookie: nc_token=newval; ...\r\n    ← 0 or more; only on remember-me path
+/// \r\n
+/// {"uid":"alice","dav_authenticated_uid":"alice"}
+/// ```
+///
+/// `uid: null` → returns `None` (unauthenticated).
+/// Any `Set-Cookie` header line → appended to `result.set_cookies` verbatim (the
+/// raw header value, e.g. `"nc_token=newval; Path=/; HttpOnly; SameSite=Lax"`).
+pub(crate) fn parse_resolve_response(raw: &[u8]) -> Option<nc_auth::SessionResolveResult> {
+    use nc_auth::{SessionIdentity, SessionResolveResult};
+
+    const SEP: &[u8] = b"\r\n\r\n";
+
+    // Split on header/body separator.
+    let sep_pos = raw.windows(SEP.len()).position(|w| w == SEP)?;
+    let header_bytes = &raw[..sep_pos];
+    let body = &raw[sep_pos + SEP.len()..];
+
+    // Parse CGI headers: collect Set-Cookie values, ignore the rest for
+    // routing purposes (Status is implicitly expected to be 200).
+    let mut set_cookies: Vec<String> = Vec::new();
+    let header_str = String::from_utf8_lossy(header_bytes);
+    for line in header_str.lines() {
+        if let Some((name, value)) = line.split_once(':') {
+            let value = value.trim_start();
+            if name.trim().eq_ignore_ascii_case("Set-Cookie") {
+                set_cookies.push(value.to_owned());
+            }
+            // Status: non-200 means the shim returned an error (e.g. 403 when
+            // HTTP_X_NC_PROXIED was not set).  Return None.
+            if name.trim().eq_ignore_ascii_case("Status") {
+                let code_str = value.split_ascii_whitespace().next().unwrap_or("0");
+                let code: u16 = code_str.parse().unwrap_or(0);
+                if code != 200 {
+                    tracing::warn!(status = code, "session-resolve: PHP shim returned non-200");
+                    return None;
+                }
+            }
+        }
+    }
+
+    // Parse JSON body: {"uid":"alice"|null,"dav_authenticated_uid":"alice"|null}
+    let json: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                body_preview = %String::from_utf8_lossy(&body[..body.len().min(200)]),
+                "session-resolve: failed to parse JSON body"
+            );
+            return None;
+        }
+    };
+
+    // uid: null → unauthenticated; return None.
+    let uid = json.get("uid").and_then(|v| v.as_str())?;
+    let uid = uid.to_owned();
+
+    // dav_authenticated_uid may be null (absent on first DAV request in session).
+    let dav_authenticated_uid = json
+        .get("dav_authenticated_uid")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+
+    Some(SessionResolveResult {
+        identity: SessionIdentity {
+            uid,
+            dav_authenticated_uid,
+        },
+        set_cookies,
+    })
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -1050,7 +1339,8 @@ mod tests {
         // App-level entries for bundled apps
         assert!(
             bases.contains(&"/apps/files"),
-            "expected /apps/files entry, got: {:?}", bases
+            "expected /apps/files entry, got: {:?}",
+            bases
         );
         assert!(
             bases.contains(&"/apps/files_sharing"),
@@ -1116,8 +1406,7 @@ mod tests {
 
     #[test]
     fn header_block_default_200() {
-        let (status, headers) =
-            parse_cgi_header_block(b"Content-Type: text/html").unwrap();
+        let (status, headers) = parse_cgi_header_block(b"Content-Type: text/html").unwrap();
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0, "Content-Type");
@@ -1130,15 +1419,16 @@ mod tests {
                 .unwrap();
         assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
         // Status pseudo-header must NOT be forwarded.
-        assert!(headers.iter().all(|(n, _)| !n.eq_ignore_ascii_case("status")));
+        assert!(headers
+            .iter()
+            .all(|(n, _)| !n.eq_ignore_ascii_case("status")));
         assert_eq!(headers.len(), 1);
     }
 
     #[test]
     fn header_block_extra_headers_forwarded() {
         let (_, headers) =
-            parse_cgi_header_block(b"Content-Type: text/xml\r\nX-Robots-Tag: none")
-                .unwrap();
+            parse_cgi_header_block(b"Content-Type: text/xml\r\nX-Robots-Tag: none").unwrap();
         assert!(headers.iter().any(|(n, _)| n == "X-Robots-Tag"));
     }
 
@@ -1146,24 +1436,21 @@ mod tests {
 
     #[test]
     fn cgi_response_default_200() {
-        let stdout =
-            b"Content-Type: text/html\r\n\r\n<html>hello</html>".to_vec();
+        let stdout = b"Content-Type: text/html\r\n\r\n<html>hello</html>".to_vec();
         let resp = parse_cgi_response(stdout);
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 
     #[test]
     fn cgi_response_explicit_status() {
-        let stdout = b"Content-Type: application/json\r\nStatus: 404 Not Found\r\n\r\n{}"
-            .to_vec();
+        let stdout = b"Content-Type: application/json\r\nStatus: 404 Not Found\r\n\r\n{}".to_vec();
         let resp = parse_cgi_response(stdout);
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
     }
 
     #[test]
     fn cgi_response_headers_forwarded() {
-        let stdout =
-            b"Content-Type: text/xml\r\nX-Robots-Tag: none\r\n\r\nbody".to_vec();
+        let stdout = b"Content-Type: text/xml\r\nX-Robots-Tag: none\r\n\r\nbody".to_vec();
         let resp = parse_cgi_response(stdout);
         assert!(resp.headers().contains_key("x-robots-tag"));
         assert!(!resp.headers().contains_key("status"));
@@ -1176,5 +1463,91 @@ mod tests {
         let resp = parse_cgi_response(stdout);
         // No separator → header parse on empty bytes → 200, body is full content.
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    // ── session_resolver ───────────────────────────────────────────────────────
+
+    fn make_resolve_output(headers: &str, body: &str) -> Vec<u8> {
+        format!("{}\r\n\r\n{}", headers, body).into_bytes()
+    }
+
+    #[test]
+    fn parse_resolve_response_authenticated() {
+        let raw = make_resolve_output(
+            "Content-Type: application/json; charset=UTF-8",
+            r#"{"uid":"alice","dav_authenticated_uid":"alice"}"#,
+        );
+        let result = parse_resolve_response(&raw).expect("should parse");
+        assert_eq!(result.identity.uid, "alice");
+        assert_eq!(
+            result.identity.dav_authenticated_uid,
+            Some("alice".to_owned())
+        );
+        assert!(result.set_cookies.is_empty());
+    }
+
+    #[test]
+    fn parse_resolve_response_no_dav_auth() {
+        let raw = make_resolve_output(
+            "Content-Type: application/json; charset=UTF-8",
+            r#"{"uid":"alice","dav_authenticated_uid":null}"#,
+        );
+        let result = parse_resolve_response(&raw).expect("should parse");
+        assert_eq!(result.identity.uid, "alice");
+        assert_eq!(result.identity.dav_authenticated_uid, None);
+    }
+
+    #[test]
+    fn parse_resolve_response_unauthenticated() {
+        // PHP shim returns uid:null when no auth path succeeded.
+        let raw = make_resolve_output(
+            "Content-Type: application/json; charset=UTF-8",
+            r#"{"uid":null,"dav_authenticated_uid":null}"#,
+        );
+        assert!(parse_resolve_response(&raw).is_none());
+    }
+
+    #[test]
+    fn parse_resolve_response_malformed() {
+        let raw = make_resolve_output(
+            "Content-Type: application/json; charset=UTF-8",
+            "this is not json {{{",
+        );
+        assert!(parse_resolve_response(&raw).is_none());
+    }
+
+    #[test]
+    fn parse_resolve_response_with_set_cookies() {
+        // loginWithCookie() side effects: two Set-Cookie headers for nc_token
+        // and nc_session_id rotation (setMagicInCookie emits all three, but
+        // we test with two to keep the fixture compact).
+        let raw = make_resolve_output(
+            "Content-Type: application/json; charset=UTF-8\r\n\
+             Set-Cookie: nc_token=newtoken; Path=/; HttpOnly; SameSite=Lax\r\n\
+             Set-Cookie: nc_session_id=newsid; Path=/; HttpOnly; SameSite=Lax",
+            r#"{"uid":"bob","dav_authenticated_uid":null}"#,
+        );
+        let result = parse_resolve_response(&raw).expect("should parse");
+        assert_eq!(result.identity.uid, "bob");
+        assert_eq!(result.set_cookies.len(), 2);
+        assert!(result.set_cookies[0].starts_with("nc_token=newtoken"));
+        assert!(result.set_cookies[1].starts_with("nc_session_id=newsid"));
+    }
+
+    #[test]
+    fn parse_resolve_response_non_200_status_returns_none() {
+        // PHP shim returned 403 (trust check failed inside shim — defence-in-depth)
+        let raw = make_resolve_output(
+            "Status: 403 Forbidden\r\nContent-Type: text/plain; charset=UTF-8",
+            "403 Forbidden: request did not pass Rust proxy layer\n",
+        );
+        assert!(parse_resolve_response(&raw).is_none());
+    }
+
+    #[test]
+    fn parse_resolve_response_no_separator_returns_none() {
+        // Truncated / completely broken output
+        let raw = b"Content-Type: application/json".to_vec();
+        assert!(parse_resolve_response(&raw).is_none());
     }
 }

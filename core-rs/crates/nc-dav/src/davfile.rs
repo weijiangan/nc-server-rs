@@ -339,8 +339,8 @@ impl DavFile for NcDavFile {
                 fileid = fid;
                 let sql = format!(
                     "UPDATE {prefix}filecache \
-                     SET size=?, mtime=?, storage_mtime=?, etag=?, checksum=?, upload_time=? \
-                     WHERE fileid=?"
+                     SET size=$1, mtime=$2, storage_mtime=$3, etag=$4, checksum=$5, upload_time=$6 \
+                     WHERE fileid=$7"
                 );
                 let _ = sqlx::query(&sql)
                     .bind(size as i64)
@@ -365,7 +365,7 @@ impl DavFile for NcDavFile {
                     "INSERT INTO {prefix}filecache \
                      (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
                       size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time) \
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"
                 );
                 let _ = sqlx::query(&sql)
                     .bind(fid)
@@ -416,7 +416,7 @@ impl DavFile for NcDavFile {
             let extended_sql = format!(
                 "INSERT INTO {prefix}filecache_extended \
                  (fileid, creation_time, upload_time, metadata_etag) \
-                 VALUES (?, ?, ?, NULL) \
+                 VALUES ($1, $2, $3, NULL) \
                  ON CONFLICT(fileid) DO UPDATE SET upload_time = excluded.upload_time",
                 prefix = prefix
             );

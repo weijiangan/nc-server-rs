@@ -19,14 +19,14 @@ license = "AGPL-3.0-only"
 # HTTP server
 axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5" }
-tower-http = { version = "0.6", features = ["trace", "request-id", "timeout"] }
+tower-http = { version = "0.6", features = ["trace", "request-id", "timeout", "fs"] }
 hyper = { version = "1", features = ["full"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "macros", "migrate"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "any", "macros", "migrate"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -43,11 +43,13 @@ md-5 = "0.10"
 adler = "0.2"
 hex = "0.4"
 bcrypt = "0.15"
-hmac = "0.12"
 base64 = "0.22"
 
 # UUID for request IDs
 uuid = { version = "1", features = ["v4"] }
+
+# Concurrent hash map (session cache — §7.9.5)
+dashmap = "6.1"
 
 # Tracing / logging
 tracing = "0.1"

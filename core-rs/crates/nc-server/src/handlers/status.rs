@@ -13,14 +13,19 @@ use crate::state::AppState;
 /// Always served — even in maintenance mode (middleware skips this path).
 /// Returns JSON with all fields from REQ §3.
 ///
-/// Values are read from the in-memory `AppConfigCache` — no DB query per
-/// request.
+/// `installed` and `maintenance` are read from `NcConfig` (parsed from
+/// `config/config.php` at startup — PHP writes both via `SystemConfig`, not
+/// `oc_appconfig`).  All other fields come from the in-memory
+/// `AppConfigCache` — no DB query per request.
 pub async fn status(State(state): State<AppState>) -> Response {
-    let ac = state.appconfig_cache.read().expect("appconfig lock poisoned");
+    let ac = state
+        .appconfig_cache
+        .read()
+        .expect("appconfig lock poisoned");
 
     let body = StatusResponse {
-        installed: ac.get_bool("core", "installed"),
-        maintenance: ac.is_maintenance(),
+        installed: state.nc_config.installed,
+        maintenance: state.nc_config.maintenance,
         needs_db_upgrade: ac.get_bool("core", "needsDbUpgrade"),
         version: ac
             .get_string("core", "oc_version")
@@ -30,9 +35,7 @@ pub async fn status(State(state): State<AppState>) -> Response {
             .get_string("core", "oc_version_string")
             .or_else(|| ac.get_string("core", "versionstring"))
             .unwrap_or_else(|| "Unknown".to_string()),
-        edition: ac
-            .get_string("core", "edition")
-            .unwrap_or_default(),
+        edition: ac.get_string("core", "edition").unwrap_or_default(),
         product_name: ac
             .get_string("core", "productname")
             .unwrap_or_else(|| "Nextcloud".to_string()),

@@ -1,59 +1,17 @@
 use axum::{
     body::Body,
-    http::{Method, Request, StatusCode},
-    middleware::{self, Next},
+    http::{Request, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
-use tower::ServiceExt as _;
-use tower_http::services::ServeDir;
 
 use crate::{
     handlers::{heartbeat::heartbeat, status::status},
     middleware::{auth::auth_layer, maintenance::maintenance_guard},
     state::AppState,
 };
-
-/// Outermost middleware: serve physical files directly from the Nextcloud root
-/// before the request reaches any route handler.
-///
-/// Mirrors nginx's `try_files $uri @php` directive:
-/// - Only GET / HEAD requests are candidates.
-/// - Paths containing `.php` are always passed through (PHP-FPM handles them).
-/// - Path traversal (`..`) is rejected immediately.
-/// - If the resolved path is a regular file, it is served by `tower_http`'s
-///   `ServeDir` (which handles ETag, Last-Modified, Range, and Content-Type
-///   detection automatically).
-/// - Everything else falls through to the auth + route layers.
-///
-/// This covers `/core/`, `/dist/`, `/themes/`, and app-level static assets
-/// such as `/apps/files/img/icon.svg` that the PHP route wildcards would
-/// otherwise swallow and send to PHP-FPM.
-async fn try_static_files(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    if matches!(req.method(), &Method::GET | &Method::HEAD) {
-        let path = req.uri().path();
-        // Skip PHP scripts and any path that looks like traversal.
-        if !path.contains(".php") && !path.contains("..") {
-            let candidate = state.nc_root.join(path.trim_start_matches('/'));
-            if tokio::fs::metadata(&candidate)
-                .await
-                .map(|m| m.is_file())
-                .unwrap_or(false)
-            {
-                return match ServeDir::new(&state.nc_root).oneshot(req).await {
-                    Ok(resp) => resp.into_response(),
-                    Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-                };
-            }
-        }
-    }
-    next.run(req).await
-}
 
 /// Fallback handler for PHP-FPM-bound routes.
 ///
@@ -133,21 +91,10 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
     });
 
     // ── Middleware (outermost layers are added last) ─────────────────────────
-    //
-    // Request processing order (outer → inner):
-    //   try_static_files  — serve physical files before routing; bypasses auth
-    //                       (JS/CSS/images are always public)
-    //   maintenance_guard — reject API calls when maintenance mode is on
-    //   auth_layer        — validate bearer / session token
-    //   routes            — native handlers + PHP-FPM proxy
     r.layer(middleware::from_fn_with_state(state.clone(), auth_layer))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             maintenance_guard,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            try_static_files,
         ))
         .with_state(state)
 }

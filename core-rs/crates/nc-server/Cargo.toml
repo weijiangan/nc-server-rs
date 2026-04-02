@@ -30,6 +30,7 @@ sqlx.workspace = true
 
 nc-db.workspace = true
 nc-auth.workspace = true
+dashmap.workspace = true
 nc-ocs.workspace = true
 nc-dav.workspace = true
 nc-files.workspace = true

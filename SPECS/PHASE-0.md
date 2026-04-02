@@ -50,6 +50,6 @@ Goal: the binary connects to an existing Nextcloud DB or creates a fresh one, an
 - [x] `SELECT appid, configkey, configvalue, type FROM oc_appconfig WHERE lazy = 0` at startup → `Arc<RwLock<AppConfigCache>>`
 - [x] Typed access: `get_bool("core", "maintenance")`, `get_string("core", "version")`, etc.
 - [x] Write path: any update to `oc_appconfig` for a non-lazy key invalidates the relevant entry atomically
-- [x] `maintenance` flag is read from this cache on every request (used by maintenance-mode middleware)
+- [x] `maintenance` flag is **not** stored here — PHP writes it to `config.php` via `SystemConfig::setValue()`, never to `oc_appconfig`. The maintenance-mode middleware reads `NcConfig.maintenance` (parsed from `config.php` at startup). Toggling maintenance while the server is running requires a restart.
 
 **Verify:** unit test: insert `maintenance=1` into test DB, start server, call `config_cache.get_bool("core","maintenance")`, assert `true`. ✅ (`appconfig::tests::*` — 6 tests passing)

@@ -27,9 +27,7 @@ fn is_public_path(path: &str) -> bool {
 /// REQ §4.3: DAV endpoints respond with `Basic realm="Nextcloud"`.
 /// REQ §5.4: OCS endpoints respond with `Basic realm="Authorisation Required"`.
 fn is_dav_path(path: &str) -> bool {
-    path.starts_with("/remote.php")
-        || path.starts_with("/dav")
-        || path.starts_with("/public.php")
+    path.starts_with("/remote.php") || path.starts_with("/dav") || path.starts_with("/public.php")
 }
 
 /// Auth middleware (Phase 3).
@@ -114,9 +112,14 @@ pub async fn auth_layer(
 
     use nc_auth::session::{check_samesite_cookies, CookieCheck};
     if auth_header.is_none() && !ocs_api_request {
-        match check_samesite_cookies(&cookie_header, is_https) {
+        match check_samesite_cookies(&cookie_header, &state.instanceid, is_https) {
             CookieCheck::StrictCheckFailed => {
-                return (StatusCode::UNAUTHORIZED, "SameSite cookie check failed")
+                // PHP returns 412 Precondition Failed for strict cookie check
+                // failures (base.php strict cookie check, REQ §7.9.2).
+                return (
+                    StatusCode::PRECONDITION_FAILED,
+                    "SameSite cookie check failed",
+                )
                     .into_response();
             }
             _ => {}
@@ -124,6 +127,11 @@ pub async fn auth_layer(
     }
 
     // ── Credential extraction and verification ────────────────────────────
+    // `pending_set_cookies` collects any `Set-Cookie` header values returned
+    // by the PHP-FPM `__session_resolve` endpoint (remember-me token rotation
+    // path — §7.9.3/§7.9.4).  They are appended to the final HTTP response
+    // after the downstream handler completes.
+    let mut pending_set_cookies: Vec<String> = Vec::new();
     let auth_info: Option<AuthInfo> = match &auth_header {
         Some(ah) if ah.starts_with("Bearer ") => {
             // REQ §4.6: throttle bearer attempts the same as Basic (brute-force
@@ -179,16 +187,11 @@ pub async fn auth_layer(
                     }
 
                     // Phase 7.2: admin group check.
-                    let is_admin = nc_auth::is_admin_user(
-                        &cached.uid,
-                        &state.pool,
-                        &state.table_prefix,
-                    )
-                    .await;
+                    let is_admin =
+                        nc_auth::is_admin_user(&cached.uid, &state.pool, &state.table_prefix).await;
 
                     // Extract the raw bearer value for HTTP_X_NC_SESSION_TOKEN.
-                    let raw_token = nc_auth::bearer::extract_bearer(ah)
-                        .map(str::to_owned);
+                    let raw_token = nc_auth::bearer::extract_bearer(ah).map(str::to_owned);
 
                     Some(AuthInfo {
                         uid: cached.uid.clone(),
@@ -283,8 +286,7 @@ pub async fn auth_layer(
                             // password (the token value) for HTTP_X_NC_SESSION_TOKEN.
                             // For plain-password auth, do not forward the password.
                             let raw_token = if result.token_id.is_some() {
-                                nc_auth::basic::extract_basic(ah)
-                                    .map(|(_, pwd)| pwd)
+                                nc_auth::basic::extract_basic(ah).map(|(_, pwd)| pwd)
                             } else {
                                 None
                             };
@@ -310,7 +312,91 @@ pub async fn auth_layer(
                 }
             }
         }
-        _ => None, // No Authorization header — anonymous request.
+        _ => {
+            // No Authorization header — try PHP session cookie resolution
+            // (§7.9.6).
+            //
+            // Browser requests authenticate via the PHP login flow and carry
+            // only cookies on subsequent requests; the Authorization header is
+            // absent.  We ask the PHP-FPM shim's `__session_resolve` endpoint
+            // to run `OC::handleLogin()` and return the resolved identity.
+            //
+            // Guard: PHP-FPM must be configured — without it there is no
+            // `__session_resolve` endpoint and no session cache to populate.
+            let (Some(fpm), Some(session_cache)) = (&state.fastcgi, &state.session_cache) else {
+                // PHP-FPM not configured — treat as anonymous.
+                return next.run(req).await;
+            };
+
+            // Find the raw session-cookie value (PHP session cookie keyed on
+            // `{instanceid}`, or `nc_token` for the remember-me fallback).
+            // PHP's `cookieCheckRequired()` uses the same two cookies as the
+            // session trigger (Request.php:464-470).
+            let Some(raw_val) =
+                nc_auth::session::session_cookie_value(&state.instanceid, &cookie_header)
+            else {
+                // No session cookies at all — anonymous request.
+                return next.run(req).await;
+            };
+            let raw_val = raw_val.to_owned();
+
+            // ── Session identity cache lookup (§7.9.5) ──────────────────────
+            // Key: SHA-256(raw PHP session cookie value).
+            let cache_key = nc_auth::make_cache_key(&raw_val);
+            let identity = if let Some(cached) = nc_auth::cache_lookup(session_cache, &cache_key) {
+                cached
+            } else {
+                // Cache miss — ask PHP-FPM to run the auth chain.
+                match nc_fastcgi::resolve_session(fpm, &cookie_header).await {
+                    Some(result) => {
+                        nc_auth::cache_insert(session_cache, cache_key, result.identity.clone());
+                        // Remember-me token rotation: forward any
+                        // Set-Cookie headers the shim emitted so the
+                        // browser receives the refreshed nc_token /
+                        // nc_username / nc_session_id cookies (§7.9.3).
+                        pending_set_cookies = result.set_cookies;
+                        result.identity
+                    }
+                    None => {
+                        // PHP says the session is invalid or unauthenticated.
+                        // Fall through as anonymous — the route handler
+                        // decides whether to reject with 401.
+                        return next.run(req).await;
+                    }
+                }
+            };
+
+            // ── DAV session-fixation guard (§7.9.6; Auth.php:184-186) ───────
+            //
+            // PHP's Auth.php accepts a cookie-only (session-based) DAV request
+            // when:
+            //   1. AUTHENTICATED_TO_DAV_BACKEND is null (first DAV request in
+            //      the session — "Fix for broken webdav clients", Auth.php:184)
+            //   2. AUTHENTICATED_TO_DAV_BACKEND === current UID AND the
+            //      Authorization header is absent (well-behaved client,
+            //      Auth.php:186)
+            // Any other case (DAV_AUTHENTICATED stores a *different* UID) is a
+            // session-fixation attempt and must be rejected with 401.
+            //
+            // This check is scoped to DAV endpoint paths only; OCS and other
+            // routes do not run through SabreDAV Auth.php.
+            if is_dav
+                && !dav_session_guard(&identity.uid, identity.dav_authenticated_uid.as_deref())
+            {
+                return build_401(true, is_xhr, true, false);
+            }
+
+            // Build and return the resolved identity.
+            let is_admin =
+                nc_auth::is_admin_user(&identity.uid, &state.pool, &state.table_prefix).await;
+            Some(AuthInfo {
+                uid: identity.uid,
+                is_admin,
+                method: AuthMethod::Session,
+                token_id: None,
+                raw_token: None,
+            })
+        }
     };
 
     // Attach identity (or nothing) to request extensions.
@@ -318,7 +404,21 @@ pub async fn auth_layer(
         req.extensions_mut().insert(info);
     }
 
-    next.run(req).await
+    let mut resp = next.run(req).await;
+
+    // Forward any Set-Cookie headers from the PHP-FPM session resolver.
+    // These originate from the remember-me token rotation path
+    // (`loginWithCookie()` → `setMagicInCookie()` — §7.9.3/§7.9.4) and
+    // carry the refreshed nc_token / nc_username / nc_session_id cookies
+    // that the browser must receive to stay logged in.
+    for cookie_val in &pending_set_cookies {
+        if let Ok(hv) = axum::http::HeaderValue::from_str(cookie_val) {
+            resp.headers_mut()
+                .append(axum::http::header::SET_COOKIE, hv);
+        }
+    }
+
+    resp
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────
@@ -364,6 +464,30 @@ fn build_429(retry_after_secs: u64) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// DAV session-fixation guard (§7.9.6 / `Auth.php:184-186`).
+///
+/// Extracted as a standalone function solely to allow unit testing without a
+/// live `AppState` or PHP-FPM socket — the logic is otherwise a 3-line match
+/// used exactly once in `auth_layer`.
+///
+/// Returns `true` when the request should be accepted, `false` when it must
+/// be rejected with `401`.
+///
+/// Three cases (matching `Auth.php` exactly):
+/// - `dav_authenticated_uid == None`        → accept (first DAV request in session;
+///                                            "Fix for broken webdav clients", `Auth.php:184`)
+/// - `dav_authenticated_uid == Some(uid)`   → accept (well-behaved cookie-only
+///                                            client, `Auth.php:186`)
+/// - `dav_authenticated_uid == Some(other)` → reject (session fixation: the
+///                                            session was previously associated
+///                                            with a different user)
+pub(crate) fn dav_session_guard(uid: &str, dav_authenticated_uid: Option<&str>) -> bool {
+    match dav_authenticated_uid {
+        None => true,
+        Some(dav_uid) => dav_uid == uid,
+    }
+}
+
 /// Extract the real client IP, honouring `X-Forwarded-For` if present.
 fn extract_client_ip(req: &Request<Body>) -> String {
     req.headers()
@@ -373,4 +497,207 @@ fn extract_client_ip(req: &Request<Body>) -> String {
         .map(str::trim)
         .unwrap_or("127.0.0.1")
         .to_string()
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request, middleware, routing::get, Router};
+    use nc_db::{
+        appconfig::AppConfigCache,
+        config::{DbType, NcConfig},
+        mime::MimeCache,
+    };
+    use std::sync::{Arc, RwLock};
+    use tower::ServiceExt;
+
+    /// Build a minimal `AppState` backed by an in-memory SQLite pool.
+    ///
+    /// `fastcgi` and `session_cache` are left as `None` — these tests exercise
+    /// the middleware paths that do not require a live PHP-FPM connection.
+    async fn make_test_state(instanceid: &str) -> AppState {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::AnyPool::connect("sqlite::memory:").await.unwrap();
+        let appconfig_cache = Arc::new(RwLock::new(AppConfigCache::default()));
+        let capability_cache = nc_ocs::load_capability_cache(&appconfig_cache);
+        AppState {
+            pool,
+            mime_cache: Arc::new(RwLock::new(MimeCache::default())),
+            appconfig_cache,
+            capability_cache,
+            token_cache: nc_auth::new_token_cache(),
+            nc_config: Arc::new(NcConfig {
+                dbtype: DbType::Sqlite,
+                dbhost: None,
+                dbname: None,
+                dbuser: None,
+                dbpassword: None,
+                dbtableprefix: "oc_".to_owned(),
+                datadirectory: None,
+                instanceid: Some(instanceid.to_owned()),
+                installed: true,
+                maintenance: false,
+                version: None,
+                trusted_domains: None,
+                overwrite_cli_url: None,
+                bruteforce_protection_enabled: false,
+                oauth2_enable_oc_clients: false,
+                memcache_distributed: None,
+                loglevel: 1,
+                logfile: None,
+                data_fingerprint: None,
+                bulkupload_enabled: true,
+                fastcgi_socket: None,
+                fastcgi_timeout_ms: 30_000,
+                forbidden_filenames: vec![".htaccess".to_owned()],
+                forbidden_filename_basenames: vec![],
+                forbidden_filename_characters: vec![],
+                forbidden_filename_extensions: vec![".filepart".to_owned()],
+            }),
+            nc_root: std::path::PathBuf::from("."),
+            table_prefix: "oc_".to_owned(),
+            fastcgi: None,
+            instanceid: instanceid.to_owned(),
+            session_cache: None,
+        }
+    }
+
+    async fn ok_handler() -> StatusCode {
+        StatusCode::OK
+    }
+
+    /// No `{instanceid}` cookie and no `nc_token` → the middleware treats the
+    /// request as anonymous (no `AuthInfo` extension) and passes it through
+    /// without a 401.  The downstream handler decides whether auth is required.
+    ///
+    /// This verifies the `_ =>` arm's first guard: absent session cookies →
+    /// anonymous, not a 401.
+    #[tokio::test]
+    async fn session_no_cookies_is_anonymous() {
+        let state = make_test_state("oc1abc").await;
+        let app = Router::new()
+            .route("/dav/files/alice", get(ok_handler))
+            .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/dav/files/alice")
+            // Deliberately empty Cookie header — no session cookies.
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Middleware passes through; handler returns 200 OK.
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── dav_session_guard pure-function tests ────────────────────────────────
+    //
+    // These cover the DAV session-fixation guard without any AppState or
+    // network calls — the function is pure so no async machinery is needed.
+
+    /// `AUTHENTICATED_TO_DAV_BACKEND` absent (first DAV request in session).
+    /// PHP `Auth.php:184`: "Fix for broken webdav clients" — always accept.
+    #[test]
+    fn dav_guard_first_request_accepted() {
+        assert!(dav_session_guard("alice", None));
+    }
+
+    /// `AUTHENTICATED_TO_DAV_BACKEND` matches the resolved UID.
+    /// PHP `Auth.php:186`: well-behaved cookie-only client — accept.
+    #[test]
+    fn dav_guard_uid_match_accepted() {
+        assert!(dav_session_guard("alice", Some("alice")));
+    }
+
+    /// `AUTHENTICATED_TO_DAV_BACKEND` stores a *different* UID.
+    /// Session-fixation attempt — guard returns false → 401.
+    #[test]
+    fn dav_guard_uid_mismatch_rejected() {
+        assert!(!dav_session_guard("alice", Some("bob")));
+    }
+
+    // ── Additional middleware tests ───────────────────────────────────────────
+
+    /// `OCS-APIRequest: true` causes the SameSite guard to be skipped entirely
+    /// (`Request.php:464-468`).  A session cookie present with missing guard
+    /// cookies must NOT return 412 when `OCS-APIRequest` is set.
+    ///
+    /// With `fastcgi: None` the auth resolves to anonymous (200), confirming
+    /// the 412 path was bypassed.
+    #[tokio::test]
+    async fn session_ocs_apirequest_bypasses_samesite() {
+        let state = make_test_state("oc1abc").await;
+        let app = Router::new()
+            .route("/ocs/v2.php/cloud/capabilities", get(ok_handler))
+            .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
+
+        // Session cookie present but SameSite guard cookies absent — would be
+        // 412 without the OCS-APIRequest bypass.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/ocs/v2.php/cloud/capabilities")
+            .header("cookie", "oc1abc=somesessionid")
+            .header("OCS-APIRequest", "true")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// When `fastcgi` is `None`, session cookies are present and the SameSite
+    /// guard passes — the middleware has no resolver to call and must fall
+    /// through as anonymous (not 401, not 412).
+    #[tokio::test]
+    async fn session_no_fpm_is_anonymous() {
+        let state = make_test_state("oc1abc").await;
+        let app = Router::new()
+            .route("/dav/files/alice", get(ok_handler))
+            .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
+
+        // Valid session cookie + guard cookies, but fastcgi = None.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/dav/files/alice")
+            .header(
+                "cookie",
+                "oc1abc=somesessionid; nc_sameSiteCookielax=true; nc_sameSiteCookiestrict=true",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // No FastCGI resolver → anonymous → downstream handler returns 200.
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// When the PHP session cookie (`{instanceid}`) is present but the
+    /// SameSite guard cookies (`nc_sameSiteCookielax`, `nc_sameSiteCookiestrict`)
+    /// are absent, PHP returns HTTP 412 Precondition Failed (base.php strict
+    /// cookie check — REQ §7.9.2 / §7.9.6).
+    ///
+    /// The Rust middleware must match that behavior — not 401, not 200.
+    #[tokio::test]
+    async fn session_samesite_failure_returns_412() {
+        let state = make_test_state("oc1abc").await;
+        let app = Router::new()
+            .route("/remote.php/webdav/", get(ok_handler))
+            .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
+
+        // `oc1abc` session cookie is present (triggers the SameSite check) but
+        // neither guard cookie is present → `StrictCheckFailed` → 412.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/remote.php/webdav/")
+            .header("cookie", "oc1abc=somesessionid")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+    }
 }

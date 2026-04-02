@@ -16,6 +16,8 @@ Each phase lives in its own file for context-size management:
 | 7 — PHP-FPM FastCGI Dispatch | [PHASE-7.md](PHASE-7.md) | ⬜ Not started |
 | 8 — Load Validation and Starvation Regression | [PHASE-8.md](PHASE-8.md) | ⬜ Not started |
 
+| Deferred improvements (nice-to-have) | [IMPROVEMENTS.md](IMPROVEMENTS.md) | ⬜ |
+
 ---
 
 ## Completion Gate

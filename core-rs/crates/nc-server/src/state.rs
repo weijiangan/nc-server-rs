@@ -25,6 +25,27 @@ pub struct AppState {
     /// PHP-FPM FastCGI proxy state.  `None` when `fastcgi_socket` is not set
     /// in `config.php`; in that case FastCGI-bound routes return `502`.
     pub fastcgi: Option<nc_fastcgi::FastCgiState>,
+    /// The Nextcloud instance ID (value of `instanceid` in `config.php`).
+    ///
+    /// PHP's `session_name()` is set to this value, making it the name of the
+    /// PHP session cookie (e.g. `oc1a2b3c4d5e`).  The auth middleware uses it
+    /// to locate the correct cookie when no `Authorization` header is present
+    /// (§7.9.6).
+    ///
+    /// Always present on an installed instance (`OC_Util::getInstanceId()`
+    /// auto-generates and persists the value).  Defaults to `""` for
+    /// pre-install / test states where `config.php` may be absent or partial.
+    pub instanceid: String,
+    /// In-process session-identity cache (§7.9.5).
+    ///
+    /// Keyed on `SHA-256(php_session_cookie_value)` → `(SessionIdentity, Instant)`.
+    /// TTL = 60 seconds.  Entries are evicted lazily on lookup and periodically
+    /// by the background eviction task spawned in `main.rs`.
+    ///
+    /// `None` when PHP-FPM is not configured (`fastcgi` is `None`).  When
+    /// PHP-FPM is absent there is no session resolver to call, so no cache is
+    /// needed.
+    pub session_cache: Option<nc_auth::SharedSessionCache>,
 }
 
 /// Allow axum to extract `OcsState` from the top-level `AppState` using the
@@ -50,11 +71,14 @@ impl FromRef<AppState> for nc_dav::NcDavState {
 
         let instance_id = Arc::new(state.nc_config.instanceid.clone().unwrap_or_default());
 
-        let filename_validator =
-            Arc::new(FilenameValidator::from_config(&state.nc_config));
+        let filename_validator = Arc::new(FilenameValidator::from_config(&state.nc_config));
 
         let base_url = Arc::new(
-            state.nc_config.overwrite_cli_url.clone().unwrap_or_default(),
+            state
+                .nc_config
+                .overwrite_cli_url
+                .clone()
+                .unwrap_or_default(),
         );
 
         nc_dav::NcDavState {

@@ -1,39 +1,53 @@
-use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha512};
 
 use nc_db::pool::DbPool;
 
 use crate::token::{CachedToken, SharedTokenCache};
 
-type HmacSha512 = Hmac<Sha512>;
-
 // ── Hashing ───────────────────────────────────────────────────────────────────
 
-/// NC v2 token hash: `HMAC-SHA512(server_secret, raw_bearer_token)`.
-/// Used by all installs with a `core.secret` in `oc_appconfig` (NC 20+).
-pub fn hmac_hash(secret: &str, raw: &str) -> [u8; 64] {
-    let mut mac = HmacSha512::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts any key size");
-    mac.update(raw.as_bytes());
-    mac.finalize().into_bytes().into()
+/// PHP-compatible token hash: `SHA-512(raw_token || server_secret)`.
+///
+/// This matches PHP's `PublicKeyTokenProvider::hashToken()`:
+/// ```php
+/// return hash('sha512', $token . $secret);   // PublicKeyTokenProvider.php:412-414
+/// ```
+/// The two strings are simply **concatenated** before hashing — this is NOT
+/// HMAC.  The output is a 64-byte digest (stored as 128-character lowercase
+/// hex in `oc_authtoken.token`).
+///
+/// Used for all installs where `config.php` contains a `secret` value (NC 20+).
+pub fn concat_hash(secret: &str, raw: &str) -> [u8; 64] {
+    let mut h = Sha512::new();
+    h.update(raw.as_bytes());
+    h.update(secret.as_bytes());
+    h.finalize().into()
 }
 
-/// NC v1 token hash: `SHA-512(raw_bearer_token)`.
-/// Fallback for installs that pre-date the server secret (NC < 20).
+/// PHP fallback token hash: `SHA-512(raw_token)`.
+///
+/// Matches PHP's `hashTokenWithEmptySecret()`:
+/// ```php
+/// return hash('sha512', $token);   // PublicKeyTokenProvider.php:420-421
+/// ```
+/// Used for pre-NC-20 installs where no server secret was set.
 pub fn sha512_hash(raw: &str) -> [u8; 64] {
     let mut h = Sha512::new();
     h.update(raw.as_bytes());
     h.finalize().into()
 }
 
-/// Compute the DB lookup hash for a raw bearer token.
+/// Compute the DB lookup hash for a raw token value.
 ///
-/// Uses HMAC if `app_secret` is non-empty; falls back to plain SHA-512.
+/// Mirrors PHP's `PublicKeyTokenProvider::hashToken()` (NC 20+) and its
+/// `hashTokenWithEmptySecret()` fallback (pre-NC-20):
+/// - `app_secret` non-empty → `SHA-512(raw || secret)` via [`concat_hash`]
+/// - `app_secret` empty     → `SHA-512(raw)` via [`sha512_hash`]
 pub fn token_hash(app_secret: &str, raw: &str) -> [u8; 64] {
     if app_secret.is_empty() {
         sha512_hash(raw)
     } else {
-        hmac_hash(app_secret, raw)
+        concat_hash(app_secret, raw)
     }
 }
 
@@ -71,16 +85,15 @@ pub async fn lookup_bearer(
     let hash_hex = hex::encode(hash);
     let table = format!("{prefix}authtoken");
 
-    let row: Option<(i64, String, i16, String, Option<i64>, i64)> =
-        sqlx::query_as(&format!(
-            "SELECT id, uid, type, scope, expires, last_activity \
-             FROM {table} WHERE token = ?"
-        ))
-        .bind(&hash_hex)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+    let row: Option<(i64, String, i16, String, Option<i64>, i64)> = sqlx::query_as(&format!(
+        "SELECT id, uid, type, scope, expires, last_activity \
+             FROM {table} WHERE token = $1"
+    ))
+    .bind(&hash_hex)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
 
     let (id, uid, token_type, scope, expires, last_activity) = row?;
 
@@ -136,7 +149,7 @@ pub async fn update_last_activity(token_id: i64, pool: &DbPool, prefix: &str) {
         .as_secs() as i64;
     let table = format!("{prefix}authtoken");
     let _ = sqlx::query(&format!(
-        "UPDATE {table} SET last_activity = ? WHERE id = ?"
+        "UPDATE {table} SET last_activity = $1 WHERE id = $2"
     ))
     .bind(now)
     .bind(token_id)
@@ -157,11 +170,13 @@ mod tests {
         assert_eq!(extract_bearer("Bearer "), Some(""));
     }
 
+    /// Concatenation hash and plain SHA-512 must differ when a secret is
+    /// supplied (otherwise the `app_secret` would be having no effect).
     #[test]
-    fn hmac_and_sha512_differ() {
+    fn concat_and_sha512_differ() {
         let raw = "test_token";
         let secret = "server_secret";
-        let h1 = hmac_hash(secret, raw);
+        let h1 = concat_hash(secret, raw);
         let h2 = sha512_hash(raw);
         assert_ne!(h1, h2);
     }
@@ -173,9 +188,29 @@ mod tests {
     }
 
     #[test]
-    fn secret_uses_hmac() {
+    fn secret_uses_concat_hash() {
         let raw = "test_token";
         let secret = "mysecret";
-        assert_eq!(token_hash(secret, raw), hmac_hash(secret, raw));
+        assert_eq!(token_hash(secret, raw), concat_hash(secret, raw));
+    }
+
+    /// Cross-validated against PHP's `hash('sha512', $token . $secret)`.
+    ///
+    /// Run via:
+    /// ```bash
+    /// php -r "var_dump(hash('sha512', 'test_token' . 'test_secret'));"
+    /// ```
+    /// Expected: `string(128) "3c8e585d...010a"`
+    #[test]
+    fn php_compatible_test_vector() {
+        let raw = "test_token";
+        let secret = "test_secret";
+        let hash_bytes = concat_hash(secret, raw);
+        let hash_hex = hex::encode(hash_bytes);
+        assert_eq!(
+            hash_hex,
+            "3c8e585d127271fe9d6247bc21caa64ca3a888920db1e3ee2ebfd8678bbde825\
+             e3f53bb97598278b1a64817569c5ed836a1a06aa93fc29875ea0acbf9f51010a",
+        );
     }
 }

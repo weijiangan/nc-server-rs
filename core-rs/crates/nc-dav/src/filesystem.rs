@@ -452,7 +452,7 @@ impl DavFileSystem for NcFileSystem {
                 "INSERT INTO {prefix}filecache \
                  (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
                   size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
                 prefix = self.state.table_prefix
             );
             sqlx::query(&sql)
@@ -504,7 +504,7 @@ impl DavFileSystem for NcFileSystem {
                 .map_err(io_to_fs)?;
 
             let sql = format!(
-                "DELETE FROM {prefix}filecache WHERE fileid = ?",
+                "DELETE FROM {prefix}filecache WHERE fileid = $1",
                 prefix = self.state.table_prefix
             );
             sqlx::query(&sql)
@@ -515,7 +515,7 @@ impl DavFileSystem for NcFileSystem {
 
             // Clean up extended metadata row (REQ §4.5).
             let sql_ext = format!(
-                "DELETE FROM {prefix}filecache_extended WHERE fileid = ?",
+                "DELETE FROM {prefix}filecache_extended WHERE fileid = $1",
                 prefix = self.state.table_prefix
             );
             let _ = sqlx::query(&sql_ext)
@@ -549,7 +549,7 @@ impl DavFileSystem for NcFileSystem {
                 "DELETE FROM {prefix}filecache_extended \
                  WHERE fileid IN (\
                      SELECT fileid FROM {prefix}filecache \
-                     WHERE storage = ? AND (path = ? OR path LIKE ?)\
+                     WHERE storage = $1 AND (path = $2 OR path LIKE $3)\
                  )"
             );
             let _ = sqlx::query(&sql_ext)
@@ -560,7 +560,7 @@ impl DavFileSystem for NcFileSystem {
                 .await;
 
             let sql_subtree = format!(
-                "DELETE FROM {prefix}filecache WHERE storage = ? AND (path = ? OR path LIKE ?)"
+                "DELETE FROM {prefix}filecache WHERE storage = $1 AND (path = $2 OR path LIKE $3)"
             );
             sqlx::query(&sql_subtree)
                 .bind(self.storage_id)
@@ -629,8 +629,8 @@ impl DavFileSystem for NcFileSystem {
             // Update the node itself.
             let sql_node = format!(
                 "UPDATE {prefix}filecache \
-                 SET path=?, path_hash=?, name=?, parent=?, mtime=?, etag=? \
-                 WHERE fileid=?"
+                 SET path=$1, path_hash=$2, name=$3, parent=$4, mtime=$5, etag=$6 \
+                 WHERE fileid=$7"
             );
             sqlx::query(&sql_node)
                 .bind(&to_fc)
@@ -682,7 +682,7 @@ impl DavFileSystem for NcFileSystem {
             // then insert new row by re-reading disk metadata.
             let _ = sqlx::query(&format!(
                 "DELETE FROM {prefix}filecache \
-                 WHERE storage = ? AND path_hash = ?",
+                 WHERE storage = $1 AND path_hash = $2",
                 prefix = self.state.table_prefix
             ))
             .bind(self.storage_id)
@@ -727,7 +727,7 @@ impl DavFileSystem for NcFileSystem {
                         "INSERT INTO {prefix}filecache \
                          (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
                           size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time) \
-                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"
                     );
                     let _ = sqlx::query(&sql)
                         .bind(fid)
@@ -769,7 +769,7 @@ impl DavFileSystem for NcFileSystem {
                 .unwrap_or_default()
                 .as_secs() as i64;
             let sql = format!(
-                "UPDATE {prefix}filecache SET mtime=?, storage_mtime=? WHERE storage=? AND path_hash=?",
+                "UPDATE {prefix}filecache SET mtime=$1, storage_mtime=$2 WHERE storage=$3 AND path_hash=$4",
                 prefix = self.state.table_prefix
             );
             sqlx::query(&sql)
@@ -989,8 +989,8 @@ impl DavFileSystem for NcFileSystem {
                             if let Some(val) = extract_text_from_prop_xml(&prop) {
                                 let etag = val.trim().trim_matches('"').to_string();
                                 let sql = format!(
-                                    "UPDATE {prefix}filecache SET etag=? \
-                                     WHERE storage=? AND path_hash=?",
+                                    "UPDATE {prefix}filecache SET etag=$1 \
+                                     WHERE storage=$2 AND path_hash=$3",
                                     prefix = self.state.table_prefix
                                 );
                                 let ok = sqlx::query(&sql)
@@ -1021,8 +1021,8 @@ impl DavFileSystem for NcFileSystem {
                                 });
                                 if let Some(ts) = ts_opt {
                                     let sql = format!(
-                                        "UPDATE {prefix}filecache SET mtime=?, storage_mtime=? \
-                                         WHERE storage=? AND path_hash=?",
+                                        "UPDATE {prefix}filecache SET mtime=$1, storage_mtime=$2 \
+                                         WHERE storage=$3 AND path_hash=$4",
                                         prefix = self.state.table_prefix
                                     );
                                     let _ = sqlx::query(&sql)
@@ -1051,8 +1051,8 @@ impl DavFileSystem for NcFileSystem {
                                     let sql = format!(
                                         "INSERT INTO {prefix}filecache_extended \
                                          (fileid, creation_time, metadata_etag, upload_time) \
-                                         SELECT fileid, ?, NULL, upload_time FROM {prefix}filecache \
-                                         WHERE storage=? AND path_hash=? \
+                                         SELECT fileid, $1, NULL, upload_time FROM {prefix}filecache \
+                                         WHERE storage=$2 AND path_hash=$3 \
                                          ON CONFLICT(fileid) DO UPDATE SET creation_time=excluded.creation_time",
                                         prefix = self.state.table_prefix
                                     );
@@ -1085,8 +1085,8 @@ impl DavFileSystem for NcFileSystem {
                                     let sql_upsert = format!(
                                         "INSERT INTO {prefix}filecache_extended \
                                          (fileid, creation_time, metadata_etag, upload_time) \
-                                         SELECT fileid, ?, NULL, upload_time FROM {prefix}filecache \
-                                         WHERE storage = ? AND path_hash = ? \
+                                         SELECT fileid, $1, NULL, upload_time FROM {prefix}filecache \
+                                         WHERE storage = $2 AND path_hash = $3 \
                                          ON CONFLICT(fileid) DO UPDATE SET creation_time = excluded.creation_time",
                                         prefix = self.state.table_prefix,
                                     );
@@ -1114,8 +1114,8 @@ impl DavFileSystem for NcFileSystem {
                                     let sql_upsert = format!(
                                         "INSERT INTO {prefix}filecache_extended \
                                          (fileid, upload_time, metadata_etag, creation_time) \
-                                         SELECT fileid, ?, NULL, creation_time FROM {prefix}filecache \
-                                         WHERE storage = ? AND path_hash = ? \
+                                         SELECT fileid, $1, NULL, creation_time FROM {prefix}filecache \
+                                         WHERE storage = $2 AND path_hash = $3 \
                                          ON CONFLICT(fileid) DO UPDATE SET upload_time = excluded.upload_time",
                                         prefix = self.state.table_prefix,
                                     );
@@ -1164,7 +1164,7 @@ impl NcFileSystem {
     ) {
         let like = format!("{old_prefix}/%");
         let sql_fetch =
-            format!("SELECT fileid, path FROM {prefix}filecache WHERE storage = ? AND path LIKE ?");
+            format!("SELECT fileid, path FROM {prefix}filecache WHERE storage = $1 AND path LIKE $2");
         let rows = sqlx::query(&sql_fetch)
             .bind(self.storage_id)
             .bind(&like)
@@ -1178,7 +1178,7 @@ impl NcFileSystem {
             let new_hash = row::path_hash(&new_path);
             let fileid: i64 = r.get("fileid");
             let sql_upd =
-                format!("UPDATE {prefix}filecache SET path=?, path_hash=? WHERE fileid=?");
+                format!("UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3");
             let _ = sqlx::query(&sql_upd)
                 .bind(&new_path)
                 .bind(&new_hash)

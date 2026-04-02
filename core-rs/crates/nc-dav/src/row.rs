@@ -84,7 +84,7 @@ pub async fn lookup_storage_id(
         format!("local::{data_dir}/{uid}/"),
         format!("local::{data_dir}{uid}/"),
     ];
-    let sql = format!("SELECT numeric_id FROM {prefix}storages WHERE id = ?");
+    let sql = format!("SELECT numeric_id FROM {prefix}storages WHERE id = $1");
     for key in &candidates {
         if let Some(row) = sqlx::query(&sql)
             .bind(key)
@@ -112,7 +112,7 @@ pub async fn lookup_by_path(
     let sql = format!(
         "SELECT fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
          size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time \
-         FROM {prefix}filecache WHERE storage = ? AND path_hash = ?"
+         FROM {prefix}filecache WHERE storage = $1 AND path_hash = $2"
     );
     sqlx::query(&sql)
         .bind(storage)
@@ -129,7 +129,7 @@ pub async fn lookup_by_id(pool: &DbPool, prefix: &str, fileid: i64) -> Option<Fi
     let sql = format!(
         "SELECT fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
          size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time \
-         FROM {prefix}filecache WHERE fileid = ?"
+         FROM {prefix}filecache WHERE fileid = $1"
     );
     sqlx::query(&sql)
         .bind(fileid)
@@ -150,7 +150,7 @@ pub async fn list_children(
     let sql = format!(
         "SELECT fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
          size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time \
-         FROM {prefix}filecache WHERE parent = ? AND storage = ?"
+         FROM {prefix}filecache WHERE parent = $1 AND storage = $2"
     );
     sqlx::query(&sql)
         .bind(parent_id)
@@ -167,7 +167,7 @@ pub async fn list_children(
 pub async fn get_extended(pool: &DbPool, prefix: &str, fileid: i64) -> FileCacheExtRow {
     let sql = format!(
         "SELECT metadata_etag, creation_time, upload_time \
-         FROM {prefix}filecache_extended WHERE fileid = ?"
+         FROM {prefix}filecache_extended WHERE fileid = $1"
     );
     sqlx::query(&sql)
         .bind(fileid)
@@ -200,8 +200,11 @@ pub async fn list_extended_batch(
         return std::collections::HashMap::new();
     }
 
-    // Build an IN clause with one `?` placeholder per fileid.
-    let placeholders = fileids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    // Build an IN clause with numbered $N placeholders per fileid.
+    let placeholders = (1..=fileids.len())
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
         "SELECT fileid, metadata_etag, creation_time, upload_time \
          FROM {prefix}filecache_extended WHERE fileid IN ({placeholders})"
@@ -242,9 +245,9 @@ pub async fn count_children(
     use sqlx::Row as _;
     let sql = format!(
         "SELECT \
-         SUM(CASE WHEN mimetype = ? THEN 1 ELSE 0 END) AS dirs, \
-         SUM(CASE WHEN mimetype != ? THEN 1 ELSE 0 END) AS files \
-         FROM {prefix}filecache WHERE parent = ? AND storage = ?"
+         SUM(CASE WHEN mimetype = $1 THEN 1 ELSE 0 END) AS dirs, \
+         SUM(CASE WHEN mimetype != $2 THEN 1 ELSE 0 END) AS files \
+         FROM {prefix}filecache WHERE parent = $3 AND storage = $4"
     );
     let row = sqlx::query(&sql)
         .bind(dir_mimetype_id)
@@ -270,7 +273,7 @@ pub async fn count_children(
 /// Falls back to returning `uid` if no row exists or the `displayname` column
 /// is NULL or empty.  This is used for `{oc:}owner-display-name` (REQ §6.5).
 pub async fn lookup_user_display_name(pool: &DbPool, prefix: &str, uid: &str) -> String {
-    let sql = format!("SELECT displayname FROM {prefix}users WHERE uid = ?");
+    let sql = format!("SELECT displayname FROM {prefix}users WHERE uid = $1");
     sqlx::query(&sql)
         .bind(uid)
         .fetch_optional(pool)
@@ -298,7 +301,7 @@ pub async fn get_subtree_max_mtime(
     let sql = format!(
         "SELECT MAX(mtime) AS m \
          FROM {prefix}filecache \
-         WHERE storage = ? AND (path = ? OR path LIKE ?)"
+         WHERE storage = $1 AND (path = $2 OR path LIKE $3)"
     );
     sqlx::query_scalar::<_, Option<i64>>(&sql)
         .bind(storage_id)
@@ -318,7 +321,7 @@ pub async fn get_subtree_max_mtime(
 /// `{oc:}permissions` (PHASE-7.6).  Returns `None` when the storage row does
 /// not exist.
 pub async fn get_storage_string_id(pool: &DbPool, prefix: &str, numeric_id: i64) -> Option<String> {
-    let sql = format!("SELECT id FROM {prefix}storages WHERE numeric_id = ?");
+    let sql = format!("SELECT id FROM {prefix}storages WHERE numeric_id = $1");
     sqlx::query_scalar::<_, Option<String>>(&sql)
         .bind(numeric_id)
         .fetch_optional(pool)
@@ -343,7 +346,7 @@ pub async fn get_share_max_permissions(
 ) -> i32 {
     let sql = format!(
         "SELECT MAX(permissions) FROM {prefix}share \
-         WHERE (uid_owner = ? OR uid_initiator = ?) AND file_source = ? \
+         WHERE (uid_owner = $1 OR uid_initiator = $2) AND file_source = $3 \
          AND share_type IN (0,1,3)"
     );
     sqlx::query_scalar::<_, Option<i32>>(&sql)
@@ -366,7 +369,7 @@ pub async fn get_share_max_permissions(
 /// Returns an empty string when no note exists (REQ §6.5, PHASE-7.6).
 pub async fn get_share_note(pool: &DbPool, prefix: &str, fileid: i64) -> String {
     let sql = format!(
-        "SELECT note FROM {prefix}share WHERE file_source = ? AND note != '' \
+        "SELECT note FROM {prefix}share WHERE file_source = $1 AND note != '' \
          ORDER BY stime DESC LIMIT 1"
     );
     sqlx::query_scalar::<_, Option<String>>(&sql)
@@ -398,7 +401,7 @@ pub async fn list_changed_since(
         "SELECT fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
          size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time \
          FROM {prefix}filecache \
-         WHERE storage = ? AND (path = ? OR path LIKE ?) AND mtime > ?"
+         WHERE storage = $1 AND (path = $2 OR path LIKE $3) AND mtime > $4"
     );
     sqlx::query(&sql)
         .bind(storage_id)

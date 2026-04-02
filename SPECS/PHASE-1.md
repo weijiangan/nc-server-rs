@@ -15,7 +15,7 @@ Goal: the binary listens on a port, routes every Nextcloud URL prefix to a place
 ### 1.2 `/status.php`
 - [x] Returns `Content-Type: application/json`, `Access-Control-Allow-Origin: *`
 - [x] JSON body with all fields from REQ §3: `installed`, `maintenance`, `needsDbUpgrade`, `version`, `versionstring`, `edition`, `productname`, `extendedSupport`
-- [x] Values read from the app config cache (`oc_appconfig`) — no direct DB query per request
+- [x] `installed` and `maintenance` read from `NcConfig` (parsed from `config.php` — PHP writes these via `SystemConfig`, not `oc_appconfig`). Version strings and all other fields read from `AppConfigCache` (`oc_appconfig`) — no direct DB query per request.
 - [x] `/status.php` is always served, even when `maintenance = true`
 
 **Verify:** `build/integration/features/maintenance-mode.feature` — the maintenance-mode status assertion passes; JSON fields present and correctly typed under `jq`. ✅
@@ -23,7 +23,7 @@ Goal: the binary listens on a port, routes every Nextcloud URL prefix to a place
 ### 1.3 Maintenance mode middleware
 - [x] Middleware runs before all handlers except `/status.php` and `/heartbeat`
 - [x] When `maintenance = true`: respond `503`, headers `X-Nextcloud-Maintenance-Mode: 1`, `Retry-After: 120`, body as plain text for DAV or OCS envelope for OCS routes
-- [x] Reads from the app config cache — no DB query per request
+- [x] Reads `NcConfig.maintenance` (from `config.php` at startup) — no DB query per request. Toggling maintenance requires a server restart (PHP writes to `config.php`, not `oc_appconfig`).
 
 **Verify:** `build/integration/features/maintenance-mode.feature` — all 503 scenarios pass. Toggle `maintenance` in DB, confirm next non-status request returns 503 without server restart. ✅
 

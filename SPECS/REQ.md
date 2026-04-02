@@ -105,7 +105,7 @@ Returns `Content-Type: application/json`, `Access-Control-Allow-Origin: *`, and:
 }
 ```
 
-All values read from DB (`oc_appconfig`) or config file (`config/config.php` or equivalent Rust config).
+All values read from `config/config.php` (system config) or DB (`oc_appconfig`). **`installed` and `maintenance` come from `config.php` via `SystemConfig::getValue()` — not from `oc_appconfig`.** Version strings (`oc_version`, `versionstring`) come from `oc_appconfig` under `core`.
 
 ---
 
@@ -117,7 +117,8 @@ All values read from DB (`oc_appconfig`) or config file (`config/config.php` or 
 |---|---|---|
 | Basic (password) | `Authorization: Basic …` header | Password or app token |
 | Bearer token | `Authorization: Bearer …` header | App token / OAuth2 token |
-| Session cookie | `nc_session_id` cookie + SameSite guard cookies | Web browser flow (see §15.2 for cookie names) |
+| Session cookie | `{instanceid}` cookie (PHP session) + SameSite guard cookies | Web browser flow (see §15.2 for cookie names). The PHP session cookie is named after `config.php`'s `instanceid` value (e.g., `oc1a2b3c4d5e`), set via `session_name(OC_Util::getInstanceId())` in `lib/base.php:437,447`. **Not** `nc_session_id` — that is a separate remember-me cookie. |
+| Remember-me cookies | `nc_token` + `nc_username` + `nc_session_id` cookies | Used by `loginWithCookie()` when the PHP session has expired but remember-me cookies remain. All three must be present. `nc_token` is validated against `oc_preferences` `login_token` entries, rotated on each use. `nc_session_id` stores the old `session_id()` for `renewSessionToken()`. |
 | Password-less token | Basic header, token has `passwordless = true` | No password login permitted |
 
 ### 4.2 Token storage (`oc_authtoken`)
@@ -125,9 +126,9 @@ All values read from DB (`oc_appconfig`) or config file (`config/config.php` or 
 Each app password / device token is a row in `oc_authtoken` with:
 - `uid` (owner user)
 - `login_name`
-- `password` (bcrypt-hashed)
+- `password` (encrypted password for token refresh — NOT bcrypt; encrypted with the token itself as key)
 - `name` (device/client label)
-- `token` (SHA-512 hashed session token)
+- `token` (hashed session token — see hashing note below)
 - `type` (`0` = temporary session, `1` = permanent app token, `2` = wipe token)
 - `last_activity` (unix timestamp, updated per request)
 - `last_check` (timestamp for periodic password re-validation)
@@ -135,13 +136,38 @@ Each app password / device token is a row in `oc_authtoken` with:
 - `expires` (optional expiry timestamp)
 - `private_key` / `public_key` (end-to-end encryption keys)
 
-Token lookup on each request: hash the bearer value with SHA-512, query `oc_authtoken.token`.
+**Token hash algorithm** (source: `lib/private/Authentication/Token/PublicKeyTokenProvider.php:412-421`):
+- Primary: `hash('sha512', $token . $secret)` — SHA-512 of the **concatenation** of raw token value + server secret from `config.php`'s `secret` key. This is NOT plain SHA-512 and NOT HMAC.
+- Fallback (pre-NC 20 installs without a secret): `hash('sha512', $token)` — plain SHA-512 without the secret suffix.
+
+Token lookup on each request: compute `SHA-512(raw_token || server_secret)`, query `oc_authtoken.token`.
 
 ### 4.3 DAV authentication precedence
 
-1. If a valid session cookie is present and the `AUTHENTICATED_TO_DAV_BACKEND` session key matches the current user → accept without re-checking credentials.
-2. If `Authorization: Bearer {token}` is present → validate via `IUserSession::tryTokenLogin`. On failure: return HTTP 401 **with no `WWW-Authenticate` header** (unlike Basic auth). Exception: if `oauth2.enable_oc_clients = true` in config and the `User-Agent` contains `mirall`, send a standard `WWW-Authenticate` challenge.
-3. If `Authorization: Basic {base64}` → attempt password login against `oc_users` / user backend, create session, set `AUTHENTICATED_TO_DAV_BACKEND`.
+**Pre-auth phase** (runs before `Auth.php`): `OC::handleLogin()` in `lib/base.php:1225-1255` establishes the logged-in state via these checks in order:
+1. Apache auth (`OC_User::handleApacheAuth()`)
+2. Token login (`$userSession->tryTokenLogin($request)` — `Session.php:818-862`):
+   - If `Authorization: Bearer {token}` → use bearer value as the token
+   - Else if the `{instanceid}` cookie is present → use `$this->session->getId()` (the PHP session ID) as the token
+   - Hash the token via `hash('sha512', $token . $secret)`, look up in `oc_authtoken`
+   - If found: `loginWithToken()` → `setUser()` → sets `$_SESSION['user_id']`
+   - Browser sessions create a `type=0` (TEMPORARY_TOKEN) row in `oc_authtoken` via `createSessionToken()` at login time, so the PHP session ID is a valid token
+3. Remember-me cookies: requires ALL THREE `$_COOKIE['nc_username']`, `$_COOKIE['nc_token']`, `$_COOKIE['nc_session_id']` → `loginWithCookie($uid, $token, $oldSessionId)` (`Session.php:871-935`)
+4. Basic auth (`$userSession->tryBasicAuthLogin($request, $throttler)`)
+
+**DAV auth phase** (`Auth.php::auth()` — `apps/dav/lib/Connector/Sabre/Auth.php:163-197`): runs after `handleLogin()` has (possibly) established a session.
+1. CSRF check first (`requiresCSRFCheck()` — see §4.4). POST CSRF failure → forced logout + re-challenge.
+2. 2FA check: if `twoFactorManager->needsSecondFactor()` → `401 "2FA challenge not passed."`
+3. Session shortcuts (checked in this order):
+   - Logged in AND `AUTHENTICATED_TO_DAV_BACKEND` is `null` → accept ("Fix for broken webdav clients" — first DAV request in session, `Auth.php:186`)
+   - Logged in AND `AUTHENTICATED_TO_DAV_BACKEND === current UID` AND no `Authorization` header → accept ("Well behaved clients that only send the cookie", `Auth.php:188`)
+   - Apache auth → accept
+4. Fall through to `parent::check()` (SabreDAV `AbstractBasic::check()` — parses `Authorization: Basic` header, calls `validateUserPass()` which calls `logClientIn()` and sets `AUTHENTICATED_TO_DAV_BACKEND` on success, `Auth.php:91`)
+5. Bearer token failure: return HTTP 401 **with no `WWW-Authenticate` header** (unlike Basic auth). Exception: if `oauth2.enable_oc_clients = true` in config and the `User-Agent` contains `mirall`, send a standard `WWW-Authenticate` challenge.
+
+**`AUTHENTICATED_TO_DAV_BACKEND`** stores a **UID string** (not a boolean). Set at `Auth.php:91`: `$this->session->set(self::DAV_AUTHENTICATED, $this->userSession->getUser()->getUID())`. Checked at `Auth.php:63-65`: `$this->session->get(self::DAV_AUTHENTICATED) === $username`. This prevents session fixation when a WebDAV client resends cookies after an account change.
+
+**Response headers on auth failure:**
 4. If the request is from an XMLHttpRequest (`X-Requested-With: XMLHttpRequest`) and Basic auth fails → respond with `WWW-Authenticate: DummyBasic realm="…"` (prevents browser pop-up).
 5. If not an XMLHttpRequest and Basic auth fails → respond with `WWW-Authenticate: Basic realm="Nextcloud"`.
 
@@ -789,10 +815,9 @@ This table is read during DAV authentication (§4.5) to check if the user has a 
 - Use `sqlx::migrate!()` with versioned SQL files (one file per schema change, named with timestamp).
 - Migrations are idempotent: check `sqlx_migrations` table (created automatically by sqlx) for applied versions.
 - Interop with PHP Nextcloud databases: SQL migration files must be additive only when the schema already exists. Never drop or rename existing columns.
-- On fresh install: create all tables from scratch, write initial `oc_appconfig` keys:
-  - `core / installed = true`
-  - `core / version = {version}`
-  - `core / lastupdatedat = {timestamp}`
+- On fresh install: create all tables from scratch, then:
+  - Write to **`config.php`** (via `SystemConfig::setValue`): `installed = true`, `instanceid`, `secret`, `passwordsalt`
+  - Write to **`oc_appconfig`**: `core / oc_version = {version}`, `core / versionstring = {versionstring}`, `core / lastupdatedat = {timestamp}`, `core / installedat = {microtime}`
   - An admin user record in `oc_users` and `oc_accounts`
 - Supported DBs: PostgreSQL, MySQL/MariaDB, SQLite.
 
@@ -970,24 +995,30 @@ Content-Security-Policy: default-src 'none';
 
 Nextcloud uses a double-submit cookie + server-side token pattern. Cookies set on browser sessions:
 
-| Cookie | Notes |
-|---|---|
-| `nc_session_id` | PHP session identifier (set by `setMagicInCookie` for remember-me logins) |
-| `nc_token` | Persistent remember-me token (also set by `setMagicInCookie`; triggers the SameSite cookie check when present) |
-| `nc_sameSiteCookielax` | Dummy cookie, `SameSite=lax` — note **lowercase** `l` and `s` in the cookie name |
-| `nc_sameSiteCookiestrict` | Dummy cookie, `SameSite=strict` — note **lowercase** `l` and `s` in the cookie name |
+| Cookie | Set by | Value | Notes |
+|---|---|---|---|
+| `{instanceid}` (e.g., `oc1a2b3c4d5e`) | PHP `session_start()` via `session_name(OC_Util::getInstanceId())` (`lib/base.php:437,447`) | PHP session ID | **The actual PHP session cookie.** Named after `config.php`'s `instanceid` key. Used by `tryTokenLogin()` to detect an existing session. `cookieCheckRequired()` checks for this cookie (via `session_name()`) to trigger the SameSite guard. |
+| `oc_sessionPassphrase` | `CryptoWrapper.php:40,56` | Random 128-char string | Encryption key for `CryptoSessionData`. Used to decrypt `$_SESSION` data. Session-scoped (no `Max-Age`). |
+| `nc_session_id` | `setMagicInCookie()` (`Session.php:1012`) | Copy of `session_id()` | **Not the PHP session cookie.** Remember-me cookie — stores the old session ID so `loginWithCookie()` can call `renewSessionToken($oldSessionId, $newSessionId)`. |
+| `nc_token` | `setMagicInCookie()` (`Session.php:1002`) | Random 32-char string | Remember-me token. Validated against `oc_preferences` entries with `appid='login_token'`, `configkey=$token`, `configvalue=$timestamp`. Rotated on each successful use. |
+| `nc_username` | `setMagicInCookie()` (`Session.php:993`) | UID string | Remember-me username. Used by `loginWithCookie()` to look up the user. |
+| `nc_sameSiteCookielax` | `base.php` | `"true"` | Dummy cookie, `SameSite=lax` — note **lowercase** `l` and `s` in the cookie name |
+| `nc_sameSiteCookiestrict` | `base.php` | `"true"` | Dummy cookie, `SameSite=strict` — note **lowercase** `l` and `s` in the cookie name |
 
 > **Note on cookie name casing:** The actual cookie names use all-lowercase suffixes (`nc_sameSiteCookielax`, `nc_sameSiteCookiestrict`), not camelCase. On HTTPS with path `/`, the `__Host-` prefix is prepended (`__Host-nc_sameSiteCookielax`).
 
-The `cookieCheckRequired()` logic: the SameSite cookie check is **only triggered** when a request includes either `session_name()` (the PHP session cookie) or `nc_token`. If neither is present, the check is bypassed.
+The `cookieCheckRequired()` logic (`lib/private/AppFramework/Http/Request.php:466-474`): the SameSite cookie check is **only triggered** when a request includes either the `{instanceid}` cookie (accessed via `session_name()`) or `nc_token`. If neither is present, the check is bypassed.
 
 The `passesStrictCookieCheck()` verifies both `nc_sameSiteCookiestrict=true` and `nc_sameSiteCookielax=true` are present.
 
 Bypass rules (no strict cookie check required):
-- `OCS-APIREQUEST: true` header present
-- `Authorization: Bearer …` header present (token-authenticated requests)
+- `OCS-APIREQUEST: true` header present (`cookieCheckRequired()` returns false — `Request.php:467-469`)
+- `Authorization: Bearer …` header present (token-authenticated requests — no session cookies sent)
+- User-Agent matches WebDAVFS or Microsoft-WebDAV-MiniRedir (`base.php:578-580` — skips the entire SameSite check block)
 
-The `SameSiteCookieMiddleware` only applies to requests routed through `index.php` — not to DAV or OCS routes directly.
+**SameSite check scope** (`base.php:582-608`): the strict cookie check is enforced based on the processing script. `index.php`, `cron.php`, and `public.php` **skip** the check (return early at `base.php:590-593`). **All other scripts** — including `remote.php`, `ocs/v1.php`, `ocs/v2.php` — **enforce** `passesStrictCookieCheck()` and return **HTTP 412 Precondition Failed** (not 401) on failure.
+
+> ~~The `SameSiteCookieMiddleware` only applies to requests routed through `index.php` — not to DAV or OCS routes directly.~~ **WRONG** — see above. The `base.php` enforcement applies to DAV and OCS routes. The `SameSiteCookieMiddleware` in the AppFramework is a separate layer for `index.php` routes only, but `base.php` has its own enforcement for all other scripts.
 
 CSRF token check (separate from cookie check):
 - Failure on non-POST → HTTP 401
@@ -1055,6 +1086,8 @@ The Rust server reads `config/config.php` (for compat with existing Nextcloud in
 | `oauth2.enable_oc_clients` | bool | Default false |
 | `loglevel` | int | 0=DEBUG … 4=FATAL |
 | `logfile` | string | Log file path |
+| `instanceid` | string | Instance identifier (e.g., `oc1a2b3c4d5e`). Used as PHP `session_name()` — the session cookie is named after this value. Also used in `{oc:}id` DAV property (zero-padded fileid + instanceid). Auto-generated on first install as `'oc' + random(10)`. Required for session cookie detection. |
+| `secret` | string | Server secret. Used in token hash: `hash('sha512', $token . $secret)` (`PublicKeyTokenProvider.php:414`). Required for all auth token lookups against `oc_authtoken`. Auto-generated on install. |
 
 ---
 

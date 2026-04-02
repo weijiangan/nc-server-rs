@@ -28,7 +28,7 @@ pub async fn requires_2fa(uid: &str, token_type: i16, pool: &DbPool, prefix: &st
 
     let table = format!("{prefix}twofactor_providers");
     let count: i64 = sqlx::query_scalar(&format!(
-        "SELECT COUNT(*) FROM {table} WHERE uid = ? AND enabled = 1"
+        "SELECT COUNT(*) FROM {table} WHERE uid = $1 AND enabled = 1"
     ))
     .bind(uid)
     .fetch_one(pool)

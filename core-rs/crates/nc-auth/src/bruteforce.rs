@@ -76,7 +76,7 @@ pub async fn check_throttle(
     // REQ §4.6: > max_attempts in 30 min → 429.
     let short_count: i64 = sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM {table} \
-         WHERE action = ? AND subnet = ? AND occurred >= ?"
+         WHERE action = $1 AND subnet = $2 AND occurred >= $3"
     ))
     .bind(action)
     .bind(&subnet)
@@ -97,7 +97,7 @@ pub async fn check_throttle(
     // REQ §4.6: over-threshold in 12 h → throttle (sleep), not 429.
     let long_count: i64 = sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM {table} \
-         WHERE action = ? AND subnet = ? AND occurred >= ?"
+         WHERE action = $1 AND subnet = $2 AND occurred >= $3"
     ))
     .bind(action)
     .bind(&subnet)
@@ -134,7 +134,7 @@ pub async fn record_attempt(action: &str, client_ip: &str, pool: &DbPool, prefix
 
     let _ = sqlx::query(&format!(
         "INSERT INTO {table}(action, occurred, ip, subnet, metadata) \
-         VALUES(?, ?, ?, ?, ?)"
+         VALUES($1, $2, $3, $4, $5)"
     ))
     .bind(action)
     .bind(now)

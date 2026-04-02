@@ -63,17 +63,11 @@ $_NC_IS_AUTHENTICATED = reject_unauthenticated_shim_request();
 // 1. Inside NC root at core-rs/php-shim/index.php (development)
 // 2. In a separate location like /usr/local/share/nc-server/php-shim/index.php (Docker)
 //
-// The Rust proxy passes NC_ROOT as the Nextcloud root directory.
+// The Rust proxy passes DOCUMENT_ROOT as the Nextcloud root directory.
 // Fall back to NC_ORIGINAL_SCRIPT or dirname(__DIR__, 2) if not available.
-$_NC_ROOT = resolve_nc_root();
+$_NC_ROOT = $_SERVER['DOCUMENT_ROOT'] 
+    ?? (!empty($_SERVER['NC_ORIGINAL_SCRIPT']) ? dirname(dirname($_SERVER['NC_ORIGINAL_SCRIPT'])) : dirname(__DIR__, 2));
 
-// ── Fix SCRIPT_FILENAME for OC::init() path calculations ─────────────────────
-// OC::init() → initPaths() computes OC::$SUBURI as:
-//   substr(realpath(SCRIPT_FILENAME), strlen(SERVERROOT))
-// If SCRIPT_FILENAME points to the shim (core-rs/php-shim/index.php), $SUBURI
-// becomes "/core-rs/php-shim/index.php" which breaks $WEBROOT derivation.
-// Override SCRIPT_FILENAME to the original entry-point so initPaths() sees
-// e.g. "/var/www/html/index.php" and computes $SUBURI = "/index.php" correctly.
 $_SERVER['SCRIPT_FILENAME'] = $_SERVER['NC_ORIGINAL_SCRIPT'] ?? $_NC_ROOT . '/index.php';
 
 // ── Load the Nextcloud framework ──────────────────────────────────────────────
@@ -223,29 +217,6 @@ function route_ocs_php(): void
         }
         \OC\OCS\ApiHelper::respond(\OCP\AppFramework\OCSController::RESPOND_SERVER_ERROR, $txt);
     }
-}
-
-/**
- * Resolve the Nextcloud installation root directory.
- *
- * Resolution order:
- *   1. NC_ROOT — set by the Rust proxy on every FastCGI request to the
- *      NC root (most reliable; works for both in-tree and out-of-tree shim).
- *   2. dirname(dirname(NC_ORIGINAL_SCRIPT)) — NC_ORIGINAL_SCRIPT is the
- *      absolute path of the original PHP entry point (e.g. /var/www/html/index.php),
- *      so two dirname() calls yield the NC root.
- *   3. dirname(__DIR__, 2) — compile-time fallback for the development layout
- *      where the shim lives at {NC_ROOT}/core-rs/php-shim/index.php.
- */
-function resolve_nc_root(): string
-{
-    if (!empty($_SERVER['NC_ROOT'])) {
-        return $_SERVER['NC_ROOT'];
-    }
-    if (!empty($_SERVER['NC_ORIGINAL_SCRIPT'])) {
-        return dirname(dirname($_SERVER['NC_ORIGINAL_SCRIPT']));
-    }
-    return dirname(__DIR__, 2);
 }
 
 /**
@@ -505,18 +476,6 @@ function route_public_php(string $ncRoot): void
  */
 function session_resolve_handler(): void
 {
-    // ── Silence PHP error output ─────────────────────────────────────────────
-    // ob_start() below captures echo/print output but does NOT intercept
-    // xdebug in develop mode: xdebug writes E_WARNING HTML directly to the
-    // FastCGI stdout stream (via the SAPI's ub_write hook), bypassing all
-    // output buffers.  When that happens PHP auto-sends a text/html header,
-    // xdebug HTML lands in the CGI body, and the Rust caller's JSON parser
-    // fails on "<br /><table class='xdebug-error …'.  Suppressing both
-    // display_errors and html_errors here ensures the response body is always
-    // clean JSON regardless of the environment's xdebug/PHP config.
-    ini_set('display_errors', '0');
-    ini_set('html_errors', '0');
-
     // ── Trust check ──────────────────────────────────────────────────────────
     // HTTP_X_NC_PROXIED=1 is injected by the Rust proxy on every proxied
     // request and stripped from any client-supplied X-NC-Proxied header.
@@ -566,22 +525,13 @@ function session_resolve_handler(): void
     // performSameSiteCookieProtection() skips the check when basename of
     // $request->getScriptName() === 'index.php'.  Use index.php to ensure
     // base.php does not run its SameSite check on this internal path.
-    //
-    // NC_ROOT is the Nextcloud root passed by the Rust proxy in the
-    // session-resolve FastCGI params.  Fall back to NC_ORIGINAL_SCRIPT or
-    // dirname(__DIR__, 2) — see resolve_nc_root().
-    $ncRoot = resolve_nc_root();
+    $ncRoot = dirname(__DIR__, 2);
     $_SERVER['SCRIPT_FILENAME'] = $ncRoot . '/index.php';
     $_SERVER['SCRIPT_NAME']     = '/index.php';
 
     // ── Bootstrap ────────────────────────────────────────────────────────────
     // base.php calls OC::init() at file scope which sets up the DI container,
     // session (initSession → Internal → CryptoWrapper), and all OCP services.
-    //
-    // Capture all output during bootstrap so that PHP warnings, xdebug HTML
-    // error blocks, or any other incidental output do not pollute the JSON
-    // response body.  The buffer is discarded before we emit JSON below.
-    ob_start();
     require_once $ncRoot . '/lib/versioncheck.php';
     require_once $ncRoot . '/lib/base.php';
 
@@ -612,14 +562,10 @@ function session_resolve_handler(): void
     $davAuth = $session->get('AUTHENTICATED_TO_DAV_BACKEND');
 
     // ── Emit JSON response ───────────────────────────────────────────────────
-    // Discard anything that leaked into the output buffer during bootstrap
-    // (PHP warnings, xdebug HTML blocks, etc.) so the response body contains
-    // only valid JSON.
     // Any Set-Cookie headers emitted by loginWithCookie() side effects are
     // already in the FastCGI stdout header block — no explicit action needed.
     // The Rust caller (§7.9.4) reads them from the response and injects them
     // into the real HTTP response it sends to the browser.
-    ob_end_clean();
     header('Content-Type: application/json; charset=UTF-8');
     echo json_encode(
         [

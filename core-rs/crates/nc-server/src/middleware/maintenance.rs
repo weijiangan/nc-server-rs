@@ -8,15 +8,16 @@ use crate::state::AppState;
 
 /// Maintenance-mode middleware.
 ///
-/// When `core.maintenance = true` in `oc_appconfig`, every route **except**
-/// `/status.php` and `/heartbeat` returns:
+/// When `maintenance = true` in `config/config.php` (read at startup into
+/// `NcConfig`), every route **except** `/status.php` and `/heartbeat` returns:
 ///   HTTP 503
 ///   X-Nextcloud-Maintenance-Mode: 1
 ///   Retry-After: 120
 ///
 /// OCS routes (`/ocs/`) get an OCS-envelope body; all other routes get
-/// plain text.  The check is a single `RwLock::read()` on the in-memory
-/// cache — no DB query per request.
+/// plain text.  PHP writes `maintenance` via `SystemConfig::setValue()` to
+/// `config.php` — never to `oc_appconfig` — so checking `NcConfig` is correct.
+/// Toggling maintenance mode while the server is running requires a restart.
 pub async fn maintenance_guard(
     axum::extract::State(state): axum::extract::State<AppState>,
     request: Request<Body>,
@@ -29,11 +30,7 @@ pub async fn maintenance_guard(
         return next.run(request).await;
     }
 
-    let is_maintenance = state
-        .appconfig_cache
-        .read()
-        .expect("appconfig lock poisoned")
-        .is_maintenance();
+    let is_maintenance = state.nc_config.maintenance;
 
     if !is_maintenance {
         return next.run(request).await;

@@ -31,7 +31,7 @@ pub struct BasicAuthResult {
 ///
 /// Priority (REQ §4.1, §4.2, §4.3):
 /// 1. Try app-token path first: hash `password` with SHA-512 (v1) or
-///    HMAC-SHA512 with `app_secret` (v2), query `oc_authtoken.token` where
+///    SHA-512(`password` ‖ `app_secret`) (v2), query `oc_authtoken.token` where
 ///    `login_name = login`. If found and not expired → success with token auth.
 /// 2. Try plain-password path: `oc_users` bcrypt check.
 ///
@@ -57,7 +57,7 @@ pub async fn verify_basic(
     let table = format!("{prefix}users");
 
     let row: Option<(String, String)> = sqlx::query_as(&format!(
-        "SELECT uid, password FROM {table} WHERE uid_lower = ?"
+        "SELECT uid, password FROM {table} WHERE uid_lower = $1"
     ))
     .bind(login.to_lowercase())
     .fetch_optional(pool)
@@ -68,11 +68,9 @@ pub async fn verify_basic(
     let (uid, hash) = row?;
 
     let password = password.to_string();
-    let ok = tokio::task::spawn_blocking(move || {
-        bcrypt::verify(&password, &hash).unwrap_or(false)
-    })
-    .await
-    .unwrap_or(false);
+    let ok = tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash).unwrap_or(false))
+        .await
+        .unwrap_or(false);
 
     if ok {
         Some(BasicAuthResult {
@@ -108,7 +106,7 @@ async fn try_app_token(
     let row: Option<(i64, String, i16, Option<i64>)> = sqlx::query_as(&format!(
         "SELECT id, uid, type, expires \
          FROM {table} \
-         WHERE token = ? AND login_name = ?"
+         WHERE token = $1 AND login_name = $2"
     ))
     .bind(&hash_hex)
     .bind(login)

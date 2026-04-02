@@ -141,7 +141,7 @@ async fn resolve_effective_quota(
 async fn lookup_quota_preference(pool: &DbPool, prefix: &str, uid: &str) -> Option<String> {
     let sql = format!(
         "SELECT configvalue FROM {prefix}preferences \
-         WHERE userid = ? AND appid = 'files' AND configkey = 'quota'"
+         WHERE userid = $1 AND appid = 'files' AND configkey = 'quota'"
     );
     sqlx::query_scalar::<_, Option<String>>(&sql)
         .bind(uid)
@@ -159,7 +159,7 @@ async fn lookup_quota_preference(pool: &DbPool, prefix: &str, uid: &str) -> Opti
 async fn lookup_used_bytes(pool: &DbPool, prefix: &str, storage_id: i64) -> i64 {
     let path_hash = crate::row::path_hash("files");
     let sql = format!(
-        "SELECT size FROM {prefix}filecache WHERE storage = ? AND path_hash = ?"
+        "SELECT size FROM {prefix}filecache WHERE storage = $1 AND path_hash = $2"
     );
     sqlx::query_scalar::<_, Option<i64>>(&sql)
         .bind(storage_id)

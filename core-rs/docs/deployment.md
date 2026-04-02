@@ -1,5 +1,131 @@
 # nc-server Deployment Guide
 
+## Overview
+
+`nc-server` is a drop-in replacement for the PHP-FPM listener on a standard
+Nextcloud installation.  It takes over **all inbound HTTP traffic** (WebDAV,
+OCS, files API) and forwards routes it does not handle natively to PHP-FPM over
+a Unix socket.  The PHP codebase is **not modified** — it is only ever called by
+the Rust proxy, never directly by clients.
+
+```
+Client → nc-server (port 80/443)
+           ├── Native:  WebDAV · OCS · status.php · auth
+           └── FastCGI: everything else → PHP-FPM (Unix socket, 0600)
+```
+
+---
+
+## Step 1 — Install Nextcloud with PHP first
+
+`nc-server` has no installer of its own.  Use the standard PHP-based installer
+to create the database schema, write `config/config.php`, and set up the admin
+account.
+
+```bash
+# Web installer: open https://yourhost/ with PHP-FPM/nginx still in place.
+# Or CLI:
+php occ maintenance:install \
+  --database pgsql \
+  --database-host 127.0.0.1 \
+  --database-name nextcloud \
+  --database-user nextcloud \
+  --database-pass secret \
+  --admin-user admin \
+  --admin-pass changeme \
+  --data-dir /var/lib/nextcloud/data
+```
+
+After install, confirm `/status.php` returns `"installed":true` against the PHP
+stack before switching traffic to the Rust binary.
+
+**Why:** `occ maintenance:install` writes `installed = true`, `instanceid`,
+`secret`, and `passwordsalt` to `config.php` via `SystemConfig::setValue()`.
+These values are never in `oc_appconfig` and `nc-server` reads them directly
+from `config.php` at startup.
+
+---
+
+## Step 2 — Build nc-server
+
+```bash
+cd /path/to/nc-server/core-rs
+cargo build --release --features postgres   # or --features sqlite
+```
+
+The binary is at `target/release/nc-server`.
+
+---
+
+## Step 3 — Add nc-server config keys to config.php
+
+Append to `config/config.php` (the same file Nextcloud uses):
+
+```php
+// Unix socket path for PHP-FPM — must match listen= in the pool config below.
+'fastcgi_socket' => '/run/nc-fpm.sock',
+// Optional: increase for slow PHP routes (default 30 000 ms).
+'fastcgi_timeout_ms' => 30000,
+```
+
+No other keys are needed — `nc-server` reads all standard Nextcloud config keys
+(`dbtype`, `dbhost`, `secret`, `instanceid`, `datadirectory`, etc.) from the
+same `config/config.php`.
+
+---
+
+## Step 4 — Start nc-server
+
+```bash
+# Run from the Nextcloud repo root (so config/config.php is found automatically).
+cd /path/to/nc-server
+./core-rs/target/release/nc-server --listen 0.0.0.0:7000
+
+# Or specify the root explicitly:
+./core-rs/target/release/nc-server \
+  --root /path/to/nc-server \
+  --listen 0.0.0.0:7000
+```
+
+On startup the binary:
+1. Parses `config/config.php` (reads `installed`, `maintenance`, `instanceid`,
+   `secret`, `dbtype`, etc.)
+2. Opens the database pool and runs `sqlx migrate` (no-op on an already-migrated
+   DB)
+3. Loads in-memory caches (mime types, app config)
+4. Opens the HTTP listener
+
+Check `GET /status.php` — it should return `"installed":true`.
+
+> **Maintenance mode:** `nc-server` reads `maintenance` from `config.php` at
+> startup only (PHP writes it via `SystemConfig`, not `oc_appconfig`).  Toggling
+> `occ maintenance:mode --on` while `nc-server` is running requires a restart to
+> take effect.  See [IMPROVEMENTS.md](../../SPECS/IMPROVEMENTS.md) §I.1 for a
+> planned hot-reload fix.
+
+---
+
+## Step 5 — Point clients at nc-server
+
+If you were previously running nginx → PHP-FPM, update nginx to proxy to
+`nc-server` instead:
+
+```nginx
+location / {
+    proxy_pass         http://127.0.0.1:7000;
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+    proxy_read_timeout 120s;
+}
+```
+
+`nc-server` handles TLS termination upstream (nginx/caddy) the same way a
+standard PHP-FPM setup does.
+
+---
+
 ## PHP-FPM configuration
 
 ### Unix socket (hard requirement)
