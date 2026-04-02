@@ -301,12 +301,19 @@ pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> R
     match tokio::time::timeout(timeout, parse_streaming_headers(response_stream)).await {
         Ok(Ok((status, cgi_headers, body_stream))) => {
             let mut builder = Response::builder().status(status);
-            for (name, value) in cgi_headers {
-                builder = builder.header(name, value);
+            for (name, value) in &cgi_headers {
+                builder = builder.header(name.as_str(), value.as_str());
             }
             builder
                 .body(Body::from_stream(body_stream))
-                .unwrap_or_else(|_| error_response(502, "Failed to build response\n"))
+                .unwrap_or_else(|e| {
+                    tracing::error!(
+                        error = %e,
+                        ?cgi_headers,
+                        "fastcgi: failed to build HTTP response from CGI headers"
+                    );
+                    error_response(502, "Failed to build response\n")
+                })
         }
         Ok(Err(resp)) => resp,
         Err(_elapsed) => {
@@ -512,7 +519,9 @@ fn parse_cgi_header_block(header_bytes: &[u8]) -> Result<(axum::http::StatusCode
 
     let header_str = String::from_utf8_lossy(header_bytes);
     for line in header_str.lines() {
-        if let Some((name, value)) = line.split_once(": ") {
+        if let Some((name, rest)) = line.split_once(':') {
+            let name = name.trim();
+            let value = rest.trim_start();
             if name.eq_ignore_ascii_case("Status") {
                 // Format: "200 OK" or "404 Not Found".  Only the code matters.
                 if let Some(code_str) = value.split_ascii_whitespace().next() {

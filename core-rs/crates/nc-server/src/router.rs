@@ -68,7 +68,8 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
         .route("/.well-known/{*path}",       axum::routing::any(php_fpm_fallback))
         .route("/login/{*path}",             axum::routing::any(php_fpm_fallback))
         .route("/index.php",                 axum::routing::any(php_fpm_fallback))
-        .route("/index.php/{*path}",         axum::routing::any(php_fpm_fallback));
+        .route("/index.php/{*path}",         axum::routing::any(php_fpm_fallback))
+        .route("/",                          axum::routing::any(php_fpm_fallback));
 
     // ── Registry-built PHP-FPM routes (Phase 7.5) ───────────────────────────
     //

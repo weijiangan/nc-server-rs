@@ -21,7 +21,11 @@ declare(strict_types=1);
  *
  * Bootstrap strategy (§7.4):
  *   1. reject_unauthenticated_shim_request() — security gate
- *   2. OC::init() — sets up the full DI container and services from config.php
+ *   2. require base.php — base.php calls OC::init() at file scope, which sets
+ *      up the full DI container and services from config.php.  No explicit
+ *      OC::init() call is needed here (and would break things if added, because
+ *      a second OC::init() call makes require_once return true instead of the
+ *      ClassLoader, causing a TypeError on the typed static property).
  *   3. setVolatileActiveUser() — injects the pre-authenticated user into the
  *      session without touching PHP session state; OC::handleRequest() then sees
  *      isLoggedIn() === true and skips the PHP-side auth/login step entirely
@@ -50,15 +54,15 @@ $_NC_IS_AUTHENTICATED = reject_unauthenticated_shim_request();
 $_NC_ROOT = $_SERVER['DOCUMENT_ROOT'] 
     ?? (!empty($_SERVER['NC_ORIGINAL_SCRIPT']) ? dirname(dirname($_SERVER['NC_ORIGINAL_SCRIPT'])) : dirname(__DIR__, 2));
 
+$_SERVER['SCRIPT_FILENAME'] = $_SERVER['NC_ORIGINAL_SCRIPT'] ?? $_NC_ROOT . '/index.php';
+
 // ── Load the Nextcloud framework ──────────────────────────────────────────────
 // versioncheck.php only outputs a friendly error if PHP is too old, then dies.
 // base.php bootstraps the full DI container (autoloaders, config, server boot).
 // OC::init() inside base.php sets OC::$SERVERROOT from __DIR__ of base.php,
 // which correctly yields $_NC_ROOT — no manual override needed.
 require_once $_NC_ROOT . '/lib/versioncheck.php';
-require_once $_NC_ROOT . '/lib/base.php';
-
-OC::init();
+require_once $_NC_ROOT . '/lib/base.php'; // base.php calls OC::init() at file scope
 
 // ── Inject pre-authenticated user (conditional) ────────────────────────────────
 // When the request is authenticated Rust has already validated the
@@ -95,14 +99,21 @@ $_NC_ORIGINAL_SCRIPT = $_SERVER['NC_ORIGINAL_SCRIPT'] ?? '';
 $_NC_ENTRY = basename($_NC_ORIGINAL_SCRIPT);
 
 switch ($_NC_ENTRY) {
-    // ── index.php, OCS entry points, clean URLs ───────────────────────────────
+    // ── index.php — standard Nextcloud entry point ─────────────────────────────
     // OC::handleRequest() resolves the path through Symfony routing and
     // dispatches to the correct app controller.  Because setVolatileActiveUser()
     // was called above, handleRequest() skips the PHP-side login step entirely.
     case 'index.php':
+        OC::handleRequest();
+        break;
+
+    // ── OCS entry points ──────────────────────────────────────────────────────
+    // OCS routes are registered with a '/ocsapp' prefix in the Symfony router,
+    // so they must go through Router::match('/ocsapp' + pathInfo), NOT through
+    // OC::handleRequest() which omits that prefix.  Mirror ocs/v1.php logic.
     case 'v1.php':    // /ocs/v1.php/...
     case 'v2.php':    // /ocs/v2.php/...
-        OC::handleRequest();
+        route_ocs_php();
         break;
 
     // ── remote.php — DAV adjacent services (CalDAV, CardDAV, direct, …) ───────
@@ -136,6 +147,63 @@ exit(0);
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper functions
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Route an OCS API request (v1.php / v2.php) through the Symfony router.
+ *
+ * OCS routes are registered with the '/ocsapp' prefix, so
+ * Router::match('/ocsapp' . $pathInfo) is required.  OC::handleRequest() uses
+ * Router::match($pathInfo) without the prefix and would never match OCS routes.
+ *
+ * Mirrors the logic in {NC_ROOT}/ocs/v1.php.
+ */
+function route_ocs_php(): void
+{
+    if (\OCP\Util::needUpgrade()
+        || \OCP\Server::get(\OCP\IConfig::class)->getSystemValueBool('maintenance')) {
+        \OC\OCS\ApiHelper::respond(503, 'Service unavailable', ['X-Nextcloud-Maintenance-Mode' => '1'], 503);
+        return;
+    }
+
+    try {
+        $appManager = \OCP\Server::get(\OCP\App\IAppManager::class);
+        $appManager->loadApps(['session']);
+        $appManager->loadApps(['authentication']);
+        $appManager->loadApps(['extended_authentication']);
+        $appManager->loadApps();
+
+        $request = \OCP\Server::get(\OCP\IRequest::class);
+        $request->throwDecodingExceptionIfAny();
+
+        if (!\OCP\Server::get(\OCP\IUserSession::class)->isLoggedIn()) {
+            OC::handleLogin($request);
+        }
+
+        \OCP\Server::get(\OC\Route\Router::class)->match('/ocsapp' . $request->getRawPathInfo());
+    } catch (\OCP\Security\Bruteforce\MaxDelayReached $ex) {
+        \OC\OCS\ApiHelper::respond(\OCP\AppFramework\Http::STATUS_TOO_MANY_REQUESTS, $ex->getMessage());
+    } catch (\Symfony\Component\Routing\Exception\ResourceNotFoundException $e) {
+        $txt = 'Invalid query, please check the syntax. API specifications are here:'
+            . ' http://www.freedesktop.org/wiki/Specifications/open-collaboration-services.' . "\n";
+        \OC\OCS\ApiHelper::respond(\OCP\AppFramework\OCSController::RESPOND_NOT_FOUND, $txt);
+    } catch (\Symfony\Component\Routing\Exception\MethodNotAllowedException $e) {
+        \OC\OCS\ApiHelper::setContentType();
+        http_response_code(405);
+    } catch (\OC\User\LoginException $e) {
+        \OC\OCS\ApiHelper::respond(\OCP\AppFramework\OCSController::RESPOND_UNAUTHORISED, 'Unauthorised');
+    } catch (\Exception $e) {
+        \OCP\Server::get(\Psr\Log\LoggerInterface::class)->error($e->getMessage(), ['exception' => $e]);
+        $txt = 'Internal Server Error' . "\n";
+        try {
+            if (\OCP\Server::get(\OC\SystemConfig::class)->getValue('debug', false)) {
+                $txt .= $e->getMessage();
+            }
+        } catch (\Throwable $e) {
+            // Just to be safe
+        }
+        \OC\OCS\ApiHelper::respond(\OCP\AppFramework\OCSController::RESPOND_SERVER_ERROR, $txt);
+    }
+}
 
 /**
  * Validate that the request arrived through the Rust proxy layer.
