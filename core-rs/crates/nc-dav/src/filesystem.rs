@@ -943,6 +943,10 @@ impl DavFileSystem for NcFileSystem {
             };
 
             let instance_id = &self.state.instance_id;
+            // is_shared: false for home-storage nodes — the file is the user's own.
+            // Shared nodes (from oc_share) are detected via is_mounted/share_permissions.
+            let is_shared = false;
+
             Ok(crate::props::build_props(
                 &meta,
                 instance_id,
@@ -954,6 +958,7 @@ impl DavFileSystem for NcFileSystem {
                 child_files,
                 sync_token_str.as_deref(),
                 is_mounted,
+                is_shared,
                 share_permissions,
                 &download_url,
                 &note,

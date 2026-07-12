@@ -361,10 +361,9 @@ async fn write_file(
     let dav_file_id = format!("{:08}{}", fid, instance_id);
 
     // permissions: for a newly created file owned by the user, perms=27
-    // (READ|UPDATE|DELETE|SHARE), not shared, not mounted, renamable.
-    // PHP DavUtil::getDavPermissions() produces "RGDNVW" for this case.
-    // TODO: use props::encode_permissions() once it matches PHP behavior (REQ §6.5).
-    let permissions = "RGDNVW".to_string();
+    // (READ|UPDATE|DELETE|SHARE), file, not shared, not mounted, renamable.
+    // encode_permissions() now matches PHP DavUtil::getDavPermissions().
+    let permissions = crate::props::encode_permissions(27, false, false, false, true);
 
     Ok(FileInfo {
         etag,

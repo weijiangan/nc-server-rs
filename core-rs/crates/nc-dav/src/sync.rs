@@ -214,7 +214,8 @@ pub async fn build_sync_response(
 
         let etag = fc_row.etag.as_deref().unwrap_or("");
         let oc_id = format!("{:08}{instance_id}", fc_row.fileid);
-        let perms_str = props::encode_permissions(fc_row.permissions, is_dir, false);
+        let can_rename = fc_row.permissions & 2 != 0;
+        let perms_str = props::encode_permissions(fc_row.permissions, is_dir, false, false, can_rename);
 
         // Dates
         let last_modified = fmt_http_date(fc_row.mtime);

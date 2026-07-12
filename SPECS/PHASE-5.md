@@ -114,11 +114,6 @@ Documented differences between the Rust implementation and the PHP reference dis
 - **PHP `ChunkingV2Plugin::beforeMove()` (line 204):** Uses `IMimeTypeDetector::detectPath($destinationName)` — a file-content-based detector.
 - **Rust:** Uses `mime_guess::from_ext()` — extension-based heuristic. This may produce different MIME types for files with ambiguous or missing extensions.
 
-### Permissions encoding in `{oc:}permissions`
-- **PHP `DavUtil::getDavPermissions()`** encodes perms=27 (READ|UPDATE|DELETE|SHARE), file, not shared, not mounted as: `RGDNVW` (R=Share, G=Read, D=Delete, N=Renamable, V=Updateable, W=Writable).
-- **Rust `props::encode_permissions()`** encodes the same as: `SDNVG` — different character set and ordering. This is a **pre-existing bug** in the PROPFIND path.
-- **Bulk upload handler** hardcodes `"RGDNVW"` (matching PHP) with a TODO to fix `encode_permissions()`.
-
 ### Filename validation
 - **PHP:** Chunked upload and bulk upload do **not** validate filenames at the plugin level. Validation occurs downstream in the storage/filesystem layer (`$userFolder->newFile()` → hooks → `IFilenameValidator`).
 - **Rust:** The main `dav_handler` validates filenames for simple PUT (§5.1). The chunked upload and bulk upload handlers do not validate filenames — matching PHP's approach of relying on the storage layer.
