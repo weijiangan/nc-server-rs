@@ -228,28 +228,36 @@ async fn handle_put(
     let uploads_pos = path_parts.iter().position(|&s| s == "uploads").unwrap_or(0);
     let user_id = path_parts.get(uploads_pos + 1).copied().unwrap_or("");
 
-    // ── §5.2 Quota enforcement ─────────────────────────────────────────────
-    // PHP ChunkingV2Plugin checks quota on each chunk PUT against the target
-    // parent directory (see REQ §11, PHP ChunkingV2Plugin::beforePut lines 152-163).
-    // We do a simpler check here: if we know the upload size, verify against quota.
+    // ── §5.2 Quota enforcement (cumulative) ────────────────────────────────
+    // PHP ChunkingV2Plugin::beforePut() checks quota against the cumulative
+    // size of all uploaded chunks ($tempTargetFile->getSize() + $size),
+    // not just the current chunk.  This prevents exceeding quota via many
+    // small chunks that individually pass the check.
     if content_length > 0 {
-        // Find the user's home storage to check quota.
         let data_dir_str = state.data_directory.to_str().unwrap_or("").to_string();
         if let Some(storage_id) =
             row::lookup_storage_id(&state.pool, &state.table_prefix, user_id, &data_dir_str).await
         {
-            let _ = crate::quota::check_quota(
+            let previous_total = state
+                .upload_state_store
+                .get_total_chunk_size(upload_id)
+                .await
+                .unwrap_or(0);
+            let cumulative_size = previous_total + content_length;
+
+            if crate::quota::check_quota(
                 &state.pool,
                 &state.table_prefix,
                 &state.appconfig_cache,
                 user_id,
                 storage_id,
-                content_length as i64,
+                cumulative_size as i64,
             )
             .await
-            .map_err(|()| {
-                // quota exceeded — return 507
-            });
+            .is_err()
+            {
+                return quota_exceeded_response();
+            }
         }
     }
 

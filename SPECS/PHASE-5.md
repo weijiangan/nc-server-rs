@@ -122,6 +122,3 @@ Documented differences between the Rust implementation and the PHP reference dis
 - **PHP:** Neither `ChunkingV2Plugin` nor `BulkUploadPlugin` performs checksum validation. The `OC-Checksum` header is handled by the storage layer or `ChecksumUpdatePlugin` during actual file writes.
 - **Rust:** The main `dav_handler` validates checksums for simple PUT via `NcDavFile::flush()`. The chunked upload and bulk upload handlers do not validate checksums — matching PHP's approach.
 
-### Quota enforcement differences
-- **PHP `ChunkingV2Plugin::beforePut()` (lines 152-163):** Checks quota by comparing `$tempTargetFile->getSize() + $additionalSize` against `$free` — tracks cumulative size of all uploaded chunks (not just the current one).
-- **Rust:** Checks quota using only the current chunk's `Content-Length`. The cumulative approach would be more precise but requires tracking the temp target file's growing size across chunk PUTs.
