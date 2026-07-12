@@ -46,6 +46,10 @@ pub struct AppState {
     /// PHP-FPM is absent there is no session resolver to call, so no cache is
     /// needed.
     pub session_cache: Option<nc_auth::SharedSessionCache>,
+    /// In-process store for chunked upload v2 metadata (PHASE-5.5).
+    /// Created regardless of distributed cache configuration - serves as the
+    /// fallback store when Redis/Memcached is not available.
+    pub upload_state_store: nc_dav::SharedUploadStateStore,
 }
 
 /// Allow axum to extract `OcsState` from the top-level `AppState` using the
@@ -90,6 +94,7 @@ impl FromRef<AppState> for nc_dav::NcDavState {
             instance_id,
             filename_validator,
             base_url,
+            upload_state_store: state.upload_state_store.clone(),
         }
     }
 }

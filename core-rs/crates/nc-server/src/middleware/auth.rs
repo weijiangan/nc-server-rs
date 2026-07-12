@@ -561,6 +561,7 @@ mod tests {
             fastcgi: None,
             instanceid: instanceid.to_owned(),
             session_cache: None,
+            upload_state_store: Arc::new(nc_dav::UploadStateStore::new()),
         }
     }
 

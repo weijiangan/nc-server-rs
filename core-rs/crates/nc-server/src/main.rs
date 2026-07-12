@@ -168,6 +168,12 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // ── Phase 5.5: Upload state store (chunked upload v2) ───────────────────
+    // Created regardless of distributed cache configuration - serves as the
+    // fallback store when Redis/Memcached is not available.
+    let upload_state_store: nc_dav::SharedUploadStateStore =
+        std::sync::Arc::new(nc_dav::UploadStateStore::new());
+
     let state = AppState {
         pool,
         mime_cache,
@@ -180,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
         fastcgi,
         instanceid,
         session_cache,
+        upload_state_store,
     };
 
     // ── Phase 7.7: Background capability refresh ──────────────────────────────

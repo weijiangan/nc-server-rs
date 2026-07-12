@@ -185,6 +185,27 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         }
     }
 
+    // ── §5.4 OC-Chunked v1: return 501 ────────────────────────────────────
+    //
+    // OC-Chunked was an older desktop sync client protocol (pre-3.0, 2020).
+    // Requests with the `OC-Chunked: 1` header return `501 Not Implemented`.
+    if req.headers().get("oc-chunked").is_some() {
+        tracing::info!(
+            method = %req_method,
+            path = %req_path,
+            "§5.4 OC-Chunked v1 request — returning 501"
+        );
+        let mut resp = http::Response::builder()
+            .status(StatusCode::NOT_IMPLEMENTED)
+            .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+            .body(Body::from("OC-Chunked v1 is not supported. Use chunked upload v2 or simple PUT."))
+            .unwrap();
+        if let Ok(v) = HeaderValue::from_str(&request_id) {
+            resp.headers_mut().insert(H_X_REQUEST_ID.clone(), v);
+        }
+        return resp;
+    }
+
     // ── 4.14.6 DummyGetResponsePlugin ────────────────────────────────────
     //
     // GET on a DAV collection returns a plain-text stub instead of an HTML
@@ -195,6 +216,49 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
             .strip_prefix(strip_prefix.as_str())
             .unwrap_or("/");
         let fc_path = crate::row::dav_to_fc_path(dav_path);
+
+        // ── §5.10 ZIP/TAR folder download ────────────────────────────────
+        //
+        // Before the generic GET-on-directory handler (DummyGetResponsePlugin),
+        // check if the client asked for an archive format.  If so, stream the
+        // folder as a ZIP or TAR and return immediately.
+        //
+        // Mirrors PHP ZipFolderPlugin (apps/dav/.../ZipFolderPlugin.php).
+        {
+            let accept_header = req
+                .headers()
+                .get("accept")
+                .and_then(|v| v.to_str().ok());
+            let uri_query = req.uri().query();
+
+            let x_nc_files: Vec<String> = req
+                .headers()
+                .get_all("x-nc-files")
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
+                .collect();
+
+            if let Some(archive_resp) = crate::archive::try_serve_archive(
+                &state.pool,
+                &state.table_prefix,
+                storage_id,
+                &fc_path,
+                &state.data_directory,
+                &uid,
+                &state.mime_cache,
+                &state.appconfig_cache,
+                accept_header,
+                uri_query,
+                x_nc_files,
+                &request_id,
+            )
+            .await
+            {
+                tracing::debug!(fc_path, "§5.10 archive download served");
+                return archive_resp;
+            }
+        }
+
         if let Some(fc_row) =
             crate::row::lookup_by_path(&state.pool, &state.table_prefix, storage_id, &fc_path)
                 .await

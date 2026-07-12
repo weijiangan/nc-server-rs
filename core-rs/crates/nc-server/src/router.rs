@@ -127,7 +127,8 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
         .route("/remote.php/dav/versions/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/remote.php/dav/comments/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/remote.php/dav/trashbin/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/remote.php/dav/uploads/{*path}", axum::routing::any(php_fpm_fallback))
+        // PHASE-5.5: Chunked upload v2 - native handler
+        .route("/remote.php/dav/uploads/{*path}", axum::routing::any(nc_dav::upload_handler))
         .route("/remote.php/dav/principals/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/remote.php/dav/calendars/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/remote.php/dav/public-calendars/{*path}", axum::routing::any(php_fpm_fallback))
@@ -145,13 +146,16 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
         .route("/dav/versions/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/dav/comments/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/dav/trashbin/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/dav/uploads/{*path}", axum::routing::any(php_fpm_fallback))
+        // PHASE-5.5: Chunked upload v2 - native handler
+        .route("/dav/uploads/{*path}", axum::routing::any(nc_dav::upload_handler))
         .route("/dav/principals/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/dav/calendars/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/dav/public-calendars/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/dav/system-calendars/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/dav/addressbooks/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/dav/avatars/{*path}", axum::routing::any(php_fpm_fallback))
+        // PHASE-5.9: Bulk upload endpoint
+        .route("/dav/bulk", axum::routing::post(nc_dav::bulk_handler))
         .route("/dav/{*path}", axum::routing::any(nc_dav::dav_handler))
         // Static PHP-FPM routes — always forwarded regardless of registry
         .route("/public.php/{*path}", axum::routing::any(php_fpm_fallback))

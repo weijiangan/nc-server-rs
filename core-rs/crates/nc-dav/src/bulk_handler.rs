@@ -1,0 +1,640 @@
+//! Handler for bulk upload endpoint (`POST /dav/bulk`).
+//!
+//! Parses `multipart/related` body; per-part headers `X-File-Path`,
+//! `X-OC-MTime` / `X-File-MTime`, `Content-Length`.
+//!
+//! Response: JSON map of path → `{error, etag, fileid, permissions}`.
+//!
+//! Matches PHP behavior (`BulkUploadPlugin.php`):
+//! - On parse error mid-stream: returns 400 with partial results written so far.
+//! - On per-file write error: records error for that file, continues processing.
+
+use axum::{body::Body, extract::State, response::Response};
+use http::{HeaderName, HeaderValue, StatusCode};
+use nc_auth::AuthInfo;
+use tokio::fs;
+
+use crate::{row, NcDavState};
+
+static H_CSP: HeaderName = HeaderName::from_static("content-security-policy");
+static H_JSON: HeaderName = HeaderName::from_static("content-type");
+static JSON_VALUE: HeaderValue = HeaderValue::from_static("application/json; charset=utf-8");
+
+/// Maximum bulk upload body size: 100 MiB.
+const MAX_BULK_BODY: usize = 100 * 1024 * 1024;
+
+/// Handler for bulk upload endpoint.
+pub async fn bulk_handler(
+    State(state): State<NcDavState>,
+    req: axum::extract::Request,
+) -> Response {
+    // Extract authenticated user and instance ID from state.
+    let uid = match req.extensions().get::<AuthInfo>() {
+        Some(info) => info.uid.clone(),
+        None => {
+            return http::Response::builder()
+                .status(401)
+                .header("WWW-Authenticate", "Basic realm=\"Nextcloud\"")
+                .body(Body::from("Unauthorized"))
+                .unwrap();
+        }
+    };
+
+    let instance_id = (*state.instance_id).clone();
+
+    let content_type = match req.headers().get("content-type") {
+        Some(ct) => match ct.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return bad_request_response("Invalid Content-Type"),
+        },
+        None => return bad_request_response("Content-Type header required"),
+    };
+
+    if !content_type.starts_with("multipart/") {
+        return bad_request_response("Content-Type must be multipart");
+    }
+
+    let boundary = match extract_boundary(&content_type) {
+        Some(b) => b,
+        None => return bad_request_response("Invalid multipart boundary"),
+    };
+
+    let body = req.into_body();
+    let bytes = match axum::body::to_bytes(body, MAX_BULK_BODY).await {
+        Ok(b) => b,
+        Err(e) => {
+            return http::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(
+                    H_CSP.clone(),
+                    HeaderValue::from_static("default-src 'none';"),
+                )
+                .header(H_JSON.clone(), JSON_VALUE.clone())
+                .body(Body::from(format!("Failed to read body: {}", e)))
+                .unwrap();
+        }
+    };
+
+    let data_dir_str = state.data_directory.to_str().unwrap_or("").to_string();
+
+    let storage_id =
+        match row::lookup_storage_id(&state.pool, &state.table_prefix, &uid, &data_dir_str)
+            .await
+        {
+            Some(id) => id,
+            None => {
+                return http::Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header(
+                        H_CSP.clone(),
+                        HeaderValue::from_static("default-src 'none';"),
+                    )
+                    .header(H_JSON.clone(), JSON_VALUE.clone())
+                    .body(Body::from("Failed to look up storage"))
+                    .unwrap();
+            }
+        };
+
+    let mut results: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut parse_error = false;
+
+    let parser = MultipartParser::new(&bytes, &boundary);
+    for part_result in parser {
+        let part = match part_result {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to parse multipart part");
+                parse_error = true;
+                break;
+            }
+        };
+
+        let file_path = match part.headers.get("x-file-path") {
+            Some(p) => p.clone(),
+            None => {
+                results.insert(
+                    format!("unknown_{}", results.len()),
+                    serde_json::json!({
+                        "error": true,
+                        "message": "Missing X-File-Path header"
+                    }),
+                );
+                continue;
+            }
+        };
+
+        let mtime = part
+            .headers
+            .get("x-oc-mtime")
+            .or_else(|| part.headers.get("x-file-mtime"))
+            .and_then(|v| v.parse::<i64>().ok());
+
+        match write_file(
+            &state, &uid, &instance_id, storage_id, &file_path, &part.data, mtime,
+        )
+        .await
+        {
+            Ok(file_info) => {
+                results.insert(
+                    file_path.clone(),
+                    serde_json::json!({
+                        "error": false,
+                        "etag": file_info.etag,
+                        "fileid": file_info.fileid,
+                        "permissions": file_info.permissions,
+                    }),
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, path = %file_path, "Failed to write file");
+                results.insert(
+                    file_path.clone(),
+                    serde_json::json!({
+                        "error": true,
+                        "message": e,
+                    }),
+                );
+            }
+        }
+    }
+
+    let status = if parse_error {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::OK
+    };
+
+    let body = match serde_json::to_string(&results) {
+        Ok(b) => b,
+        Err(e) => {
+            return http::Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(
+                    H_CSP.clone(),
+                    HeaderValue::from_static("default-src 'none';"),
+                )
+                .header(H_JSON.clone(), JSON_VALUE.clone())
+                .body(Body::from(format!("Failed to serialize response: {}", e)))
+                .unwrap();
+        }
+    };
+
+    http::Response::builder()
+        .status(status)
+        .header(
+            H_CSP.clone(),
+            HeaderValue::from_static("default-src 'none';"),
+        )
+        .header(H_JSON.clone(), JSON_VALUE.clone())
+        .body(Body::from(body))
+        .unwrap()
+}
+
+struct FileInfo {
+    etag: String,
+    fileid: String,
+    permissions: String,
+}
+
+async fn write_file(
+    state: &NcDavState,
+    uid: &str,
+    instance_id: &str,
+    storage_id: i64,
+    file_path: &str,
+    data: &[u8],
+    mtime: Option<i64>,
+) -> Result<FileInfo, String> {
+    let fc_path = format!("files/{}", file_path.trim_start_matches('/'));
+
+    // ── §5.2 Quota enforcement ─────────────────────────────────────────────
+    // PHP BulkUploadPlugin delegates to $userFolder->newFile() which goes
+    // through the storage layer where quota is enforced. We check it
+    // explicitly here before writing.
+    if let Err(()) = crate::quota::check_quota(
+        &state.pool,
+        &state.table_prefix,
+        &state.appconfig_cache,
+        uid,
+        storage_id,
+        data.len() as i64,
+    )
+    .await
+    {
+        return Err("Quota exceeded: insufficient free space".to_string());
+    }
+
+    let file_name = file_path.rsplit('/').next().unwrap_or("").to_string();
+    let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
+    let mime_str = mime_guess::from_ext(&ext)
+        .first_raw()
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let part_str = mime_str
+        .split('/')
+        .next()
+        .unwrap_or("application")
+        .to_string();
+
+    let (mime_type_id, mimepart_id) = {
+        let cache = state.mime_cache.read().expect("mime cache lock");
+        let mid = cache.get_id(&mime_str).unwrap_or(1);
+        let pid = cache
+            .get_id(&format!("{}/", part_str))
+            .unwrap_or(1);
+        (mid, pid)
+    };
+
+    let parent_path = {
+        let mut parts: Vec<&str> = fc_path.split('/').collect();
+        parts.pop();
+        if parts.is_empty() {
+            "files".to_string()
+        } else {
+            format!("files/{}", parts.join("/"))
+        }
+    };
+
+    let parent_row = row::lookup_by_path(&state.pool, &state.table_prefix, storage_id, &parent_path)
+        .await
+        .ok_or_else(|| "Parent directory not found".to_string())?;
+
+    let existing =
+        row::lookup_by_path(&state.pool, &state.table_prefix, storage_id, &fc_path).await;
+
+    let fid = if let Some(ref existing) = existing {
+        existing.fileid
+    } else {
+        row::next_fileid(&state.pool, &state.table_prefix)
+            .await
+            .map_err(|e| format!("Failed to get fileid: {}", e))?
+    };
+
+    let final_disk_path = row::disk_path(&state.data_directory, uid, &fc_path);
+
+    if let Some(parent) = final_disk_path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+
+    fs::write(&final_disk_path, data)
+        .await
+        .map_err(|e| format!("Failed to write file: {}", e))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let file_mtime = mtime.unwrap_or(now);
+
+    let t = filetime::FileTime::from_unix_time(file_mtime, 0);
+    let _ = filetime::set_file_times(&final_disk_path, t, t);
+
+    let etag_raw = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+    // PHP getETag() returns quoted etag; JSON-encode doubles the quotes.
+    let etag = format!("\"{}\"", etag_raw);
+
+    let hash = row::path_hash(&fc_path);
+    if existing.is_some() {
+        let sql = format!(
+            "UPDATE {prefix}filecache SET size=$1, mtime=$2, storage_mtime=$3, etag=$4, mimetype=$5, mimepart=$6 WHERE fileid=$7",
+            prefix = state.table_prefix
+        );
+        let _ = sqlx::query(&sql)
+            .bind(data.len() as i64)
+            .bind(file_mtime)
+            .bind(file_mtime)
+            .bind(&etag_raw)
+            .bind(mime_type_id)
+            .bind(mimepart_id)
+            .bind(fid)
+            .execute(&state.pool)
+            .await;
+    } else {
+        let sql = format!(
+            "INSERT INTO {prefix}filecache \
+            (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+             size, mtime, storage_mtime, etag, permissions, checksum) \
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+            prefix = state.table_prefix
+        );
+        let _ = sqlx::query(&sql)
+            .bind(fid)
+            .bind(storage_id)
+            .bind(&fc_path)
+            .bind(&hash)
+            .bind(parent_row.fileid)
+            .bind(&file_name)
+            .bind(mime_type_id)
+            .bind(mimepart_id)
+            .bind(data.len() as i64)
+            .bind(file_mtime)
+            .bind(file_mtime)
+            .bind(&etag_raw)
+            .bind(27i32) // CRUDS permissions (READ|UPDATE|DELETE|SHARE)
+            .bind("")
+            .execute(&state.pool)
+            .await;
+    }
+
+    // Set upload_time in extended cache for new files
+    {
+        let sql = format!(
+            "INSERT INTO {prefix}filecache_extended (fileid, metadata_etag, creation_time, upload_time) \
+            VALUES ($1, $2, $3, $4) \
+            ON CONFLICT(fileid) DO UPDATE SET \
+                upload_time = COALESCE(EXCLUDED.upload_time, {prefix}filecache_extended.upload_time)",
+            prefix = state.table_prefix
+        );
+        let _ = sqlx::query(&sql)
+            .bind(fid)
+            .bind("") // metadata_etag
+            .bind(file_mtime) // creation_time
+            .bind(now) // upload_time
+            .execute(&state.pool)
+            .await;
+    }
+
+    // fileid: PHP DavUtil::getDavFileId() formats as zero-padded 8-char id + instanceId.
+    let dav_file_id = format!("{:08}{}", fid, instance_id);
+
+    // permissions: for a newly created file owned by the user, perms=27
+    // (READ|UPDATE|DELETE|SHARE), not shared, not mounted, renamable.
+    // PHP DavUtil::getDavPermissions() produces "RGDNVW" for this case.
+    // TODO: use props::encode_permissions() once it matches PHP behavior (REQ §6.5).
+    let permissions = "RGDNVW".to_string();
+
+    Ok(FileInfo {
+        etag,
+        fileid: dav_file_id,
+        permissions,
+    })
+}
+
+struct MultipartPart {
+    headers: std::collections::HashMap<String, String>,
+    data: Vec<u8>,
+}
+
+fn extract_boundary(content_type: &str) -> Option<String> {
+    content_type.split(';').find_map(|param| {
+        let param = param.trim();
+        if param.starts_with("boundary=") {
+            let value = param.trim_start_matches("boundary=");
+            let value = value.trim_matches('"');
+            Some(value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Streaming multipart parser that yields parts one at a time.
+///
+/// Mirrors PHP's `MultipartRequestParser::parseNextPart()` — returns an error
+/// mid-stream if a part cannot be parsed, allowing the caller to return 400
+/// with partial results (matching `BulkUploadPlugin.php:54-58`).
+struct MultipartParser<'a> {
+    data: &'a [u8],
+    boundary_start: Vec<u8>,
+    boundary_crlf: Vec<u8>,
+    boundary_close: Vec<u8>,
+    pos: usize,
+    is_first: bool,
+    done: bool,
+}
+
+impl<'a> MultipartParser<'a> {
+    fn new(data: &'a [u8], boundary: &str) -> Self {
+        Self {
+            data,
+            boundary_start: format!("--{}", boundary).into_bytes(),
+            boundary_crlf: format!("\r\n--{}", boundary).into_bytes(),
+            boundary_close: format!("\r\n--{}--", boundary).into_bytes(),
+            pos: 0,
+            is_first: true,
+            done: false,
+        }
+    }
+}
+
+impl Iterator for MultipartParser<'_> {
+    type Item = Result<MultipartPart, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.pos >= self.data.len() {
+            return None;
+        }
+
+        let start_marker = if self.is_first {
+            self.is_first = false;
+            &self.boundary_start[..]
+        } else {
+            &self.boundary_crlf[..]
+        };
+
+        if let Some(start) = find_subsequence(&self.data[self.pos..], start_marker) {
+            self.pos += start + start_marker.len();
+        } else {
+            self.done = true;
+            return None;
+        }
+
+        // Check for closing boundary (--)
+        if self.pos + 2 <= self.data.len() && &self.data[self.pos..self.pos + 2] == b"--" {
+            self.done = true;
+            return None;
+        }
+
+        // Skip CRLF after boundary
+        if self.pos + 2 <= self.data.len() && &self.data[self.pos..self.pos + 2] == b"\r\n" {
+            self.pos += 2;
+        }
+
+        let header_end = match find_subsequence(&self.data[self.pos..], b"\r\n\r\n") {
+            Some(h) => h,
+            None => {
+                self.done = true;
+                return Some(Err("Missing header/body separator".to_string()));
+            }
+        };
+        let header_bytes = &self.data[self.pos..self.pos + header_end];
+        let header_text = match std::str::from_utf8(header_bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                self.done = true;
+                return Some(Err(format!("Invalid header encoding: {}", e)));
+            }
+        };
+        self.pos += header_end + 4;
+
+        let mut headers = std::collections::HashMap::new();
+        for line in header_text.lines() {
+            if let Some(colon) = line.find(':') {
+                let key = line[..colon].trim().to_lowercase();
+                let value = line[colon + 1..].trim().to_string();
+                headers.insert(key, value);
+            }
+        }
+
+        let end_pos = find_subsequence(&self.data[self.pos..], &self.boundary_crlf)
+            .or_else(|| find_subsequence(&self.data[self.pos..], &self.boundary_close))
+            .unwrap_or(self.data.len() - self.pos);
+
+        let body = self.data[self.pos..self.pos + end_pos].to_vec();
+        self.pos += end_pos;
+
+        Some(Ok(MultipartPart {
+            headers,
+            data: body,
+        }))
+    }
+}
+
+fn bad_request_response(msg: &str) -> Response {
+    http::Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(
+            H_CSP.clone(),
+            HeaderValue::from_static("default-src 'none';"),
+        )
+        .header(H_JSON.clone(), JSON_VALUE.clone())
+        .body(Body::from(msg.to_string()))
+        .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_boundary_simple() {
+        assert_eq!(
+            extract_boundary("multipart/related; boundary=abc123"),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_boundary_quoted() {
+        assert_eq!(
+            extract_boundary("multipart/related; boundary=\"abc123\""),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_boundary_with_charset() {
+        assert_eq!(
+            extract_boundary("multipart/related; charset=utf-8; boundary=xyz"),
+            Some("xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_boundary_missing() {
+        assert_eq!(extract_boundary("multipart/related"), None);
+    }
+
+    #[test]
+    fn test_multipart_parser_single_part() {
+        let body =
+            b"--boundary\r\nX-File-Path: /test.txt\r\n\r\nhello world\r\n--boundary--";
+        let parser = MultipartParser::new(body, "boundary");
+        let parts: Vec<_> = parser.collect();
+        assert_eq!(parts.len(), 1);
+        let part = parts[0].as_ref().unwrap();
+        assert_eq!(part.headers.get("x-file-path").unwrap(), "/test.txt");
+        assert_eq!(part.data, b"hello world");
+    }
+
+    #[test]
+    fn test_multipart_parser_multiple_parts() {
+        let body = b"--boundary\r\nX-File-Path: /a.txt\r\n\r\ncontent A\r\n--boundary\r\nX-File-Path: /b.txt\r\n\r\ncontent B\r\n--boundary--";
+        let parser = MultipartParser::new(body, "boundary");
+        let parts: Vec<_> = parser.collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0].as_ref().unwrap().headers.get("x-file-path").unwrap(),
+            "/a.txt"
+        );
+        assert_eq!(parts[0].as_ref().unwrap().data, b"content A");
+        assert_eq!(
+            parts[1].as_ref().unwrap().headers.get("x-file-path").unwrap(),
+            "/b.txt"
+        );
+        assert_eq!(parts[1].as_ref().unwrap().data, b"content B");
+    }
+
+    #[test]
+    fn test_multipart_parser_binary_data() {
+        let body: Vec<u8> = [
+            b"--boundary\r\nX-File-Path: /bin.dat\r\n\r\n".to_vec(),
+            vec![0x00, 0x01, 0x02, 0xff, 0xfe],
+            b"\r\n--boundary--".to_vec(),
+        ]
+        .concat();
+        let parser = MultipartParser::new(&body, "boundary");
+        let parts: Vec<_> = parser.collect();
+        assert_eq!(parts.len(), 1);
+        let part = parts[0].as_ref().unwrap();
+        assert_eq!(part.headers.get("x-file-path").unwrap(), "/bin.dat");
+        assert_eq!(part.data, vec![0x00, 0x01, 0x02, 0xff, 0xfe]);
+    }
+
+    #[test]
+    fn test_multipart_parser_missing_separator() {
+        let body = b"--boundary\r\nX-File-Path: /test.txt";
+        let parser = MultipartParser::new(body, "boundary");
+        let parts: Vec<_> = parser.collect();
+        assert_eq!(parts.len(), 1);
+        match &parts[0] {
+            Err(e) => assert!(e.contains("Missing header/body separator")),
+            Ok(_) => panic!("Expected error for missing separator"),
+        }
+    }
+
+    #[test]
+    fn test_multipart_parser_with_mtime() {
+        let body = b"--boundary\r\nX-File-Path: /test.txt\r\nX-OC-MTime: 1234567890\r\n\r\ncontent\r\n--boundary--";
+        let parser = MultipartParser::new(body, "boundary");
+        let parts: Vec<_> = parser.collect();
+        assert_eq!(parts.len(), 1);
+        let part = parts[0].as_ref().unwrap();
+        assert_eq!(part.headers.get("x-oc-mtime").unwrap(), "1234567890");
+    }
+
+    #[test]
+    fn test_multipart_parser_with_file_mtime() {
+        let body = b"--boundary\r\nX-File-Path: /test.txt\r\nX-File-MTime: 9876543210\r\n\r\ncontent\r\n--boundary--";
+        let parser = MultipartParser::new(body, "boundary");
+        let parts: Vec<_> = parser.collect();
+        assert_eq!(parts.len(), 1);
+        let part = parts[0].as_ref().unwrap();
+        assert_eq!(part.headers.get("x-file-mtime").unwrap(), "9876543210");
+    }
+
+    #[test]
+    fn test_multipart_parser_empty_body() {
+        let body = b"";
+        let parser = MultipartParser::new(body, "boundary");
+        let parts: Vec<_> = parser.collect();
+        assert_eq!(parts.len(), 0);
+    }
+
+    #[test]
+    fn test_multipart_parser_first_part_no_crlf_prefix() {
+        let body = b"--boundary\r\nX-File-Path: /first.txt\r\n\r\nfirst\r\n--boundary\r\nX-File-Path: /second.txt\r\n\r\nsecond\r\n--boundary--";
+        let parser = MultipartParser::new(body, "boundary");
+        let parts: Vec<_> = parser.collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].as_ref().unwrap().data, b"first");
+        assert_eq!(parts[1].as_ref().unwrap().data, b"second");
+    }
+}

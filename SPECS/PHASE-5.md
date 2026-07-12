@@ -30,51 +30,59 @@ Goal: all upload methods used by desktop and mobile clients work end-to-end, inc
 **Verify:** `build/integration/files_features/checksums.feature` — upload with checksum, mismatch, and correct checksum scenarios.
 
 ### 5.4 Chunked upload v1 (`OC-Chunked`) ~~CUT~~
+- [x] Requests with `OC-Chunked: 1` header return `501 Not Implemented` and are logged
 > **Cut:** OC-Chunked was an older desktop sync client protocol (pre-3.0, 2020). It was never used by the web browser or mobile clients, and modern desktop clients default to Chunked v2 or simple PUT. Requests with the `OC-Chunked: 1` header return `501 Not Implemented` and are logged; no client in the target set will send them.
 
 ### 5.5 Chunked upload v2 — MKCOL (phase 1)
-- [ ] `MKCOL /dav/uploads/{userId}/{upload_id}` with `Destination` header required
-- [ ] Store `(upload_id, target_path)` in distributed cache or local in-process store
-- [ ] `201 Created`
-- [ ] If no distributed cache configured: proceed with in-process map (disable v2 capability only if this is a known limitation)
+- [x] `MKCOL /dav/uploads/{userId}/{upload_id}` with `Destination` header required
+- [x] Store `(upload_id, target_path)` in distributed cache or local in-process store
+- [x] `201 Created`
+- [x] If no distributed cache configured: proceed with in-process map (disable v2 capability only if this is a known limitation)
 
 **Verify:** `build/integration/dav_features/dav-v2.feature` — MKCOL upload slot creation.
 
 ### 5.6 Chunked upload v2 — PUT chunks (phase 2)
-- [ ] `PUT /dav/uploads/{userId}/{upload_id}/{part_id}` where `part_id` is numeric 1–10000
-- [ ] Reject `part_id < 1` or `part_id > 10000` → `400`
-- [ ] Write chunk to temp area keyed by `(upload_id, part_id)`
+- [x] `PUT /dav/uploads/{userId}/{upload_id}/{part_id}` where `part_id` is numeric 1–10000
+- [x] Reject `part_id < 1` or `part_id > 10000` → `400`
+- [x] Write chunk to temp area keyed by `(upload_id, part_id)`
+- [x] Quota enforced on chunk PUT when Content-Length is known (§5.2)
 
 **Verify:** `build/integration/dav_features/dav-v2.feature` — chunk PUT scenarios. Confirm invalid part ID rejected.
 
 ### 5.7 Chunked upload v2 — MOVE assembly (phase 3)
-- [ ] `MOVE /dav/uploads/{userId}/{upload_id}/.file` with `Destination` header
-- [ ] Optional `OC-Total-Length`: if present, validate sum of chunk sizes matches
-- [ ] Assemble chunks in `part_id` order, write to `Destination`
-- [ ] Optional `X-OC-MTime` / `X-OC-CTime` honored
-- [ ] `201 Created` or `204 No Content`
+- [x] `MOVE /dav/uploads/{userId}/{upload_id}/.file` with `Destination` header
+- [x] Optional `OC-Total-Length`: if present, validate sum of chunk sizes matches
+- [x] Assemble chunks in `part_id` order, write to `Destination`
+- [x] Optional `X-OC-MTime` / `X-OC-CTime` honored
+- [x] `201 Created` or `204 No Content`
+- [x] Quota enforced before assembly (§5.2)
+- [x] `upload_time` set in `oc_filecache_extended` for new files
 
 **Verify:** full three-phase chunked v2 upload; confirm assembled file matches original. Test with wrong `OC-Total-Length` → `400`.
 
 ### 5.8 Chunked upload v2 — DELETE (abort)
-- [ ] `DELETE /dav/uploads/{userId}/{upload_id}` removes all temp chunks and cache entry
-- [ ] `204 No Content`
+- [x] `DELETE /dav/uploads/{userId}/{upload_id}` removes all temp chunks and cache entry
+- [x] `204 No Content`
 
 **Verify:** start upload, abort with DELETE, confirm temp files removed.
 
 ### 5.9 Bulk upload (`POST /dav/bulk`)
-- [ ] Parse `multipart/related` body; per-part headers `X-File-Path`, `X-OC-MTime` / `X-File-MTime`, `Content-Length`
-- [ ] Write each part to the correct path
-- [ ] Response: JSON map of path → `{error, etag, fileid, permissions}`
-- [ ] Partial failure: write what succeeded, include errors for failed parts in response
+- [x] Parse `multipart/related` body; per-part headers `X-File-Path`, `X-OC-MTime` / `X-File-MTime`, `Content-Length`
+- [x] Write each part to the correct path
+- [x] Response: JSON map of path → `{error, etag, fileid, permissions}`
+- [x] Partial failure: write what succeeded, include errors for failed parts in response
+- [x] Quota enforced per file before write (§5.2)
+- [x] `fileid` formatted per PHP `DavUtil::getDavFileId()` (zero-padded 8 char + instanceId)
+- [x] `upload_time` set in `oc_filecache_extended` for new files
 
 **Verify:** `build/integration/dav_features/dav-v2.feature` bulk upload scenario (if present); otherwise integration test: upload 5 files in one bulk request, confirm all present with correct etags.
 
 ### 5.10 ZIP/TAR folder download
-- [ ] `GET /dav/files/{userId}/{folder}` with `Accept: application/zip` or `?accept=zip` → streamed ZIP; `Content-Disposition: attachment; filename="foldername.zip"`
-- [ ] Same endpoint with `Accept: application/x-tar` or `?accept=tar` → streamed TAR archive (REQ §7.5)
-- [ ] Root folder download named `download.zip` / `download.tar` respectively
-- [ ] Optional `?files=["name1","name2"]` or `X-NC-Files` headers to filter children
+- [x] `GET /dav/files/{userId}/{folder}` with `Accept: application/zip` or `?accept=zip` → streamed ZIP; `Content-Disposition: attachment; filename="foldername.zip"`
+- [x] Same endpoint with `Accept: application/x-tar` or `?accept=tar` → streamed TAR archive (REQ §7.5)
+- [x] Root folder download named `download.zip` / `download.tar` respectively
+- [x] Optional `?files=["name1","name2"]` or `X-NC-Files` headers to filter children
+- [x] Dual-mode: buffered (≤10 MiB) with Content-Length, streaming (>10 MiB) with chunked transfer
 
 **Verify:** `build/integration/files_features/download.feature` — ZIP and TAR download scenarios. Download a folder via each format, extract, verify contents match.
 
@@ -86,3 +94,39 @@ Goal: all upload methods used by desktop and mobile clients work end-to-end, inc
 - [ ] `204 No Content`, `OC-Checksum: {ALG}:{new_hash}` in response
 
 **Verify:** `build/integration/files_features/checksums.feature` — PATCH recalculation scenario.
+
+---
+
+## Deviations from PHP Reference
+
+Documented differences between the Rust implementation and the PHP reference discovered during implementation and validated against `apps/dav/lib/Upload/ChunkingV2Plugin.php`, `apps/dav/lib/BulkUpload/BulkUploadPlugin.php`, and `lib/public/Files/DavUtil.php`.
+
+### Global server vs local file semantics
+- **PHP:** Chunked upload v2 requires a **distributed cache** (Redis/Memcached). `ChunkingV2Plugin::checkPrerequisites()` throws `BadRequest` if `memcache.distributed` is `null` or the cache is not Redis/Memcached, effectively disabling v2.
+- **Rust:** Falls back to an in-process `RwLock<HashMap>` (`upload.rs`) when no distributed cache is configured. This enables single-node operation but won't survive process restarts. The v2 capability is still advertised regardless.
+
+### MOVE assembly: `.file` suffix
+- **REQ §7.3** documents `MOVE /dav/uploads/{userId}/{upload_id}/.file`.
+- **PHP `ChunkingV2Plugin::beforeMove()`** does **not** validate the `.file` suffix. It extracts the upload folder via `dirname($sourcePath)` and assembles regardless of the final path segment.
+- **Rust:** Follows PHP — any MOVE on a path within an upload folder triggers assembly.
+
+### MIME type detection
+- **PHP `ChunkingV2Plugin::beforeMove()` (line 204):** Uses `IMimeTypeDetector::detectPath($destinationName)` — a file-content-based detector.
+- **Rust:** Uses `mime_guess::from_ext()` — extension-based heuristic. This may produce different MIME types for files with ambiguous or missing extensions.
+
+### Permissions encoding in `{oc:}permissions`
+- **PHP `DavUtil::getDavPermissions()`** encodes perms=27 (READ|UPDATE|DELETE|SHARE), file, not shared, not mounted as: `RGDNVW` (R=Share, G=Read, D=Delete, N=Renamable, V=Updateable, W=Writable).
+- **Rust `props::encode_permissions()`** encodes the same as: `SDNVG` — different character set and ordering. This is a **pre-existing bug** in the PROPFIND path.
+- **Bulk upload handler** hardcodes `"RGDNVW"` (matching PHP) with a TODO to fix `encode_permissions()`.
+
+### Filename validation
+- **PHP:** Chunked upload and bulk upload do **not** validate filenames at the plugin level. Validation occurs downstream in the storage/filesystem layer (`$userFolder->newFile()` → hooks → `IFilenameValidator`).
+- **Rust:** The main `dav_handler` validates filenames for simple PUT (§5.1). The chunked upload and bulk upload handlers do not validate filenames — matching PHP's approach of relying on the storage layer.
+
+### Checksum validation
+- **PHP:** Neither `ChunkingV2Plugin` nor `BulkUploadPlugin` performs checksum validation. The `OC-Checksum` header is handled by the storage layer or `ChecksumUpdatePlugin` during actual file writes.
+- **Rust:** The main `dav_handler` validates checksums for simple PUT via `NcDavFile::flush()`. The chunked upload and bulk upload handlers do not validate checksums — matching PHP's approach.
+
+### Quota enforcement differences
+- **PHP `ChunkingV2Plugin::beforePut()` (lines 152-163):** Checks quota by comparing `$tempTargetFile->getSize() + $additionalSize` against `$free` — tracks cumulative size of all uploaded chunks (not just the current one).
+- **Rust:** Checks quota using only the current chunk's `Content-Length`. The cumulative approach would be more precise but requires tracking the temp target file's growing size across chunk PUTs.

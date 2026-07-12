@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+pub mod archive;
+pub(crate) mod archive_stream;
+pub mod bulk_handler;
 pub mod davfile;
 pub mod filesystem;
 pub mod handler;
@@ -9,11 +12,16 @@ pub mod props;
 pub mod quota;
 pub mod row;
 pub mod sync;
+pub mod upload;
+pub mod upload_handler;
 
+pub use bulk_handler::bulk_handler;
 pub use filesystem::NcFileSystem;
 pub use handler::dav_handler;
 pub use locksystem::NcLockSystem;
 pub use metadata::NcMetaData;
+pub use upload::{SharedUploadStateStore, UploadMetadata, UploadStateStore};
+pub use upload_handler::upload_handler;
 
 use nc_db::{
     appconfig::SharedAppConfigCache, filename_validator::SharedFilenameValidator,
@@ -72,4 +80,7 @@ pub struct NcDavState {
     /// `{oc:}downloadURL` for home-storage files (PHASE-7.6).
     /// Empty string when not configured.
     pub base_url: Arc<String>,
+    /// In-process store for chunked upload v2 metadata.
+    /// Used when no distributed cache is configured (PHASE-5.5).
+    pub upload_state_store: SharedUploadStateStore,
 }

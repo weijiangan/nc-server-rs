@@ -71,6 +71,17 @@ clap = { version = "4", features = ["derive"] }
 # Async utilities
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = "0.1"
+
+# Archive streaming (ZIP/TAR folder download, Phase 5.10)
+# `zip` — buffered fallback for small archives (seekable writer needed)
+zip = { version = "6", default-features = false, features = ["deflate"] }
+tar = "0.4"
+# `s-zip` — streaming ZIP for large archives (no seek, no temp file)
+s-zip = "0.11"
+
+# File time manipulation (Phase 5.x — chunked upload mtime/ctime)
+filetime = "0.2"
 
 # FastCGI client (async, Tokio-native) — used by nc-fastcgi (Phase 7.1)
 # No explicit registry: resolved via crates-io → artifactory-remote replacement.

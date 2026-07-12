@@ -907,9 +907,11 @@ Quota checks happen before write operations (PUT, MKCOL, COPY, MOVE, chunk assem
 2. Compare against the larger of `Content-Length`, `X-Expected-Entity-Length`, and `OC-Total-Length` headers.
 3. If free space < required space → `507 Insufficient Storage` response.
 4. For MKCOL: check 4096 bytes as a proxy for directory creation cost.
-5. Storage abstraction sentinel values:
-   - `FileInfo::SPACE_UNKNOWN = -2`: free space is not determinable; skip the quota check and allow the operation.
-   - When free space is non-negative: enforce quota normally.
+5. Storage abstraction sentinel values — when `free_space()` returns **any negative value**, the quota check is skipped and the write is allowed. Sentinels are:
+   - `SPACE_NOT_COMPUTED = -1`: file size not yet scanned
+   - `SPACE_UNKNOWN = -2`: free space is not determinable (e.g. external storage)
+   - `SPACE_UNLIMITED = -3`: no quota / unlimited storage
+   - PHP `QuotaPlugin.checkQuota()` treats all negative `free_space()` as "allow" — this mirrors that behavior.
 6. DAV property mapping: `{DAV:}quota-available-bytes` reports `-3` when quota is unlimited (confirmed by integration tests). Internal `SPACE_UNKNOWN (-2)` maps to `-3` in the DAV response.
 
 ---
