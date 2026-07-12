@@ -451,8 +451,8 @@ impl DavFileSystem for NcFileSystem {
             let sql = format!(
                 "INSERT INTO {prefix}filecache \
                  (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
-                  size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+                  size, mtime, storage_mtime, etag, permissions, checksum) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
                 prefix = self.state.table_prefix
             );
             sqlx::query(&sql)
@@ -470,8 +470,6 @@ impl DavFileSystem for NcFileSystem {
                 .bind(&etag)
                 .bind(31i32)
                 .bind("")
-                .bind(now)
-                .bind(now)
                 .execute(&self.state.pool)
                 .await
                 .map_err(|e| {
@@ -726,8 +724,8 @@ impl DavFileSystem for NcFileSystem {
                     let sql = format!(
                         "INSERT INTO {prefix}filecache \
                          (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
-                          size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time) \
-                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"
+                          size, mtime, storage_mtime, etag, permissions, checksum) \
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"
                     );
                     let _ = sqlx::query(&sql)
                         .bind(fid)
@@ -744,8 +742,6 @@ impl DavFileSystem for NcFileSystem {
                         .bind(&etag)
                         .bind(from_row.permissions)
                         .bind(from_row.checksum.as_deref().unwrap_or(""))
-                        .bind(now)
-                        .bind(now)
                         .execute(&self.state.pool)
                         .await;
                 }

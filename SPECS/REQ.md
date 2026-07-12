@@ -356,15 +356,35 @@ Returns the server's public signing key for the given user's cloud ID.
 
 ### 6.1 URL structure
 
-| URL | Purpose |
-|---|---|
-| `/remote.php/webdav/…` | Authenticated WebDAV root (v1) — same as `/dav/files/{userId}/` |
-| `/remote.php/dav/…` | Authenticated DAV v2 root (full tree including principals, uploads) |
-| `/dav/files/{userId}/…` | User file tree |
-| `/dav/uploads/{userId}/…` | Chunked upload staging area |
-| `/dav/principals/…` | Principals tree (for CalDAV/CardDAV — may proxy to PHP-FPM) |
-| `/public.php/webdav/…` | Public share WebDAV |
-| `/public.php/dav/…` | Public share DAV v2 |
+All sub-trees are served by Nextcloud's SabreDAV server (`apps/dav`), which registers a `RootCollection` with named child trees. The Rust native handler serves only the **files** sub-tree; all other sub-trees are forwarded to PHP-FPM.
+
+| URL | Handler | Purpose |
+|---|---|---|
+| `/remote.php/webdav/…` | **Rust native** | Authenticated WebDAV root (v1) — alias for `/dav/files/{userId}/` |
+| `/remote.php/dav/files/{userId}/…` | **Rust native** | User file tree (DAV v2) |
+| `/remote.php/dav/versions/{userId}/…` | PHP-FPM | File version history (`files_versions` app) |
+| `/remote.php/dav/trashbin/{userId}/…` | PHP-FPM | Trash bin (`files_trashbin` app) |
+| `/remote.php/dav/uploads/{userId}/…` | PHP-FPM | Chunked upload v2 staging area |
+| `/remote.php/dav/comments/…` | PHP-FPM | File comments |
+| `/remote.php/dav/calendars/…` | PHP-FPM | CalDAV |
+| `/remote.php/dav/public-calendars/…` | PHP-FPM | Public CalDAV |
+| `/remote.php/dav/system-calendars/…` | PHP-FPM | System CalDAV |
+| `/remote.php/dav/addressbooks/…` | PHP-FPM | CardDAV |
+| `/remote.php/dav/avatars/…` | PHP-FPM | User avatars |
+| `/remote.php/dav/principals/…` | PHP-FPM | Principals tree (ACL/CalDAV/CardDAV) |
+| `/dav/files/{userId}/…` | **Rust native** | User file tree |
+| `/dav/versions/{userId}/…` | PHP-FPM | File version history |
+| `/dav/trashbin/{userId}/…` | PHP-FPM | Trash bin |
+| `/dav/uploads/{userId}/…` | PHP-FPM | Chunked upload v2 staging area |
+| `/dav/comments/…` | PHP-FPM | File comments |
+| `/dav/calendars/…` | PHP-FPM | CalDAV |
+| `/dav/public-calendars/…` | PHP-FPM | Public CalDAV |
+| `/dav/system-calendars/…` | PHP-FPM | System CalDAV |
+| `/dav/addressbooks/…` | PHP-FPM | CardDAV |
+| `/dav/avatars/…` | PHP-FPM | User avatars |
+| `/dav/principals/…` | PHP-FPM | Principals tree |
+| `/public.php/webdav/…` | PHP-FPM | Public share WebDAV |
+| `/public.php/dav/…` | PHP-FPM | Public share DAV v2 |
 
 ### 6.2 RFC 4918 methods required
 
@@ -742,8 +762,8 @@ The Rust server manages the following tables (minimum required for core + files)
 - `etag` VARCHAR(40)
 - `permissions` INT — CRUDS bitmask
 - `checksum` VARCHAR(255)
-- `creation_time` INT
-- `upload_time` INT
+
+> **Note:** `creation_time` and `upload_time` are **not** columns of `oc_filecache`. They live exclusively in `oc_filecache_extended` (added in NC 17 via `Version17000Date20190514105811`). Do not SELECT them from `oc_filecache`.
 
 **`oc_mimetypes`**
 - `id` BIGINT PK AI
@@ -752,8 +772,8 @@ The Rust server manages the following tables (minimum required for core + files)
 **`oc_filecache_extended`**
 - `fileid` BIGINT PK FK `oc_filecache.fileid`
 - `metadata_etag` VARCHAR(40)
-- `creation_time` INT — authoritative source for `{nc:}creation_time` (migrated here from `oc_filecache`; `oc_filecache.creation_time` retained for backward compat with PHP)
-- `upload_time` INT — authoritative source for `{nc:}upload_time` (same migration story)
+- `creation_time` INT — authoritative source for `{nc:}creation_time`; this is the **only** table that has this column
+- `upload_time` INT — authoritative source for `{nc:}upload_time`; this is the **only** table that has this column
 
 **`oc_files_metadata`**
 - `id` BIGINT PK AI
@@ -871,10 +891,10 @@ At startup Rust scans `apps/*/appinfo/routes.php` (or a pre-built JSON manifest)
 | `systemtags` | `/apps/systemtags/…` |
 | `federation` | `/apps/federation/…` |
 | `federatedfilesharing` | `/apps/federatedfilesharing/…` |
-| `dav` (CalDAV/CardDAV) | `/dav/calendars/…`, `/dav/addressbooks/…` |
+| `dav` (CalDAV/CardDAV/comments/avatars) | `/remote.php/dav/calendars/…`, `/remote.php/dav/public-calendars/…`, `/remote.php/dav/system-calendars/…`, `/remote.php/dav/addressbooks/…`, `/remote.php/dav/comments/…`, `/remote.php/dav/avatars/…`, `/remote.php/dav/principals/…`, `/remote.php/dav/uploads/…` and `/dav/` equivalents |
 | `settings` | `/settings/…` |
-| `files_versions` | `/apps/files_versions/…`, `/ocs/…/apps/files_versions/…` |
-| `files_trashbin` | `/apps/files_trashbin/…`, `/ocs/…/apps/files_trashbin/…` |
+| `files_versions` | `/apps/files_versions/…`, `/ocs/…/apps/files_versions/…`, `/remote.php/dav/versions/…`, `/dav/versions/…` |
+| `files_trashbin` | `/apps/files_trashbin/…`, `/ocs/…/apps/files_trashbin/…`, `/remote.php/dav/trashbin/…`, `/dav/trashbin/…` |
 | Any other installed app | All its registered routes |
 
 ---

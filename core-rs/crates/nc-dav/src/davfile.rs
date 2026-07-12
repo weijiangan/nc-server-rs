@@ -339,19 +339,22 @@ impl DavFile for NcDavFile {
                 fileid = fid;
                 let sql = format!(
                     "UPDATE {prefix}filecache \
-                     SET size=$1, mtime=$2, storage_mtime=$3, etag=$4, checksum=$5, upload_time=$6 \
-                     WHERE fileid=$7"
+                     SET size=$1, mtime=$2, storage_mtime=$3, etag=$4, checksum=$5 \
+                     WHERE fileid=$6"
                 );
-                let _ = sqlx::query(&sql)
+                if let Err(e) = sqlx::query(&sql)
                     .bind(size as i64)
                     .bind(use_mtime)
                     .bind(use_mtime)
                     .bind(&new_etag)
                     .bind(checksum)
-                    .bind(now)
                     .bind(fid)
                     .execute(pool)
-                    .await;
+                    .await
+                {
+                    tracing::error!(error = %e, fileid = fid, "PUT: failed to update oc_filecache row");
+                    return Err(FsError::GeneralFailure);
+                }
             } else {
                 let fid = crate::row::next_fileid(pool, prefix)
                     .await
@@ -364,10 +367,10 @@ impl DavFile for NcDavFile {
                 let sql = format!(
                     "INSERT INTO {prefix}filecache \
                      (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
-                      size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time) \
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"
+                      size, mtime, storage_mtime, etag, permissions, checksum) \
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"
                 );
-                let _ = sqlx::query(&sql)
+                if let Err(e) = sqlx::query(&sql)
                     .bind(fid)
                     .bind(ctx.storage_id)
                     .bind(&ctx.fc_path)
@@ -382,10 +385,12 @@ impl DavFile for NcDavFile {
                     .bind(&new_etag)
                     .bind(27i32)
                     .bind(checksum)
-                    .bind(use_creation_time)
-                    .bind(now)
                     .execute(pool)
-                    .await;
+                    .await
+                {
+                    tracing::error!(error = %e, fc_path = %ctx.fc_path, "PUT: failed to insert oc_filecache row");
+                    return Err(FsError::GeneralFailure);
+                }
             }
 
             // ── Update in-memory metadata (PHASE-5.3) ────────────────────────

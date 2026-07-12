@@ -45,7 +45,7 @@ pub struct FileCacheExtRow {
 ///
 /// Nextcloud's home storage keeps all user files under a `files/` prefix.
 pub fn dav_to_fc_path(dav_path: &str) -> String {
-    let trimmed = dav_path.trim_start_matches('/');
+    let trimmed = dav_path.trim_matches('/');
     if trimmed.is_empty() {
         "files".to_string()
     } else {
@@ -111,33 +111,41 @@ pub async fn lookup_by_path(
     let hash = path_hash(path);
     let sql = format!(
         "SELECT fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
-         size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time \
+         size, mtime, storage_mtime, etag, permissions, checksum \
          FROM {prefix}filecache WHERE storage = $1 AND path_hash = $2"
     );
-    sqlx::query(&sql)
+    match sqlx::query(&sql)
         .bind(storage)
         .bind(&hash)
         .fetch_optional(pool)
         .await
-        .ok()
-        .flatten()
-        .map(|r| fc_row_from_any(&r))
+    {
+        Err(e) => {
+            tracing::error!(error = %e, path = %path, "lookup_by_path: SQL error");
+            None
+        }
+        Ok(row) => row.map(|r| fc_row_from_any(&r)),
+    }
 }
 
 /// Look up one filecache row by its `fileid`.
 pub async fn lookup_by_id(pool: &DbPool, prefix: &str, fileid: i64) -> Option<FileCacheRow> {
     let sql = format!(
         "SELECT fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
-         size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time \
+         size, mtime, storage_mtime, etag, permissions, checksum \
          FROM {prefix}filecache WHERE fileid = $1"
     );
-    sqlx::query(&sql)
+    match sqlx::query(&sql)
         .bind(fileid)
         .fetch_optional(pool)
         .await
-        .ok()
-        .flatten()
-        .map(|r| fc_row_from_any(&r))
+    {
+        Err(e) => {
+            tracing::error!(error = %e, fileid = fileid, "lookup_by_id: SQL error");
+            None
+        }
+        Ok(row) => row.map(|r| fc_row_from_any(&r)),
+    }
 }
 
 /// Fetch all direct children of `parent_id` in the given storage.
@@ -149,18 +157,21 @@ pub async fn list_children(
 ) -> Vec<FileCacheRow> {
     let sql = format!(
         "SELECT fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
-         size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time \
+         size, mtime, storage_mtime, etag, permissions, checksum \
          FROM {prefix}filecache WHERE parent = $1 AND storage = $2"
     );
-    sqlx::query(&sql)
+    match sqlx::query(&sql)
         .bind(parent_id)
         .bind(storage)
         .fetch_all(pool)
         .await
-        .unwrap_or_default()
-        .iter()
-        .map(fc_row_from_any)
-        .collect()
+    {
+        Err(e) => {
+            tracing::error!(error = %e, parent_id = parent_id, "list_children: SQL error");
+            Vec::new()
+        }
+        Ok(rows) => rows.iter().map(fc_row_from_any).collect(),
+    }
 }
 
 /// Fetch extended metadata for a file (creation_time, upload_time, metadata_etag).
@@ -399,21 +410,24 @@ pub async fn list_changed_since(
     let like_pat = format!("{fc_path}/%");
     let sql = format!(
         "SELECT fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
-         size, mtime, storage_mtime, etag, permissions, checksum, creation_time, upload_time \
+         size, mtime, storage_mtime, etag, permissions, checksum \
          FROM {prefix}filecache \
          WHERE storage = $1 AND (path = $2 OR path LIKE $3) AND mtime > $4"
     );
-    sqlx::query(&sql)
+    match sqlx::query(&sql)
         .bind(storage_id)
         .bind(fc_path)
         .bind(&like_pat)
         .bind(since_mtime)
         .fetch_all(pool)
         .await
-        .unwrap_or_default()
-        .iter()
-        .map(fc_row_from_any)
-        .collect()
+    {
+        Err(e) => {
+            tracing::error!(error = %e, fc_path = %fc_path, "list_changed_since: SQL error");
+            Vec::new()
+        }
+        Ok(rows) => rows.iter().map(fc_row_from_any).collect(),
+    }
 }
 
 /// Generate the next available `fileid` for INSERT.
@@ -444,7 +458,10 @@ fn fc_row_from_any(r: &sqlx::any::AnyRow) -> FileCacheRow {
         etag: r.get("etag"),
         permissions: r.get::<Option<i32>, _>("permissions").unwrap_or(0),
         checksum: r.get("checksum"),
-        creation_time: r.get("creation_time"),
-        upload_time: r.get("upload_time"),
+        // creation_time and upload_time live in oc_filecache_extended, not
+        // oc_filecache.  Default to 0 here; load_meta() calls get_extended()
+        // and apply_extended() to fill in the authoritative values.
+        creation_time: 0,
+        upload_time: 0,
     }
 }

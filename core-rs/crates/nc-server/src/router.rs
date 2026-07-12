@@ -99,19 +99,68 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
         .route("/ocs-provider/index.php", get(php_fpm_fallback))
         // DAV (Phase 4) — native handlers; all mount points share the same
         // handler which resolves the strip prefix from the request path.
-        .route("/remote.php/webdav",         axum::routing::any(nc_dav::dav_handler))
-        .route("/remote.php/webdav/{*path}", axum::routing::any(nc_dav::dav_handler))
-        .route("/remote.php/dav",            axum::routing::any(nc_dav::dav_handler))
-        .route("/remote.php/dav/{*path}",    axum::routing::any(nc_dav::dav_handler))
-        .route("/dav",                       axum::routing::any(nc_dav::dav_handler))
-        .route("/dav/{*path}",               axum::routing::any(nc_dav::dav_handler))
+        //
+        // Each mount point needs three routes because axum's `{*path}` catch-all
+        // requires at least one character — it does NOT match a bare trailing
+        // slash.  WebDAV clients routinely PROPFIND the collection root with a
+        // trailing slash (e.g. `PROPFIND /remote.php/webdav/`), so we register:
+        //   /mount          — exact, no trailing slash
+        //   /mount/         — exact, trailing slash only (collection root)
+        //   /mount/{*path}  — one or more path segments
+        .route(
+            "/remote.php/webdav",
+            axum::routing::any(nc_dav::dav_handler),
+        )
+        .route(
+            "/remote.php/webdav/",
+            axum::routing::any(nc_dav::dav_handler),
+        )
+        .route(
+            "/remote.php/webdav/{*path}",
+            axum::routing::any(nc_dav::dav_handler),
+        )
+        .route("/remote.php/dav", axum::routing::any(nc_dav::dav_handler))
+        .route("/remote.php/dav/", axum::routing::any(nc_dav::dav_handler))
+        // Non-files DAV sub-trees are served by PHP/SabreDAV.  These more-specific
+        // routes must come before the generic `/remote.php/dav/{*path}` wildcard so
+        // that axum matches them first.
+        .route("/remote.php/dav/versions/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/remote.php/dav/comments/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/remote.php/dav/trashbin/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/remote.php/dav/uploads/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/remote.php/dav/principals/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/remote.php/dav/calendars/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/remote.php/dav/public-calendars/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/remote.php/dav/system-calendars/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/remote.php/dav/addressbooks/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/remote.php/dav/avatars/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/remote.php/dav/access-control/{*path}", axum::routing::any(php_fpm_fallback))
+        // Native file-storage handler for /remote.php/dav/files/{uid}/{*path}
+        .route(
+            "/remote.php/dav/{*path}",
+            axum::routing::any(nc_dav::dav_handler),
+        )
+        .route("/dav", axum::routing::any(nc_dav::dav_handler))
+        .route("/dav/", axum::routing::any(nc_dav::dav_handler))
+        .route("/dav/versions/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/dav/comments/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/dav/trashbin/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/dav/uploads/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/dav/principals/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/dav/calendars/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/dav/public-calendars/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/dav/system-calendars/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/dav/addressbooks/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/dav/avatars/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/dav/{*path}", axum::routing::any(nc_dav::dav_handler))
         // Static PHP-FPM routes — always forwarded regardless of registry
-        .route("/public.php/{*path}",        axum::routing::any(php_fpm_fallback))
-        .route("/.well-known/{*path}",       axum::routing::any(php_fpm_fallback))
-        .route("/login/{*path}",             axum::routing::any(php_fpm_fallback))
-        .route("/index.php",                 axum::routing::any(php_fpm_fallback))
-        .route("/index.php/{*path}",         axum::routing::any(php_fpm_fallback))
-        .route("/",                          axum::routing::any(php_fpm_fallback));
+        .route("/public.php/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/.well-known/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/login/{*path}", axum::routing::any(php_fpm_fallback))
+        .route("/index.php", axum::routing::any(php_fpm_fallback))
+        .route("/index.php/{*path}", axum::routing::any(php_fpm_fallback))
+        // Root path — Nextcloud redirects to default page or login
+        .route("/", axum::routing::any(php_fpm_fallback));
 
     // ── Registry-built PHP-FPM routes (Phase 7.5) ───────────────────────────
     //
