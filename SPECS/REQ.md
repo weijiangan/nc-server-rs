@@ -2,6 +2,14 @@
 
 This document captures the detailed requirements for reimplementing Nextcloud's **core** and **files** subsystems in Rust such that all existing clients (desktop sync, iOS, Android, WebDAV mounts, web UI) continue to work unchanged. PHP apps remain supported by forwarding requests to a PHP-FPM backend.
 
+### ⚠ Requirement Gap: Trash Bin on DELETE
+
+The `files_trashbin` app was categorised as "out of scope / delegated to PHP-FPM" (§1, §10.5) and its DAV endpoint (`/remote.php/dav/trashbin/…`) was routed to PHP-FPM (§6.1). This correctly covers the *read-side* (listing and restoring deleted files), but **misses the write-side**: the trash bin is not a self-contained app — it is a storage-wrapper that intercepts every `unlink()` call across the filesystem. The act of moving a file to trash happens during `DELETE /remote.php/dav/files/{userId}/…` — the Rust-native handler — not on the trashbin endpoint. By the time a request reaches `/dav/trashbin/…`, the file is already expected to be in the trash.
+
+This gap was introduced because the scope boundaries were drawn along app/endpoint lines (the trashbin *app* and its *DAV subtree* are PHP-FPM), without tracing the cross-cutting dataflow: the write path runs through the files endpoint, not the trashbin endpoint. The `oc_files_trash` table and the `files_trashbin/files/` storage layout were also absent from the database schema (§9).
+
+See §6.7 and §9.7 for the corrected requirements.
+
 ---
 
 ## 1. Scope
@@ -508,6 +516,66 @@ All the following are **read-only** (protected) unless noted:
 | `{nc:}metadata-{key}` | Update metadata value (permission-checked) |
 | `{DAV:}displayname` | Return 403 (blocked) |
 
+### 6.7 Trash bin on DELETE
+
+DELETE on `/remote.php/dav/files/{userId}/{path}` (and equivalent `/dav/files/{userId}/{path}`) must **not** permanently delete the file. Instead, it must move the file to the trash bin, matching PHP's `TrashbinPlugin` which intercepts `unlink()` calls via the `files_trashbin` storage wrapper.
+
+#### 6.7.1 Disk layout
+
+The file is renamed on disk from:
+
+```
+{datadirectory}/{userId}/files/{relative_path}
+```
+
+to:
+
+```
+{datadirectory}/{userId}/files_trashbin/files/{relative_path}.d{timestamp}
+```
+
+For directories, the entire subtree is moved under the same `.d{timestamp}`-suffixed path.
+
+`timestamp` is the current Unix timestamp at deletion time.
+
+If a file with the same trash path already exists, append an incrementing suffix: `.d{timestamp}_1`, `.d{timestamp}_2`, etc.
+
+#### 6.7.2 Filecache update
+
+The `oc_filecache` row is **updated** (not deleted):
+
+| Column | New value |
+|---|---|
+| `path` | `files_trashbin/files/{relative_path}.d{timestamp}` |
+| `path_hash` | `MD5(new_path)` |
+| `name` | Original basename with `.d{timestamp}` appended |
+| `parent` | `fileid` of the `files_trashbin/files` directory (auto-created if missing) |
+| `mtime` | `timestamp` (deletion time) |
+
+The `oc_filecache_extended` row is left unchanged (still keyed by `fileid`).
+
+#### 6.7.3 `oc_files_trash` table
+
+One row is inserted per deleted file/directory:
+
+| Column | Value |
+|---|---|
+| `auto_id` | auto-increment |
+| `id` | `fileid` from `oc_filecache` (the deleted node's fileid) |
+| `user` | UID of the deleting user |
+| `timestamp` | Unix timestamp of deletion |
+| `location` | Original `files/{relative_path}` (the path before deletion) |
+| `type` | `'file'` or `'folder'` |
+| `deleted_by` | UID of the user who performed the deletion (same as `user` for direct deletes; differs for share recipients) |
+
+#### 6.7.4 Deletion from trash (permanent delete)
+
+DELETE on `/remote.php/dav/trashbin/{userId}/{path}` is forwarded to PHP-FPM (existing route). PHP-FPM's `files_trashbin` app handles the permanent deletion from disk and removal from `oc_files_trash` + `oc_filecache`. The Rust handler does not need to implement permanent-delete logic — the trashbin DAV subtree is already routed to PHP-FPM (§6.1).
+
+#### 6.7.5 Versioning interaction
+
+When a file is deleted and moved to trash, any existing versions in `files_versions/` are preserved as-is by the `files_versions` app (PHP-FPM). The Rust handler does not interact with versions during trash moves.
+
 ---
 
 ## 7. Upload Flows
@@ -774,6 +842,15 @@ The Rust server manages the following tables (minimum required for core + files)
 - `metadata_etag` VARCHAR(40)
 - `creation_time` INT — authoritative source for `{nc:}creation_time`; this is the **only** table that has this column
 - `upload_time` INT — authoritative source for `{nc:}upload_time`; this is the **only** table that has this column
+
+**`oc_files_trash`**
+- `auto_id` BIGINT PK AI
+- `id` BIGINT NOT NULL — `oc_filecache.fileid` of the trashed node
+- `user` VARCHAR(64) NOT NULL — UID of the user who deleted the file
+- `timestamp` INT NOT NULL — Unix timestamp of deletion
+- `location` VARCHAR(512) NOT NULL — original path before deletion (e.g. `files/Documents/report.pdf`)
+- `type` VARCHAR(8) — `'file'` or `'folder'`
+- `deleted_by` VARCHAR(64) — UID of the user who performed the deletion (same as `user` for direct deletes)
 
 **`oc_files_metadata`**
 - `id` BIGINT PK AI
