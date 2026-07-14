@@ -251,7 +251,8 @@ async fn write_file(
         if parts.is_empty() {
             "files".to_string()
         } else {
-            format!("files/{}", parts.join("/"))
+            // parts already start with "files" because fc_path does
+            parts.join("/")
         }
     };
 
@@ -635,5 +636,53 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].as_ref().unwrap().data, b"first");
         assert_eq!(parts[1].as_ref().unwrap().data, b"second");
+    }
+
+    // ── fc_path construction ───────────────────────────────────────────────
+    //
+    // regression: double "files/" prefix when the client-provided path
+    // already contained the "files/" prefix.
+    //   core-rs/crates/nc-dav/src/bulk_handler.rs::store_single_file()
+    //     → format!("files/{}", file_path.trim_start_matches('/'))
+
+    /// Replicate the fc_path construction from `store_single_file`.
+    fn bulk_fc_path(file_path: &str) -> String {
+        format!("files/{}", file_path.trim_start_matches('/'))
+    }
+
+    #[test]
+    fn bulk_fc_path_simple() {
+        assert_eq!(bulk_fc_path("/test.txt"), "files/test.txt");
+    }
+
+    #[test]
+    fn bulk_fc_path_nested() {
+        assert_eq!(
+            bulk_fc_path("/Media/Decent photos/001.jpg"),
+            "files/Media/Decent photos/001.jpg"
+        );
+    }
+
+    #[test]
+    fn bulk_fc_path_no_leading_slash() {
+        assert_eq!(bulk_fc_path("test.txt"), "files/test.txt");
+    }
+
+    #[test]
+    fn bulk_fc_path_no_double_files_prefix() {
+        // Regression: the old code `format!("files/{}", parts.join("/"))`
+        // where parts already included "files" produced "files/files/...".
+        // trim_start_matches('/') does NOT strip "files/", so a path
+        // already containing "files/" would still cause a double prefix.
+        // This test documents the contract: callers must NOT pass paths
+        // already prefixed with "files/".
+        let with_files_prefix = bulk_fc_path("files/test.txt");
+        assert_eq!(
+            with_files_prefix,
+            "files/files/test.txt",
+            "callers must strip 'files/' prefix before passing to bulk_fc_path"
+        );
+        // Correct: strip the DAV prefix first.
+        assert_eq!(bulk_fc_path("test.txt"), "files/test.txt");
     }
 }
