@@ -156,6 +156,7 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
         .route("/dav/avatars/{*path}", axum::routing::any(php_fpm_fallback))
         // PHASE-5.9: Bulk upload endpoint
         .route("/dav/bulk", axum::routing::post(nc_dav::bulk_handler))
+        .route("/remote.php/dav/bulk", axum::routing::post(nc_dav::bulk_handler))
         .route("/dav/{*path}", axum::routing::any(nc_dav::dav_handler))
         // Static PHP-FPM routes — always forwarded regardless of registry
         .route("/public.php/{*path}", axum::routing::any(php_fpm_fallback))
