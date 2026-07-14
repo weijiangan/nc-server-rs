@@ -356,41 +356,56 @@ impl DavFile for NcDavFile {
                     return Err(FsError::GeneralFailure);
                 }
             } else {
-                let fid = crate::row::next_fileid(pool, prefix)
-                    .await
-                    .map_err(|_| FsError::GeneralFailure)?;
-                fileid = fid;
-
                 let name = ctx.fc_path.rsplit('/').next().unwrap_or(&ctx.fc_path).to_string();
                 let hash = crate::row::path_hash(&ctx.fc_path);
-
                 let sql = format!(
                     "INSERT INTO {prefix}filecache \
                      (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
                       size, mtime, storage_mtime, etag, permissions, checksum) \
                      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"
                 );
-                if let Err(e) = sqlx::query(&sql)
-                    .bind(fid)
-                    .bind(ctx.storage_id)
-                    .bind(&ctx.fc_path)
-                    .bind(&hash)
-                    .bind(ctx.parent_id)
-                    .bind(&name)
-                    .bind(ctx.mime_type_id)
-                    .bind(ctx.mimepart_id)
-                    .bind(size as i64)
-                    .bind(use_mtime)
-                    .bind(use_mtime)
-                    .bind(&new_etag)
-                    .bind(27i32)
-                    .bind(checksum)
-                    .execute(pool)
-                    .await
-                {
-                    tracing::error!(error = %e, fc_path = %ctx.fc_path, "PUT: failed to insert oc_filecache row");
-                    return Err(FsError::GeneralFailure);
+
+                // Retry on duplicate-key race (concurrent PUTs may get the same
+                // fileid from `next_fileid` which does `SELECT MAX(fileid)+1`).
+                let mut fid: i64 = 0;
+                for attempt in 0..3 {
+                    fid = crate::row::next_fileid(pool, prefix)
+                        .await
+                        .map_err(|_| FsError::GeneralFailure)?;
+
+                    match sqlx::query(&sql)
+                        .bind(fid)
+                        .bind(ctx.storage_id)
+                        .bind(&ctx.fc_path)
+                        .bind(&hash)
+                        .bind(ctx.parent_id)
+                        .bind(&name)
+                        .bind(ctx.mime_type_id)
+                        .bind(ctx.mimepart_id)
+                        .bind(size as i64)
+                        .bind(use_mtime)
+                        .bind(use_mtime)
+                        .bind(&new_etag)
+                        .bind(27i32)
+                        .bind(checksum)
+                        .execute(pool)
+                        .await
+                    {
+                        Ok(_) => break,
+                        Err(e) if attempt < 2 => {
+                            tracing::warn!(
+                                error = %e, fc_path = %ctx.fc_path, attempt,
+                                "PUT: insert race, retrying"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, fc_path = %ctx.fc_path, "PUT: failed to insert oc_filecache row");
+                            return Err(FsError::GeneralFailure);
+                        }
+                    }
                 }
+                fileid = fid;
             }
 
             // ── Update in-memory metadata (PHASE-5.3) ────────────────────────

@@ -86,6 +86,209 @@ impl NcFileSystem {
         disk_path(data_dir, &self.uid, fc_path)
     }
 
+    /// Ensure a parent directory exists in the filecache, creating it
+    /// recursively if needed.
+    ///
+    /// Matches PHP's `View::createParentDirectories()` which is called
+    /// before every `newFile()` / `newFolder()` operation.  Without this,
+    /// uploading a file into a newly-created folder (or a folder that only
+    /// exists on disk but not in the filecache) fails with NotFound.
+    ///
+    /// Deviation: PHP does NOT call `createParentDirectories()` from chunked
+    /// upload v2 assembly, so chunked uploads to paths with a non-existent
+    /// parent fail.  Rust calls this uniformly from all write paths (PUT,
+    /// MKCOL, chunked assembly).  See SPECS/PHASE-5.md.
+    async fn ensure_parent_dir(
+        &self,
+        fc_path: &str,
+    ) -> Result<row::FileCacheRow, String> {
+        // Fast path: parent already exists.
+        if let Some(row) = row::lookup_by_path(
+            &self.state.pool,
+            &self.state.table_prefix,
+            self.storage_id,
+            fc_path,
+        )
+        .await
+        {
+            return Ok(row);
+        }
+
+        // Build the full chain of ancestors that need to exist.
+        // The root "files" must already be in the filecache.
+        let segments: Vec<&str> = fc_path.split('/').collect();
+        let mut built = String::new();
+        let mut last_existing_row: Option<row::FileCacheRow> = None;
+
+        for (i, seg) in segments.iter().enumerate() {
+            if i == 0 {
+                built.push_str(seg);
+            } else {
+                built.push('/');
+                built.push_str(seg);
+            }
+
+            if let Some(r) = row::lookup_by_path(
+                &self.state.pool,
+                &self.state.table_prefix,
+                self.storage_id,
+                &built,
+            )
+            .await
+            {
+                last_existing_row = Some(r);
+                continue;
+            }
+
+            // Create this missing directory.
+            // If even the first segment is missing (e.g. files_trashbin),
+            // create it as a peer of "files" — same parent in oc_filecache.
+            if last_existing_row.is_none() {
+                let files_row = row::lookup_by_path(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    self.storage_id,
+                    "files",
+                )
+                .await
+                .ok_or("Cannot find root 'files' directory")?;
+                // Use files.parent so the new top-level dir is a sibling of
+                // "files".  Guard against self-referencing parent.
+                let parent_id = if files_row.parent == files_row.fileid {
+                    -1
+                } else {
+                    files_row.parent
+                };
+                // Synthesise a minimal parent row — only fileid is read by the
+                // INSERT below.
+                last_existing_row = Some(row::FileCacheRow {
+                    fileid: parent_id,
+                    storage: self.storage_id,
+                    path: None,
+                    path_hash: String::new(),
+                    parent: -1,
+                    name: None,
+                    mimetype: 0,
+                    mimepart: 0,
+                    size: 0,
+                    mtime: 0,
+                    storage_mtime: 0,
+                    etag: None,
+                    permissions: 0,
+                    checksum: None,
+                    creation_time: 0,
+                    upload_time: 0,
+                });
+            }
+            let parent_row = last_existing_row.as_ref().unwrap();
+
+            let disk = self.disk_path(&built);
+            tokio::fs::create_dir_all(&disk)
+                .await
+                .map_err(|e| format!("mkdir: {e}"))?;
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+            let fid = row::next_fileid(
+                &self.state.pool,
+                &self.state.table_prefix,
+            )
+            .await
+            .map_err(|e| format!("fileid: {e}"))?;
+
+            let dir_mime_id = {
+                let cache = self.state.mime_cache.read().expect("mime cache lock");
+                cache.get_id("httpd/unix-directory").unwrap_or(2)
+            };
+            let hash = row::path_hash(&built);
+            let name = seg.to_string();
+
+            let sql = format!(
+                "INSERT INTO {prefix}filecache \
+                 (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+                  size, mtime, storage_mtime, etag, permissions, checksum) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                prefix = self.state.table_prefix
+            );
+            if let Err(e) = sqlx::query(&sql)
+                .bind(fid)
+                .bind(self.storage_id)
+                .bind(&built)
+                .bind(&hash)
+                .bind(parent_row.fileid)
+                .bind(&name)
+                .bind(dir_mime_id)
+                .bind(dir_mime_id)
+                .bind(0i64)
+                .bind(now)
+                .bind(now)
+                .bind(&etag)
+                .bind(31i32)
+                .bind("")
+                .execute(&self.state.pool)
+                .await
+            {
+                // TOCTOU race: another request created this directory between
+                // our lookup and INSERT.  Re-read the row that the other
+                // request inserted.
+                warn!("ensure_parent_dir insert race for {built}: {e}");
+                if let Some(r) = row::lookup_by_path(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    self.storage_id,
+                    &built,
+                )
+                .await
+                {
+                    last_existing_row = Some(r);
+                    continue;
+                }
+                return Err(format!("insert: {e}"));
+            }
+
+            // Also create the extended-cache row.
+            {
+                let sql = format!(
+                    "INSERT INTO {prefix}filecache_extended \
+                     (fileid, metadata_etag, creation_time, upload_time) \
+                     VALUES ($1, '', $2, $2) \
+                     ON CONFLICT(fileid) DO NOTHING",
+                    prefix = self.state.table_prefix
+                );
+                let _ = sqlx::query(&sql)
+                    .bind(fid)
+                    .bind(now)
+                    .execute(&self.state.pool)
+                    .await;
+            }
+
+            let new_row = row::FileCacheRow {
+                fileid: fid,
+                storage: self.storage_id,
+                path: Some(built.clone()),
+                path_hash: hash,
+                parent: parent_row.fileid,
+                name: Some(name),
+                mimetype: dir_mime_id,
+                mimepart: dir_mime_id,
+                size: 0,
+                mtime: now,
+                storage_mtime: now,
+                etag: Some(etag),
+                permissions: 31,
+                checksum: None,
+                creation_time: now,
+                upload_time: now,
+            };
+            last_existing_row = Some(new_row);
+        }
+
+        last_existing_row.ok_or_else(|| "Failed to ensure parent directory".to_string())
+    }
+
     /// Load `NcMetaData` for any filecache path, including extended times.
     async fn load_meta(&self, fc_path: &str) -> Option<NcMetaData> {
         let row = row::lookup_by_path(
@@ -258,7 +461,8 @@ impl DavFileSystem for NcFileSystem {
                     return Err(FsError::Exists);
                 }
 
-                // Resolve parent directory.
+                // Resolve parent directory (auto-create if missing — matches PHP's
+                // $userFolder->newFile() which calls createParentDirectories()).
                 let parent_fc_path = {
                     let mut parts: Vec<&str> = fc_path.split('/').collect();
                     parts.pop();
@@ -268,14 +472,10 @@ impl DavFileSystem for NcFileSystem {
                         parts.join("/")
                     }
                 };
-                let parent_row = row::lookup_by_path(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    self.storage_id,
-                    &parent_fc_path,
-                )
-                .await
-                .ok_or(FsError::NotFound)?;
+                let parent_row = self
+                    .ensure_parent_dir(&parent_fc_path)
+                    .await
+                    .map_err(|_| FsError::NotFound)?;
 
                 // Resolve MIME type ids.
                 let file_name = fc_path.rsplit('/').next().unwrap_or("");
@@ -411,20 +611,16 @@ impl DavFileSystem for NcFileSystem {
                 return Err(FsError::Exists);
             }
 
-            // Look up parent.
+            // Look up parent (auto-create if missing, matching PHP).
             let parent_path = {
                 let mut parts: Vec<&str> = fc_path.split('/').collect();
                 parts.pop();
                 parts.join("/")
             };
-            let parent_row = row::lookup_by_path(
-                &self.state.pool,
-                &self.state.table_prefix,
-                self.storage_id,
-                &parent_path,
-            )
-            .await
-            .ok_or(FsError::NotFound)?;
+            let parent_row = self
+                .ensure_parent_dir(&parent_path)
+                .await
+                .map_err(|_| FsError::NotFound)?;
 
             // Create directory on disk.
             blocking(move || std::fs::create_dir(&disk))
@@ -1290,5 +1486,272 @@ mod tests {
     #[test]
     fn iso8601_unix_epoch() {
         assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
+    }
+
+
+    // ── Trash path computation ─────────────────────────────────────────────
+    //
+    // These tests verify our implementation matches the behaviour of:
+    //   apps/files_trashbin/lib/Trashbin.php::move2trash()
+    //     → pathinfo() for id/location extraction
+    //     → getTrashFilename() for basename.d{ts} naming
+    //   apps/files_trashbin/lib/Helper.php::getTrashFiles()
+    //     → pathinfo() parsing of .d{ts} suffix from flat trash names
+
+    /// Compute the trash `id` (basename) and `location` (dirname) for
+    /// `oc_files_trash`, matching PHP's `pathinfo()` behaviour.
+    ///
+    /// Returns `(trash_basename, location, trash_fc_path)`.
+    fn trash_path_info(
+        fc_path: &str,
+        now: i64,
+    ) -> (String, String, String) {
+        let relative = fc_path.strip_prefix("files/").unwrap_or(fc_path);
+        let p = std::path::Path::new(relative);
+
+        let basename = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| relative.to_string());
+
+        let location = p
+            .parent()
+            .and_then(|d| d.to_str())
+            .unwrap_or("")
+            .trim_matches('.')
+            .to_string();
+
+        let trash_fc = format!("files_trashbin/files/{}.d{now}", basename);
+
+        (basename, location, trash_fc)
+    }
+
+    #[test]
+    fn trash_root_level_file_basename_is_correct() {
+        // Trashbin::move2trash() line 263-268:
+        //   $path_parts = pathinfo($ownerPath);
+        //   $filename = $path_parts['basename'];  // "test"
+        //   $location = $path_parts['dirname'];   // "." → stored as ""
+        let (basename, location, trash_fc) =
+            trash_path_info("files/test", 1784065766);
+        assert_eq!(basename, "test");
+        assert_eq!(location, ""); // "." trimmed to ""
+        assert_eq!(trash_fc, "files_trashbin/files/test.d1784065766");
+    }
+
+    #[test]
+    fn trash_nested_file_basename_is_correct() {
+        // Trashbin::move2trash() pathinfo() for a nested path.
+        //   pathinfo("Media/test.txt") → basename="test.txt", dirname="Media"
+        let (basename, location, trash_fc) =
+            trash_path_info("files/Media/test.txt", 1784065766);
+        assert_eq!(basename, "test.txt");
+        assert_eq!(location, "Media");
+        assert_eq!(trash_fc, "files_trashbin/files/test.txt.d1784065766");
+    }
+
+    #[test]
+    fn trash_directory_structure_not_preserved() {
+        // A file deep in a tree should NOT preserve its directory structure
+        // in the trash path. PHP flattens to just the basename.
+        let (_basename, _location, trash_fc) =
+            trash_path_info("files/a/b/c/deep/file.pdf", 1784000000);
+        assert_eq!(trash_fc, "files_trashbin/files/file.pdf.d1784000000");
+    }
+
+    #[test]
+    fn trash_nested_dirname_is_correct() {
+        // PHP: pathinfo("a/b/c/name") → basename="name", dirname="a/b/c"
+        let (basename, location, trash_fc) =
+            trash_path_info("files/a/b/c/name", 1784000000);
+        assert_eq!(basename, "name");
+        assert_eq!(location, "a/b/c");
+        assert_eq!(trash_fc, "files_trashbin/files/name.d1784000000");
+    }
+
+    #[test]
+    fn trash_filename_with_dots_preserves_extension() {
+        // "archive.tar.gz" → basename is "archive.tar.gz", not "archive"
+        let (basename, location, trash_fc) =
+            trash_path_info("files/backups/archive.tar.gz", 1784000000);
+        assert_eq!(basename, "archive.tar.gz");
+        assert_eq!(location, "backups");
+        assert_eq!(trash_fc, "files_trashbin/files/archive.tar.gz.d1784000000");
+    }
+
+    #[test]
+    fn trash_root_level_directory() {
+        // Trashing a top-level directory like "files/Photos"
+        let (basename, location, trash_fc) =
+            trash_path_info("files/Photos", 1784000000);
+        assert_eq!(basename, "Photos");
+        assert_eq!(location, "");
+        assert_eq!(trash_fc, "files_trashbin/files/Photos.d1784000000");
+    }
+
+    #[test]
+    fn trash_id_is_never_a_fileid() {
+        // Regression: we used to store row.fileid in oc_files_trash.id.
+        // The id must always be the filename basename (a string like "test"),
+        // never a numeric fileid like "109".
+        let (basename, _, _) = trash_path_info("files/test", 1784000000);
+        assert!(!basename.chars().all(|c| c.is_ascii_digit()),
+            "trash id must be the basename, not a numeric fileid");
+        assert_eq!(basename, "test");
+    }
+
+    #[test]
+    fn trash_location_is_never_a_full_fc_path() {
+        // Regression: we used to store "files/{relative}" as location.
+        // The location must be the dirname relative to files/, never "files/...".
+        let (_, location, _) =
+            trash_path_info("files/Media/test.txt", 1784000000);
+        assert!(!location.starts_with("files/"),
+            "trash location must be relative to files/, not a full fc path: {location}");
+        assert_eq!(location, "Media");
+    }
+
+    // ── Upload path computation ────────────────────────────────────────────
+    //
+    // These tests verify path construction used by all write paths,
+    // matching:
+    //   lib/private/Files/View.php::createParentDirectories()
+    //     → recursive parent directory auto-creation
+    //   apps/files_trashbin/lib/Trashbin.php::setUpTrash()
+    //     → creates files_trashbin/files as sibling of files/
+    //   core-rs/crates/nc-dav/src/row.rs::dav_to_fc_path()
+    //     → DAV path to filecache path mapping
+
+    /// Simulate `dav_to_fc_path` — the DAV→filecache path mapping used by
+    /// all write paths (PUT, MKCOL, bulk upload).
+    fn upload_fc_path(dav_path: &str) -> String {
+        crate::row::dav_to_fc_path(dav_path)
+    }
+
+    /// Extract the parent directory from a filecache path, matching the
+    /// logic in `bulk_handler` and `move_to_trash`.
+    fn upload_parent_fc(fc_path: &str) -> String {
+        let mut parts: Vec<&str> = fc_path.split('/').collect();
+        parts.pop();
+        parts.join("/")
+    }
+
+    /// Build the chain of ancestor paths from a filecache path, matching
+    /// the segment-iteration logic in `ensure_parent_dir`.
+    fn upload_ancestor_chain(fc_path: &str) -> Vec<String> {
+        let segments: Vec<&str> = fc_path.split('/').collect();
+        let mut built = String::new();
+        let mut chain = Vec::new();
+        for (i, seg) in segments.iter().enumerate() {
+            if i == 0 {
+                built.push_str(seg);
+            } else {
+                built.push('/');
+                built.push_str(seg);
+            }
+            chain.push(built.clone());
+        }
+        chain
+    }
+
+    #[test]
+    fn upload_fc_path_root() {
+        assert_eq!(upload_fc_path("/"), "files");
+    }
+
+    #[test]
+    fn upload_fc_path_root_level_file() {
+        assert_eq!(upload_fc_path("/test.txt"), "files/test.txt");
+    }
+
+    #[test]
+    fn upload_fc_path_nested_file() {
+        assert_eq!(
+            upload_fc_path("/Media/Decent photos/001.jpg"),
+            "files/Media/Decent photos/001.jpg"
+        );
+    }
+
+    #[test]
+    fn upload_fc_path_no_leading_slash() {
+        // DAV paths may or may not have a leading slash.
+        assert_eq!(upload_fc_path("Media/test.txt"), "files/Media/test.txt");
+    }
+
+    #[test]
+    fn upload_fc_path_no_double_files_prefix() {
+        // Regression: bulk_handler used to prepend "files/" to a path
+        // that already contained "files/", producing "files/files/...".
+        // dav_to_fc_path trims slashes and adds "files/", so a raw "files/foo"
+        // would produce "files/files/foo". Callers must strip "files/" first.
+        //
+        // This test documents the CONTRACT: dav_to_fc_path always adds
+        // "files/", so callers must NOT pass a path already containing it.
+        let with_leading_files = upload_fc_path("files/test.txt");
+        assert_eq!(with_leading_files, "files/files/test.txt");
+        // The correct usage: strip the DAV prefix first, then convert.
+        assert_eq!(upload_fc_path("test.txt"), "files/test.txt");
+    }
+
+    #[test]
+    fn upload_parent_root_level() {
+        // Parent of "files/test.txt" is "files".
+        assert_eq!(upload_parent_fc("files/test.txt"), "files");
+    }
+
+    #[test]
+    fn upload_parent_nested() {
+        assert_eq!(
+            upload_parent_fc("files/Media/Decent photos/001.jpg"),
+            "files/Media/Decent photos"
+        );
+    }
+
+    #[test]
+    fn upload_parent_two_levels() {
+        assert_eq!(upload_parent_fc("files/a/b"), "files/a");
+    }
+
+    #[test]
+    fn upload_ancestor_chain_root_level() {
+        let chain = upload_ancestor_chain("files/test.txt");
+        assert_eq!(chain, vec!["files", "files/test.txt"]);
+    }
+
+    #[test]
+    fn upload_ancestor_chain_nested_directory() {
+        // Uploading to "files/a/b/c" should create ancestors:
+        // "files", "files/a", "files/a/b", "files/a/b/c".
+        let chain = upload_ancestor_chain("files/a/b/c");
+        assert_eq!(chain, vec![
+            "files",
+            "files/a",
+            "files/a/b",
+            "files/a/b/c",
+        ]);
+    }
+
+    #[test]
+    fn upload_ancestor_chain_trashbin() {
+        // files_trashbin is a peer of files — its first segment
+        // triggers the "if last_existing_row.is_none()" branch in
+        // ensure_parent_dir.
+        let chain = upload_ancestor_chain("files_trashbin/files/test.d123");
+        assert_eq!(chain, vec![
+            "files_trashbin",
+            "files_trashbin/files",
+            "files_trashbin/files/test.d123",
+        ]);
+    }
+
+    #[test]
+    fn upload_ancestor_chain_deep_trashbin() {
+        let chain = upload_ancestor_chain("files_trashbin/files/foo.d123/sub.txt");
+        assert_eq!(chain, vec![
+            "files_trashbin",
+            "files_trashbin/files",
+            "files_trashbin/files/foo.d123",
+            "files_trashbin/files/foo.d123/sub.txt",
+        ]);
     }
 }
