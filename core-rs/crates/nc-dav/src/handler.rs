@@ -439,7 +439,35 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
 
     // ── Delegate to dav-server ────────────────────────────────────────────
     let dav_resp = handler.handle(req).await;
-    let (mut parts, dav_body) = dav_resp.into_parts();
+    let (mut parts, mut dav_body) = dav_resp.into_parts();
+
+    // ── Log non-success DAV responses so errors are visible in docker logs ─
+    if !parts.status.is_success() {
+        // dav_server::body::Body implements Stream<Item = io::Result<Bytes>>
+        use bytes::BytesMut;
+        use futures::StreamExt;
+        let mut buf = BytesMut::new();
+        while let Some(chunk) = dav_body.next().await {
+            match chunk {
+                Ok(b) => buf.extend_from_slice(&b),
+                Err(e) => {
+                    tracing::debug!(error = %e, "DAV: error reading error response body");
+                    break;
+                }
+            }
+        }
+        let body_str = String::from_utf8_lossy(&buf);
+        tracing::warn!(
+            status = %parts.status,
+            status_code = parts.status.as_u16(),
+            method = %req_method,
+            path = %req_path,
+            body = %body_str,
+            "DAV error response"
+        );
+        // Reconstruct the body for the response
+        dav_body = dav_server::body::Body::from(buf.freeze());
+    }
 
     // ── Post-process: inject Nextcloud response headers ───────────────────
     // 0. Rewrite 500 → 400 if a PUT failed due to a known client error such
