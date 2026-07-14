@@ -8,6 +8,8 @@ use axum::{
 };
 use tower::ServiceExt as _;
 use tower_http::services::ServeDir;
+use tower_http::trace::{self, TraceLayer};
+use tracing::Level;
 
 use crate::{
     handlers::{heartbeat::heartbeat, status::status},
@@ -189,11 +191,16 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
     // ── Middleware (outermost layers are added last) ─────────────────────────
     //
     // Request processing order (outer → inner):
+    //   trace_layer       — log every request: method, path, status, duration
     //   try_static_files  — serve physical files before routing; bypasses auth
     //                       (JS/CSS/images are always public)
     //   maintenance_guard — reject API calls when maintenance mode is on
     //   auth_layer        — validate bearer / session token
     //   routes            — native handlers + PHP-FPM proxy
+    let trace_layer = TraceLayer::new_for_http()
+        .make_span_with(trace::DefaultMakeSpan::new().level(Level::INFO))
+        .on_response(trace::DefaultOnResponse::new().level(Level::INFO));
+
     r.layer(middleware::from_fn_with_state(state.clone(), auth_layer))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -203,5 +210,6 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
             state.clone(),
             try_static_files,
         ))
+        .layer(trace_layer)
         .with_state(state)
 }
