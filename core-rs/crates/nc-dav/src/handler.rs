@@ -335,6 +335,87 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
     let strip_ref = strip_prefix.clone();
     let mime_cache_ref = state.mime_cache.clone();
 
+    // ── Intercept DELETE for directories ──────────────────────────────────
+    //
+    // dav-server-rs recursively walks children before calling remove_dir,
+    // which would trash each file individually.  PHP's SabreDAV handles
+    // directory deletes atomically via View::rmdir() → Trashbin::move2trash().
+    // We intercept here before the framework to match that behaviour.
+    if req_method == Method::DELETE {
+        let dav_path = req_path
+            .strip_prefix(strip_prefix.as_str())
+            .unwrap_or(&req_path);
+        // Percent-decode: the request URI may have %20 etc., but the
+        // filecache stores the decoded path.
+        let decoded = percent_decode_path(dav_path.trim_end_matches('/'));
+        let fc_path = crate::row::dav_to_fc_path(&decoded);
+
+        // Check if the target is a directory.
+        if let Some(fc_row) =
+            crate::row::lookup_by_path(&pool_ref, &prefix_ref, storage_id, &fc_path).await
+        {
+            let dir_mime_id = {
+                let cache = state.mime_cache.read().expect("mime cache lock");
+                cache.get_id("httpd/unix-directory")
+            };
+            if Some(fc_row.mimetype) == dir_mime_id {
+                // Check if trashbin is enabled before intercepting.
+                let trash_enabled = {
+                    let sql = format!(
+                        "SELECT configvalue FROM {prefix}appconfig \
+                         WHERE appid = 'files_trashbin' AND configkey = 'enabled'",
+                        prefix = prefix_ref
+                    );
+                    match sqlx::query_scalar::<_, String>(&sql)
+                        .fetch_optional(&pool_ref)
+                        .await
+                    {
+                        Ok(Some(val)) => val == "yes" || val == "true",
+                        _ => false,
+                    }
+                };
+
+                if trash_enabled {
+                    let write_result: crate::SharedWriteResult =
+                        Arc::new(std::sync::Mutex::new(None));
+                    let put_error: crate::SharedPutError =
+                        Arc::new(std::sync::Mutex::new(None));
+                    let fs = NcFileSystem::new(
+                        state,
+                        uid.clone(),
+                        storage_id,
+                        x_oc_mtime,
+                        x_oc_ctime,
+                        write_result,
+                        put_error,
+                    );
+
+                    match fs.trash_directory(&fc_path).await {
+                        Ok(()) => {
+                            return http::Response::builder()
+                                .status(StatusCode::NO_CONTENT)
+                                .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+                                .body(Body::empty())
+                                .unwrap();
+                        }
+                        Err(e) => {
+                            let status = match e {
+                                dav_server::fs::FsError::NotFound => StatusCode::NOT_FOUND,
+                                dav_server::fs::FsError::Forbidden => StatusCode::FORBIDDEN,
+                                _ => StatusCode::INTERNAL_SERVER_ERROR,
+                            };
+                            return http::Response::builder()
+                                .status(status)
+                                .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+                                .body(Body::empty())
+                                .unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ── Build per-request filesystem ──────────────────────────────────────
     let write_result: crate::SharedWriteResult = Arc::new(std::sync::Mutex::new(None));
     let put_error: crate::SharedPutError = Arc::new(std::sync::Mutex::new(None));
@@ -868,5 +949,67 @@ mod tests {
             url_to_path("/dav/files/alice/file.txt"),
             "/dav/files/alice/file.txt"
         );
+    }
+
+    // ── DELETE intercept path resolution ───────────────────────────────────
+    //
+    // The handler intercepts DELETE for directories to avoid dav-server-rs's
+    // recursive child walk.  It must resolve the request path to a filecache
+    // path, which requires prefix-stripping and percent-decoding.
+
+    fn delete_intercept_fc_path(req_path: &str, strip_prefix: &str) -> String {
+        let dav_path = req_path.strip_prefix(strip_prefix).unwrap_or(req_path);
+        let decoded = percent_decode_path(dav_path.trim_end_matches('/'));
+        crate::row::dav_to_fc_path(&decoded)
+    }
+
+    #[test]
+    fn delete_intercept_percent_encoded_space() {
+        // Regression: %20 must be decoded before filecache lookup.
+        // Without decoding, the path "files/Media/Decent%20photos" would
+        // not match the stored path "files/Media/Decent photos".
+        let fc = delete_intercept_fc_path(
+            "/remote.php/dav/files/admin/Media/Decent%20photos",
+            "/remote.php/dav/files/admin",
+        );
+        assert_eq!(fc, "files/Media/Decent photos");
+    }
+
+    #[test]
+    fn delete_intercept_simple_path() {
+        let fc = delete_intercept_fc_path(
+            "/remote.php/dav/files/admin/Photos",
+            "/remote.php/dav/files/admin",
+        );
+        assert_eq!(fc, "files/Photos");
+    }
+
+    #[test]
+    fn delete_intercept_trailing_slash() {
+        // DAV paths often have a trailing slash for collections.
+        let fc = delete_intercept_fc_path(
+            "/remote.php/dav/files/admin/Photos/",
+            "/remote.php/dav/files/admin",
+        );
+        assert_eq!(fc, "files/Photos");
+    }
+
+    #[test]
+    fn delete_intercept_root_level_file() {
+        let fc = delete_intercept_fc_path(
+            "/remote.php/webdav/Notes",
+            "/remote.php/webdav",
+        );
+        assert_eq!(fc, "files/Notes");
+    }
+
+    #[test]
+    fn delete_intercept_unicode_percent_encoded() {
+        // café → %C3%A9
+        let fc = delete_intercept_fc_path(
+            "/remote.php/dav/files/admin/caf%C3%A9",
+            "/remote.php/dav/files/admin",
+        );
+        assert_eq!(fc, "files/café");
     }
 }

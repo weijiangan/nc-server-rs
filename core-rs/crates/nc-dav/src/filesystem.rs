@@ -289,6 +289,239 @@ impl NcFileSystem {
         last_existing_row.ok_or_else(|| "Failed to ensure parent directory".to_string())
     }
 
+    /// Check whether the `files_trashbin` app is enabled for the current user.
+    ///
+    /// Matches PHP `Trashbin::isEnabled()` which calls
+    /// `AppManager::isEnabledForUser('files_trashbin')`.
+    async fn is_trashbin_enabled(&self) -> bool {
+        let sql = format!(
+            "SELECT configvalue FROM {prefix}appconfig \
+             WHERE appid = 'files_trashbin' AND configkey = 'enabled'",
+            prefix = self.state.table_prefix
+        );
+        match sqlx::query_scalar::<_, String>(&sql)
+            .fetch_optional(&self.state.pool)
+            .await
+        {
+            Ok(Some(val)) => val == "yes" || val == "true",
+            Ok(None) => {
+                // Key not present — app may not be installed.
+                // Also check cache in case it's there (some setups use different keys).
+                let cache = self.state.appconfig_cache.read().expect("appconfig cache lock");
+                cache.get_string("files_trashbin", "enabled")
+                    .map_or(false, |v| v == "yes" || v == "true")
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Delete a directory by moving it to the trash bin as a single unit,
+    /// matching PHP's `View::rmdir()` → `Trashbin::move2trash()` behaviour.
+    ///
+    /// Unlike dav-server-rs's recursive walk (which would call `remove_file`
+    /// for each child individually), this moves the entire directory tree
+    /// atomically — the directory is renamed on disk and its children's
+    /// filecache paths are updated to point inside the trashed directory.
+    /// Only ONE `oc_files_trash` row is inserted (for the directory itself).
+    pub(crate) async fn trash_directory(
+        &self,
+        fc_path: &str,
+    ) -> Result<(), FsError> {
+        let row = row::lookup_by_path(
+            &self.state.pool,
+            &self.state.table_prefix,
+            self.storage_id,
+            fc_path,
+        )
+        .await
+        .ok_or(FsError::NotFound)?;
+
+        // Collect descendant (fileid, path) before moving.
+        let like_pat = format!("{fc_path}/%");
+        let sql_desc = format!(
+            "SELECT fileid, path FROM {prefix}filecache \
+             WHERE storage = $1 AND path LIKE $2",
+            prefix = self.state.table_prefix
+        );
+        let descendants: Vec<(i64, String)> = sqlx::query(&sql_desc)
+            .bind(self.storage_id)
+            .bind(&like_pat)
+            .fetch_all(&self.state.pool)
+            .await
+            .map_err(|_| FsError::GeneralFailure)?
+            .into_iter()
+            .map(|r| (r.get::<i64, _>("fileid"), r.get::<String, _>("path")))
+            .collect();
+
+        // Move the directory itself to trash.
+        let old_fc_path = fc_path.to_string();
+        let trash_fc = self.move_to_trash(&old_fc_path, &row, true).await?;
+
+        // Update filecache paths for all descendants so they appear
+        // nested inside the trashed directory.
+        for (fid, old_path) in &descendants {
+            let new_path = trash_fc.clone() + &old_path[old_fc_path.len()..];
+            let new_hash = row::path_hash(&new_path);
+            let sql_upd = format!(
+                "UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3",
+                prefix = self.state.table_prefix
+            );
+            let _ = sqlx::query(&sql_upd)
+                .bind(&new_path)
+                .bind(&new_hash)
+                .bind(fid)
+                .execute(&self.state.pool)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    /// Move a file or directory to the trash bin, matching PHP's
+    /// `Trashbin::move2trash()`.  Returns the trash `fc_path` on success.
+    ///
+    /// - Renames on disk: `files/{path}` → `files_trashbin/files/{basename}.d{timestamp}`
+    /// - Updates the `oc_filecache` row (path, name, parent, mtime).
+    /// - Inserts a row into `oc_files_trash`.
+    async fn move_to_trash(
+        &self,
+        fc_path: &str,
+        row: &row::FileCacheRow,
+        is_dir: bool,
+    ) -> Result<String, FsError> {
+        let relative = fc_path.strip_prefix("files/").unwrap_or(fc_path);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // PHP Trashbin::move2trash() uses pathinfo():
+        //   $filename = pathinfo($ownerPath)['basename'];  // e.g. "test.txt"
+        //   $location = pathinfo($ownerPath)['dirname'];   // e.g. "" or "Media"
+        //
+        // The trash filename is built from the basename ONLY — directory
+        // structure is NOT preserved.  A file at "Media/test.txt" becomes
+        // "files_trashbin/files/test.txt.d{timestamp}".
+        let p = std::path::Path::new(relative);
+        let trash_basename = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| relative.to_string());
+
+        // Build trash path with conflict resolution.
+        let mut trash_fc = format!("files_trashbin/files/{}.d{now}", trash_basename);
+        let mut suffix: u32 = 0;
+        loop {
+            if row::lookup_by_path(
+                &self.state.pool,
+                &self.state.table_prefix,
+                self.storage_id,
+                &trash_fc,
+            )
+            .await
+            .is_none()
+            {
+                break;
+            }
+            suffix += 1;
+            trash_fc = format!("files_trashbin/files/{}.d{now}_{suffix}", trash_basename);
+        }
+
+        // Ensure the trash parent exists in filecache.
+        let trash_parent_fc = {
+            let mut parts: Vec<&str> = trash_fc.split('/').collect();
+            parts.pop();
+            parts.join("/")
+        };
+        self.ensure_parent_dir(&trash_parent_fc)
+            .await
+            .map_err(|_| FsError::NotFound)?;
+
+        // Create parent dirs on disk.
+        let from_disk = self.disk_path(fc_path);
+        let to_disk = self.disk_path(&trash_fc);
+        if let Some(parent) = to_disk.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| {
+                    warn!("move_to_trash mkdir parent failed: {e}");
+                    FsError::GeneralFailure
+                })?;
+        }
+
+        // Move on disk.
+        let f = from_disk.clone();
+        let t = to_disk.clone();
+        blocking(move || std::fs::rename(&f, &t))
+            .await
+            .map_err(|e| {
+                warn!("move_to_trash rename {fc_path} → {trash_fc}: {e}");
+                io_to_fs(e)
+            })?;
+
+        // Update the filecache row.
+        let new_hash = row::path_hash(&trash_fc);
+        let new_name = trash_fc.rsplit('/').next().unwrap_or("").to_string();
+        let trash_parent = row::lookup_by_path(
+            &self.state.pool,
+            &self.state.table_prefix,
+            self.storage_id,
+            &trash_parent_fc,
+        )
+        .await
+        .ok_or(FsError::NotFound)?;
+
+        let sql = format!(
+            "UPDATE {prefix}filecache \
+             SET path=$1, path_hash=$2, name=$3, parent=$4, mtime=$5 \
+             WHERE fileid=$6",
+            prefix = self.state.table_prefix
+        );
+        sqlx::query(&sql)
+            .bind(&trash_fc)
+            .bind(&new_hash)
+            .bind(&new_name)
+            .bind(trash_parent.fileid)
+            .bind(now)
+            .bind(row.fileid)
+            .execute(&self.state.pool)
+            .await
+            .map_err(|_| FsError::GeneralFailure)?;
+
+        // Insert into oc_files_trash.
+        //
+        // PHP Trashbin::move2trash() uses pathinfo():
+        //   $filename = pathinfo($ownerPath)['basename'];   // e.g. "test"
+        //   $location = pathinfo($ownerPath)['dirname'];    // e.g. "" or "Media"
+        //
+        // The `id` column stores the basename so that
+        // Trashbin::delete() can match it when stripping the
+        // .d{timestamp} suffix from the trash filename.
+        let trash_location = p
+            .parent()
+            .and_then(|d| d.to_str())
+            .unwrap_or("")
+            .trim_matches('.') // pathinfo returns "." for root → empty
+            .to_string();
+        let item_type = if is_dir { "folder" } else { "file" };
+        let trash_sql = format!(
+            "INSERT INTO {prefix}files_trash (id, \"user\", \"timestamp\", location, \"type\", deleted_by) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            prefix = self.state.table_prefix
+        );
+        let _ = sqlx::query(&trash_sql)
+            .bind(&trash_basename)
+            .bind(&self.uid)
+            .bind(now)
+            .bind(&trash_location)
+            .bind(item_type)
+            .bind(&self.uid)
+            .execute(&self.state.pool)
+            .await;
+
+        Ok(trash_fc)
+    }
+
     /// Load `NcMetaData` for any filecache path, including extended times.
     async fn load_meta(&self, fc_path: &str) -> Option<NcMetaData> {
         let row = row::lookup_by_path(
@@ -692,30 +925,35 @@ impl DavFileSystem for NcFileSystem {
             .await
             .ok_or(FsError::NotFound)?;
 
-            let disk = self.disk_path(&fc_path);
-            blocking(move || std::fs::remove_file(&disk))
-                .await
-                .map_err(io_to_fs)?;
+            if self.is_trashbin_enabled().await {
+                // Move to trash instead of hard-deleting (REQ §6.7).
+                self.move_to_trash(&fc_path, &row, false).await?;
+            } else {
+                // Trashbin app not enabled — hard delete.
+                let disk = self.disk_path(&fc_path);
+                blocking(move || std::fs::remove_file(&disk))
+                    .await
+                    .map_err(io_to_fs)?;
 
-            let sql = format!(
-                "DELETE FROM {prefix}filecache WHERE fileid = $1",
-                prefix = self.state.table_prefix
-            );
-            sqlx::query(&sql)
-                .bind(row.fileid)
-                .execute(&self.state.pool)
-                .await
-                .map_err(|_| FsError::GeneralFailure)?;
+                let sql = format!(
+                    "DELETE FROM {prefix}filecache WHERE fileid = $1",
+                    prefix = self.state.table_prefix
+                );
+                sqlx::query(&sql)
+                    .bind(row.fileid)
+                    .execute(&self.state.pool)
+                    .await
+                    .map_err(|_| FsError::GeneralFailure)?;
 
-            // Clean up extended metadata row (REQ §4.5).
-            let sql_ext = format!(
-                "DELETE FROM {prefix}filecache_extended WHERE fileid = $1",
-                prefix = self.state.table_prefix
-            );
-            let _ = sqlx::query(&sql_ext)
-                .bind(row.fileid)
-                .execute(&self.state.pool)
-                .await;
+                let sql_ext = format!(
+                    "DELETE FROM {prefix}filecache_extended WHERE fileid = $1",
+                    prefix = self.state.table_prefix
+                );
+                let _ = sqlx::query(&sql_ext)
+                    .bind(row.fileid)
+                    .execute(&self.state.pool)
+                    .await;
+            }
 
             Ok(())
         }
@@ -728,43 +966,49 @@ impl DavFileSystem for NcFileSystem {
         async move {
             let fc_path = self.to_fc_path(path);
 
-            let disk = self.disk_path(&fc_path);
-            blocking(move || std::fs::remove_dir_all(&disk))
-                .await
-                .map_err(io_to_fs)?;
+            if self.is_trashbin_enabled().await {
+                // Delegate to trash_directory which moves the directory tree
+                // as a single unit.  This is only reached for subdirectories
+                // within a recursive delete — top-level DELETE for directories
+                // is intercepted in the handler.
+                self.trash_directory(&fc_path).await
+            } else {
+                // Trashbin app not enabled — hard delete.
+                let disk = self.disk_path(&fc_path);
+                blocking(move || std::fs::remove_dir_all(&disk))
+                    .await
+                    .map_err(io_to_fs)?;
 
-            // Remove the directory and all descendants from oc_filecache.
-            let prefix = &self.state.table_prefix;
-            let like_pat = format!("{fc_path}/%");
+                let prefix = &self.state.table_prefix;
+                let like_pat = format!("{fc_path}/%");
 
-            // Delete extended metadata for all affected rows first (while the
-            // filecache rows still exist so the subquery resolves correctly).
-            let sql_ext = format!(
-                "DELETE FROM {prefix}filecache_extended \
-                 WHERE fileid IN (\
-                     SELECT fileid FROM {prefix}filecache \
-                     WHERE storage = $1 AND (path = $2 OR path LIKE $3)\
-                 )"
-            );
-            let _ = sqlx::query(&sql_ext)
-                .bind(self.storage_id)
-                .bind(&fc_path)
-                .bind(&like_pat)
-                .execute(&self.state.pool)
-                .await;
+                let sql_ext = format!(
+                    "DELETE FROM {prefix}filecache_extended \
+                     WHERE fileid IN (\
+                         SELECT fileid FROM {prefix}filecache \
+                         WHERE storage = $1 AND (path = $2 OR path LIKE $3)\
+                     )"
+                );
+                let _ = sqlx::query(&sql_ext)
+                    .bind(self.storage_id)
+                    .bind(&fc_path)
+                    .bind(&like_pat)
+                    .execute(&self.state.pool)
+                    .await;
 
-            let sql_subtree = format!(
-                "DELETE FROM {prefix}filecache WHERE storage = $1 AND (path = $2 OR path LIKE $3)"
-            );
-            sqlx::query(&sql_subtree)
-                .bind(self.storage_id)
-                .bind(&fc_path)
-                .bind(&like_pat)
-                .execute(&self.state.pool)
-                .await
-                .map_err(|_| FsError::GeneralFailure)?;
+                let sql_subtree = format!(
+                    "DELETE FROM {prefix}filecache WHERE storage = $1 AND (path = $2 OR path LIKE $3)"
+                );
+                sqlx::query(&sql_subtree)
+                    .bind(self.storage_id)
+                    .bind(&fc_path)
+                    .bind(&like_pat)
+                    .execute(&self.state.pool)
+                    .await
+                    .map_err(|_| FsError::GeneralFailure)?;
 
-            Ok(())
+                Ok(())
+            }
         }
         .boxed()
     }
@@ -1487,7 +1731,6 @@ mod tests {
     fn iso8601_unix_epoch() {
         assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
     }
-
 
     // ── Trash path computation ─────────────────────────────────────────────
     //
