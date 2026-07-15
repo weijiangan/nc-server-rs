@@ -114,16 +114,46 @@ pub async fn lookup_by_path(
          size, mtime, storage_mtime, etag, permissions, checksum \
          FROM {prefix}filecache WHERE storage = $1 AND path_hash = $2"
     );
-    match sqlx::query(&sql)
+    let result = sqlx::query(&sql)
         .bind(storage)
         .bind(&hash)
         .fetch_optional(pool)
-        .await
-    {
+        .await;
+    match &result {
         Err(e) => {
-            tracing::error!(error = %e, path = %path, "lookup_by_path: SQL error");
-            None
+            tracing::error!(error = %e, path = %path, hash = %hash, storage, "lookup_by_path: SQL error");
         }
+        Ok(Some(row)) => {
+            let db_path: Option<String> = row.get("path");
+            let db_storage: i64 = row.get("storage");
+            tracing::info!(path = %path, hash = %hash, storage, db_path = ?db_path, db_storage, "lookup_by_path: found");
+        }
+        Ok(None) => {
+            // Debug: query without the storage filter to check if path_hash
+            // matches any row at all.
+            let debug_sql = format!(
+                "SELECT fileid, storage, path FROM {prefix}filecache WHERE path_hash = $1",
+                prefix = prefix
+            );
+            let debug_rows: Vec<(i64, i64, Option<String>)> =
+                sqlx::query(&debug_sql)
+                    .bind(&hash)
+                    .fetch_all(pool)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| {
+                        (r.get(0), r.get(1), r.get(2))
+                    })
+                    .collect();
+            tracing::info!(
+                path = %path, hash = %hash, storage, ?debug_rows,
+                "lookup_by_path: not found (any storage)"
+            );
+        }
+    }
+    match result {
+        Err(_) => None,
         Ok(row) => row.map(|r| fc_row_from_any(&r)),
     }
 }

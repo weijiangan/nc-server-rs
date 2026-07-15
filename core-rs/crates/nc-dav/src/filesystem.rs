@@ -530,7 +530,14 @@ impl NcFileSystem {
             self.storage_id,
             fc_path,
         )
-        .await?;
+        .await;
+        tracing::trace!(
+            fc_path = %fc_path,
+            storage_id = self.storage_id,
+            found = row.is_some(),
+            "load_meta result"
+        );
+        let row = row?;
 
         let mime_type = {
             let cache = self.state.mime_cache.read().expect("mime cache lock");
@@ -580,6 +587,12 @@ impl DavFileSystem for NcFileSystem {
     ) -> FsFuture<'a, Box<dyn DavMetaData>> {
         async move {
             let fc_path = self.to_fc_path(path);
+            tracing::trace!(
+                dav_path = %String::from_utf8_lossy(path.as_bytes()),
+                fc_path = %fc_path,
+                storage_id = self.storage_id,
+                "metadata lookup"
+            );
             let meta = self.load_meta(&fc_path).await.ok_or(FsError::NotFound)?;
             Ok(Box::new(meta) as Box<dyn DavMetaData>)
         }

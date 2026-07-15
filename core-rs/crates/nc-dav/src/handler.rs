@@ -104,6 +104,13 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
     // ── Determine strip prefix ────────────────────────────────────────────
     let path = req.uri().path();
     let strip_prefix = determine_prefix(path, &uid);
+    tracing::debug!(
+        method = %req_method,
+        req_path = %path,
+        uid = %uid,
+        strip_prefix = %strip_prefix,
+        "DAV request"
+    );
 
     // ── §5.1 Filename validation (write methods) ──────────────────────────
     //
