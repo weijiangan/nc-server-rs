@@ -98,10 +98,7 @@ impl NcFileSystem {
     /// upload v2 assembly, so chunked uploads to paths with a non-existent
     /// parent fail.  Rust calls this uniformly from all write paths (PUT,
     /// MKCOL, chunked assembly).  See SPECS/04-tasks/phase-5.md.
-    async fn ensure_parent_dir(
-        &self,
-        fc_path: &str,
-    ) -> Result<row::FileCacheRow, String> {
+    async fn ensure_parent_dir(&self, fc_path: &str) -> Result<row::FileCacheRow, String> {
         // Fast path: parent already exists.
         if let Some(row) = row::lookup_by_path(
             &self.state.pool,
@@ -192,12 +189,9 @@ impl NcFileSystem {
                 .unwrap_or_default()
                 .as_secs() as i64;
             let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
-            let fid = row::next_fileid(
-                &self.state.pool,
-                &self.state.table_prefix,
-            )
-            .await
-            .map_err(|e| format!("fileid: {e}"))?;
+            let fid = row::next_fileid(&self.state.pool, &self.state.table_prefix)
+                .await
+                .map_err(|e| format!("fileid: {e}"))?;
 
             let dir_mime_id = {
                 let cache = self.state.mime_cache.read().expect("mime cache lock");
@@ -307,8 +301,13 @@ impl NcFileSystem {
             Ok(None) => {
                 // Key not present — app may not be installed.
                 // Also check cache in case it's there (some setups use different keys).
-                let cache = self.state.appconfig_cache.read().expect("appconfig cache lock");
-                cache.get_string("files_trashbin", "enabled")
+                let cache = self
+                    .state
+                    .appconfig_cache
+                    .read()
+                    .expect("appconfig cache lock");
+                cache
+                    .get_string("files_trashbin", "enabled")
                     .map_or(false, |v| v == "yes" || v == "true")
             }
             Err(_) => false,
@@ -323,10 +322,7 @@ impl NcFileSystem {
     /// atomically — the directory is renamed on disk and its children's
     /// filecache paths are updated to point inside the trashed directory.
     /// Only ONE `oc_files_trash` row is inserted (for the directory itself).
-    pub(crate) async fn trash_directory(
-        &self,
-        fc_path: &str,
-    ) -> Result<(), FsError> {
+    pub(crate) async fn trash_directory(&self, fc_path: &str) -> Result<(), FsError> {
         let row = row::lookup_by_path(
             &self.state.pool,
             &self.state.table_prefix,
@@ -355,7 +351,7 @@ impl NcFileSystem {
 
         // Move the directory itself to trash.
         let old_fc_path = fc_path.to_string();
-        let trash_fc = self.move_to_trash(&old_fc_path, &row, true).await?;
+        let trash_fc = self.move_to_trash(&old_fc_path, &row).await?;
 
         // Update filecache paths for all descendants so they appear
         // nested inside the trashed directory.
@@ -387,10 +383,9 @@ impl NcFileSystem {
         &self,
         fc_path: &str,
         row: &row::FileCacheRow,
-        is_dir: bool,
     ) -> Result<String, FsError> {
         let relative = fc_path.strip_prefix("files/").unwrap_or(fc_path);
-        let now = std::time::SystemTime::now()
+        let mut now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
@@ -408,23 +403,33 @@ impl NcFileSystem {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| relative.to_string());
 
-        // Build trash path with conflict resolution.
-        let mut trash_fc = format!("files_trashbin/files/{}.d{now}", trash_basename);
-        let mut suffix: u32 = 0;
+        // Build the trash path with PHP-compatible conflict resolution.
+        //
+        // PHP `Trashbin::getTrashFilename()` produces strictly
+        // `{basename}.d{timestamp}`.  On a same-second collision PHP
+        // increments the *timestamp* (it never appends a numeric suffix),
+        // because `Trashbin::restore()`/`getLocation()` recover the timestamp
+        // by splitting the trash name on `.d`.  A `_N` suffix would yield a
+        // name the PHP-FPM trashbin cannot parse or restore, so we must match
+        // PHP and nudge the timestamp forward instead.  (See `trash_fc_name`.)
+        let mut trash_fc = trash_fc_name(&trash_basename, now);
         loop {
-            if row::lookup_by_path(
+            let in_cache = row::lookup_by_path(
                 &self.state.pool,
                 &self.state.table_prefix,
                 self.storage_id,
                 &trash_fc,
             )
             .await
-            .is_none()
-            {
+            .is_some();
+            let on_disk = tokio::fs::try_exists(self.disk_path(&trash_fc))
+                .await
+                .unwrap_or(false);
+            if !in_cache && !on_disk {
                 break;
             }
-            suffix += 1;
-            trash_fc = format!("files_trashbin/files/{}.d{now}_{suffix}", trash_basename);
+            now += 1;
+            trash_fc = trash_fc_name(&trash_basename, now);
         }
 
         // Ensure the trash parent exists in filecache.
@@ -441,12 +446,10 @@ impl NcFileSystem {
         let from_disk = self.disk_path(fc_path);
         let to_disk = self.disk_path(&trash_fc);
         if let Some(parent) = to_disk.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| {
-                    warn!("move_to_trash mkdir parent failed: {e}");
-                    FsError::GeneralFailure
-                })?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                warn!("move_to_trash mkdir parent failed: {e}");
+                FsError::GeneralFailure
+            })?;
         }
 
         // Move on disk.
@@ -503,21 +506,31 @@ impl NcFileSystem {
             .unwrap_or("")
             .trim_matches('.') // pathinfo returns "." for root → empty
             .to_string();
-        let item_type = if is_dir { "folder" } else { "file" };
+        // PHP `Trashbin::move2trash()` inserts ONLY these columns and leaves
+        // `type` / `mime` NULL (migration Version1010Date20200630192639: `type`
+        // is VARCHAR(4), `mime` VARCHAR(255), both nullable). `timestamp` is a
+        // VARCHAR(12) and PHP binds it as a string (createNamedParameter
+        // defaults to PARAM_STR), so we bind a string too — binding an integer
+        // makes Postgres reject the whole INSERT (bigint into a varchar column).
         let trash_sql = format!(
-            "INSERT INTO {prefix}files_trash (id, \"user\", \"timestamp\", location, \"type\", deleted_by) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO {prefix}files_trash (id, \"user\", \"timestamp\", location, deleted_by) \
+             VALUES ($1, $2, $3, $4, $5)",
             prefix = self.state.table_prefix
         );
-        let _ = sqlx::query(&trash_sql)
+        if let Err(e) = sqlx::query(&trash_sql)
             .bind(&trash_basename)
             .bind(&self.uid)
-            .bind(now)
+            .bind(now.to_string())
             .bind(&trash_location)
-            .bind(item_type)
             .bind(&self.uid)
             .execute(&self.state.pool)
-            .await;
+            .await
+        {
+            // Non-fatal: the file is already trashed on disk and in the
+            // filecache, so it still lists in the web UI. But without this row
+            // the original location is lost and PHP restore falls back to root.
+            warn!("oc_files_trash insert failed for {trash_basename}: {e}");
+        }
 
         Ok(trash_fc)
     }
@@ -574,6 +587,18 @@ fn io_to_fs(e: io::Error) -> FsError {
         io::ErrorKind::AlreadyExists => FsError::Exists,
         _ => FsError::GeneralFailure,
     }
+}
+
+/// Build the trash filecache path for `basename` deleted at `ts` (Unix secs).
+///
+/// Matches PHP `Trashbin::getTrashFilename()`: the name is strictly
+/// `{basename}.d{ts}`.  On a same-second name collision PHP advances the
+/// *timestamp* (see `move_to_trash`); it never appends a numeric suffix,
+/// because `Trashbin::restore()`/`getLocation()` recover the timestamp by
+/// splitting the trash name on `.d`.  Any other shape (e.g. `name.d{ts}_1`)
+/// would be unrestorable via the PHP-FPM trashbin endpoint.
+fn trash_fc_name(basename: &str, ts: i64) -> String {
+    format!("files_trashbin/files/{basename}.d{ts}")
 }
 
 // ─── DavFileSystem impl ────────────────────────────────────────────────────────
@@ -842,7 +867,7 @@ impl DavFileSystem for NcFileSystem {
     fn create_dir<'a>(&'a self, path: &'a dav_server::davpath::DavPath) -> FsFuture<'a, ()> {
         async move {
             let fc_path = self.to_fc_path(path);
-            let disk    = self.disk_path(&fc_path);
+            let disk = self.disk_path(&fc_path);
 
             // Must not already exist.
             if row::lookup_by_path(
@@ -879,7 +904,7 @@ impl DavFileSystem for NcFileSystem {
                 .unwrap_or_default()
                 .as_secs() as i64;
             let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
-            let fid  = row::next_fileid(&self.state.pool, &self.state.table_prefix)
+            let fid = row::next_fileid(&self.state.pool, &self.state.table_prefix)
                 .await
                 .map_err(|_| FsError::GeneralFailure)?;
 
@@ -940,7 +965,7 @@ impl DavFileSystem for NcFileSystem {
 
             if self.is_trashbin_enabled().await {
                 // Move to trash instead of hard-deleting (REQ §6.7).
-                self.move_to_trash(&fc_path, &row, false).await?;
+                self.move_to_trash(&fc_path, &row).await?;
             } else {
                 // Trashbin app not enabled — hard delete.
                 let disk = self.disk_path(&fc_path);
@@ -1121,9 +1146,9 @@ impl DavFileSystem for NcFileSystem {
     ) -> FsFuture<'a, ()> {
         async move {
             let from_fc = self.to_fc_path(from);
-            let to_fc   = self.to_fc_path(to);
+            let to_fc = self.to_fc_path(to);
             let from_disk = self.disk_path(&from_fc);
-            let to_disk   = self.disk_path(&to_fc);
+            let to_disk = self.disk_path(&to_fc);
 
             blocking(move || std::fs::copy(&from_disk, &to_disk).map(|_| ()))
                 .await
@@ -1162,11 +1187,11 @@ impl DavFileSystem for NcFileSystem {
                 )
                 .await
                 {
-                    let now  = std::time::SystemTime::now()
+                    let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as i64;
-                    let fid  = row::next_fileid(&self.state.pool, &self.state.table_prefix)
+                    let fid = row::next_fileid(&self.state.pool, &self.state.table_prefix)
                         .await
                         .unwrap_or(from_row.fileid + 1);
                     let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
@@ -1349,14 +1374,10 @@ impl DavFileSystem for NcFileSystem {
             let is_mounted = if meta.storage == self.storage_id {
                 false
             } else {
-                row::get_storage_string_id(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    meta.storage,
-                )
-                .await
-                .map(|id| !id.starts_with("home::"))
-                .unwrap_or(false)
+                row::get_storage_string_id(&self.state.pool, &self.state.table_prefix, meta.storage)
+                    .await
+                    .map(|id| !id.starts_with("home::"))
+                    .unwrap_or(false)
             };
 
             // `share_permissions`: MAX(permissions) from oc_share for this
@@ -1370,30 +1391,28 @@ impl DavFileSystem for NcFileSystem {
             .await;
 
             // `note`: most-recent non-empty share note for this file.
-            let note = row::get_share_note(
-                &self.state.pool,
-                &self.state.table_prefix,
-                meta.fileid,
-            )
-            .await;
+            let note =
+                row::get_share_note(&self.state.pool, &self.state.table_prefix, meta.fileid).await;
 
             // `download_url`: direct WebDAV URL for home-storage files.
             // Format: {overwrite.cli.url}/remote.php/webdav/{path-without-files-prefix}
             // Empty for non-home storage (object/S3 URLs require storage-specific
             // signed-URL support which is out of scope, PHASE-7.6).
             // Only generated for files (not directories) and when base_url is set.
-            let download_url = if !is_mounted
-                && !meta.is_dir_flag
-                && !self.state.base_url.is_empty()
-            {
-                // `meta.path` is like "files/Photos/img.jpg"; strip "files" prefix
-                // to get the WebDAV subpath "/Photos/img.jpg".
-                let subpath = meta.path.as_deref().unwrap_or("").trim_start_matches("files");
-                let base = self.state.base_url.trim_end_matches('/');
-                format!("{base}/remote.php/webdav{}", percent_encode_path(subpath))
-            } else {
-                String::new()
-            };
+            let download_url =
+                if !is_mounted && !meta.is_dir_flag && !self.state.base_url.is_empty() {
+                    // `meta.path` is like "files/Photos/img.jpg"; strip "files" prefix
+                    // to get the WebDAV subpath "/Photos/img.jpg".
+                    let subpath = meta
+                        .path
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim_start_matches("files");
+                    let base = self.state.base_url.trim_end_matches('/');
+                    format!("{base}/remote.php/webdav{}", percent_encode_path(subpath))
+                } else {
+                    String::new()
+                };
 
             let instance_id = &self.state.instance_id;
             // is_shared: false for home-storage nodes — the file is the user's own.
@@ -1617,8 +1636,9 @@ impl NcFileSystem {
         prefix: &str,
     ) {
         let like = format!("{old_prefix}/%");
-        let sql_fetch =
-            format!("SELECT fileid, path FROM {prefix}filecache WHERE storage = $1 AND path LIKE $2");
+        let sql_fetch = format!(
+            "SELECT fileid, path FROM {prefix}filecache WHERE storage = $1 AND path LIKE $2"
+        );
         let rows = sqlx::query(&sql_fetch)
             .bind(self.storage_id)
             .bind(&like)
@@ -1654,16 +1674,41 @@ fn percent_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for byte in path.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'.' | b'_' | b'~' | b'/'
-            | b':' | b'@' | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
-            | b'*' | b'+' | b',' | b';' | b'=' => out.push(byte as char),
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'/'
+            | b':'
+            | b'@'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'=' => out.push(byte as char),
             _ => {
                 out.push('%');
                 let hi = byte >> 4;
                 let lo = byte & 0xF;
-                out.push(char::from_digit(hi as u32, 16).unwrap().to_ascii_uppercase());
-                out.push(char::from_digit(lo as u32, 16).unwrap().to_ascii_uppercase());
+                out.push(
+                    char::from_digit(hi as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit(lo as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
             }
         }
     }
@@ -1726,7 +1771,7 @@ fn parse_iso8601(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_iso8601;
+    use super::{parse_iso8601, trash_fc_name};
 
     #[test]
     fn iso8601_z_suffix() {
@@ -1758,10 +1803,7 @@ mod tests {
     /// `oc_files_trash`, matching PHP's `pathinfo()` behaviour.
     ///
     /// Returns `(trash_basename, location, trash_fc_path)`.
-    fn trash_path_info(
-        fc_path: &str,
-        now: i64,
-    ) -> (String, String, String) {
+    fn trash_path_info(fc_path: &str, now: i64) -> (String, String, String) {
         let relative = fc_path.strip_prefix("files/").unwrap_or(fc_path);
         let p = std::path::Path::new(relative);
 
@@ -1777,9 +1819,80 @@ mod tests {
             .trim_matches('.')
             .to_string();
 
-        let trash_fc = format!("files_trashbin/files/{}.d{now}", basename);
+        let trash_fc = trash_fc_name(&basename, now);
 
         (basename, location, trash_fc)
+    }
+
+    /// Mirror of the collision-resolution loop in `move_to_trash`: advance the
+    /// timestamp until `taken` reports the candidate path is free.  Shares the
+    /// production `trash_fc_name` formatter so the PHP-compatible naming is
+    /// covered directly.
+    fn resolve_trash_collision(
+        basename: &str,
+        start_ts: i64,
+        taken: impl Fn(&str) -> bool,
+    ) -> (String, i64) {
+        let mut ts = start_ts;
+        loop {
+            let candidate = trash_fc_name(basename, ts);
+            if !taken(&candidate) {
+                return (candidate, ts);
+            }
+            ts += 1;
+        }
+    }
+
+    #[test]
+    fn trash_name_format_matches_php_no_suffix() {
+        // getTrashFilename() is strictly "{basename}.d{ts}".
+        assert_eq!(
+            trash_fc_name("test.txt", 1784065766),
+            "files_trashbin/files/test.txt.d1784065766"
+        );
+        // The filename segment must never carry a "_N" collision suffix
+        // (the `files_trashbin` directory legitimately contains an underscore).
+        let name = trash_fc_name("test.txt", 1)
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(!name.contains('_'));
+    }
+
+    #[test]
+    fn trash_collision_bumps_timestamp() {
+        // Same-second delete of a same-named file: the first timestamp is
+        // taken, so resolution must advance to ts+1 (PHP behaviour), NOT
+        // append "_1".
+        let taken_path = trash_fc_name("f.txt", 100);
+        let (resolved, ts) = resolve_trash_collision("f.txt", 100, |c| c == taken_path);
+        assert_eq!(ts, 101);
+        assert_eq!(resolved, "files_trashbin/files/f.txt.d101");
+        let name = resolved.rsplit('/').next().unwrap();
+        assert!(!name.contains('_'));
+    }
+
+    #[test]
+    fn trash_collision_advances_over_multiple_taken_timestamps() {
+        // Two consecutive timestamps taken → resolve to ts+2, still with the
+        // canonical ".d{ts}" shape (regression guard against "_N" suffixing).
+        let taken: std::collections::HashSet<String> =
+            [trash_fc_name("f.txt", 100), trash_fc_name("f.txt", 101)]
+                .into_iter()
+                .collect();
+        let (resolved, ts) = resolve_trash_collision("f.txt", 100, |c| taken.contains(c));
+        assert_eq!(ts, 102);
+        assert_eq!(resolved, "files_trashbin/files/f.txt.d102");
+        let name = resolved.rsplit('/').next().unwrap();
+        assert!(!name.contains('_'));
+    }
+
+    #[test]
+    fn trash_no_collision_keeps_original_timestamp() {
+        let (resolved, ts) = resolve_trash_collision("f.txt", 100, |_| false);
+        assert_eq!(ts, 100);
+        assert_eq!(resolved, "files_trashbin/files/f.txt.d100");
     }
 
     #[test]
@@ -1788,8 +1901,7 @@ mod tests {
         //   $path_parts = pathinfo($ownerPath);
         //   $filename = $path_parts['basename'];  // "test"
         //   $location = $path_parts['dirname'];   // "." → stored as ""
-        let (basename, location, trash_fc) =
-            trash_path_info("files/test", 1784065766);
+        let (basename, location, trash_fc) = trash_path_info("files/test", 1784065766);
         assert_eq!(basename, "test");
         assert_eq!(location, ""); // "." trimmed to ""
         assert_eq!(trash_fc, "files_trashbin/files/test.d1784065766");
@@ -1799,8 +1911,7 @@ mod tests {
     fn trash_nested_file_basename_is_correct() {
         // Trashbin::move2trash() pathinfo() for a nested path.
         //   pathinfo("Media/test.txt") → basename="test.txt", dirname="Media"
-        let (basename, location, trash_fc) =
-            trash_path_info("files/Media/test.txt", 1784065766);
+        let (basename, location, trash_fc) = trash_path_info("files/Media/test.txt", 1784065766);
         assert_eq!(basename, "test.txt");
         assert_eq!(location, "Media");
         assert_eq!(trash_fc, "files_trashbin/files/test.txt.d1784065766");
@@ -1818,8 +1929,7 @@ mod tests {
     #[test]
     fn trash_nested_dirname_is_correct() {
         // PHP: pathinfo("a/b/c/name") → basename="name", dirname="a/b/c"
-        let (basename, location, trash_fc) =
-            trash_path_info("files/a/b/c/name", 1784000000);
+        let (basename, location, trash_fc) = trash_path_info("files/a/b/c/name", 1784000000);
         assert_eq!(basename, "name");
         assert_eq!(location, "a/b/c");
         assert_eq!(trash_fc, "files_trashbin/files/name.d1784000000");
@@ -1838,8 +1948,7 @@ mod tests {
     #[test]
     fn trash_root_level_directory() {
         // Trashing a top-level directory like "files/Photos"
-        let (basename, location, trash_fc) =
-            trash_path_info("files/Photos", 1784000000);
+        let (basename, location, trash_fc) = trash_path_info("files/Photos", 1784000000);
         assert_eq!(basename, "Photos");
         assert_eq!(location, "");
         assert_eq!(trash_fc, "files_trashbin/files/Photos.d1784000000");
@@ -1851,8 +1960,10 @@ mod tests {
         // The id must always be the filename basename (a string like "test"),
         // never a numeric fileid like "109".
         let (basename, _, _) = trash_path_info("files/test", 1784000000);
-        assert!(!basename.chars().all(|c| c.is_ascii_digit()),
-            "trash id must be the basename, not a numeric fileid");
+        assert!(
+            !basename.chars().all(|c| c.is_ascii_digit()),
+            "trash id must be the basename, not a numeric fileid"
+        );
         assert_eq!(basename, "test");
     }
 
@@ -1860,10 +1971,11 @@ mod tests {
     fn trash_location_is_never_a_full_fc_path() {
         // Regression: we used to store "files/{relative}" as location.
         // The location must be the dirname relative to files/, never "files/...".
-        let (_, location, _) =
-            trash_path_info("files/Media/test.txt", 1784000000);
-        assert!(!location.starts_with("files/"),
-            "trash location must be relative to files/, not a full fc path: {location}");
+        let (_, location, _) = trash_path_info("files/Media/test.txt", 1784000000);
+        assert!(
+            !location.starts_with("files/"),
+            "trash location must be relative to files/, not a full fc path: {location}"
+        );
         assert_eq!(location, "Media");
     }
 
@@ -1979,12 +2091,7 @@ mod tests {
         // Uploading to "files/a/b/c" should create ancestors:
         // "files", "files/a", "files/a/b", "files/a/b/c".
         let chain = upload_ancestor_chain("files/a/b/c");
-        assert_eq!(chain, vec![
-            "files",
-            "files/a",
-            "files/a/b",
-            "files/a/b/c",
-        ]);
+        assert_eq!(chain, vec!["files", "files/a", "files/a/b", "files/a/b/c",]);
     }
 
     #[test]
@@ -1993,21 +2100,27 @@ mod tests {
         // triggers the "if last_existing_row.is_none()" branch in
         // ensure_parent_dir.
         let chain = upload_ancestor_chain("files_trashbin/files/test.d123");
-        assert_eq!(chain, vec![
-            "files_trashbin",
-            "files_trashbin/files",
-            "files_trashbin/files/test.d123",
-        ]);
+        assert_eq!(
+            chain,
+            vec![
+                "files_trashbin",
+                "files_trashbin/files",
+                "files_trashbin/files/test.d123",
+            ]
+        );
     }
 
     #[test]
     fn upload_ancestor_chain_deep_trashbin() {
         let chain = upload_ancestor_chain("files_trashbin/files/foo.d123/sub.txt");
-        assert_eq!(chain, vec![
-            "files_trashbin",
-            "files_trashbin/files",
-            "files_trashbin/files/foo.d123",
-            "files_trashbin/files/foo.d123/sub.txt",
-        ]);
+        assert_eq!(
+            chain,
+            vec![
+                "files_trashbin",
+                "files_trashbin/files",
+                "files_trashbin/files/foo.d123",
+                "files_trashbin/files/foo.d123/sub.txt",
+            ]
+        );
     }
 }

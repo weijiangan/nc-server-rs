@@ -29,18 +29,26 @@ Goal: implement the cross-cutting PHP behaviours that execute **inline on the Ru
 
 **Verify:** PUT a 1 MB file into `/A/B/C/`; PROPFIND `{DAV:}getetag` + `{oc:}size` on `A`, `B`, `C` all changed; `size` increased by 1 MB at each already-scanned ancestor. Delete it; sizes revert and ETags change again. A desktop-sync incremental poll detects the change purely from the parent ETag.
 
-### 9.3 Trash bin on DELETE (REQ §6.7)
+### 9.3 Trash bin on DELETE (REQ §6.7) — ✅ IMPLEMENTED (with residual gaps)
 > PHP source: `apps/files_trashbin/lib/Storage.php` (unlink/rmdir interception), `apps/files_trashbin/lib/Trashbin.php` (`move2trash`).
+> Rust: [`../../core-rs/crates/nc-dav/src/filesystem.rs`](../../core-rs/crates/nc-dav/src/filesystem.rs) (`move_to_trash`, `trash_directory`, `is_trashbin_enabled`, `remove_file`/`remove_dir`) + [`../../core-rs/crates/nc-dav/src/handler.rs`](../../core-rs/crates/nc-dav/src/handler.rs) (atomic directory-DELETE interception).
 
-- [ ] `DELETE` on `/dav/files/{userId}/{path}` (and `/remote.php/…` alias) moves the node instead of permanently deleting it
-- [ ] Disk: rename `{datadir}/{userId}/files/{path}` → `{datadir}/{userId}/files_trashbin/files/{path}.d{timestamp}` (whole subtree for directories)
-- [ ] Collision: append `_1`, `_2`, … to the `.d{timestamp}` suffix
-- [ ] `oc_filecache` row **updated** (not deleted): `path`, `path_hash`, `name` (+`.d{ts}`), `parent` (fileid of auto-created `files_trashbin/files`), `mtime = timestamp`
-- [ ] `oc_filecache_extended` row left unchanged (keyed by `fileid`)
-- [ ] Insert one `oc_files_trash` row per node: `id=fileid`, `user`, `timestamp`, `location=files/{path}`, `type` (`file`/`folder`), `deleted_by`
-- [ ] Auto-create the `files_trashbin/` and `files_trashbin/files/` collection rows if missing
-- [ ] Runs propagation (§9.2) on the source parent
-- [ ] Permanent delete via `/dav/trashbin/…` stays delegated to PHP-FPM (unchanged, REQ §6.7.4)
+- [x] `DELETE` on `/dav/files/{userId}/{path}` (and `/remote.php/…` alias) moves the node instead of permanently deleting it (guarded by `is_trashbin_enabled`; hard-delete fallback when the app is disabled)
+- [x] Disk: rename `{datadir}/{userId}/files/{path}` → `{datadir}/{userId}/files_trashbin/files/{basename}.d{timestamp}` (whole subtree for directories, moved as one unit; **basename only** — original directory structure is not encoded in the trash name, matching PHP `pathinfo()`). Collisions bump the timestamp (PHP-compatible, `{name}.d{ts}` only — no `_N` suffix)
+- [x] `oc_filecache` row **updated** (not deleted): `path`, `path_hash`, `name` (trash basename incl. `.d{ts}`), `parent` (fileid of auto-created `files_trashbin/files`), `mtime = timestamp`; directory descendants' `path`/`path_hash` rewritten to nest under the trashed dir
+- [x] `oc_filecache_extended` row left unchanged (keyed by `fileid`)
+- [x] Insert one `oc_files_trash` row per top-level node with **exactly** the columns PHP writes: `id = basename` (matches PHP — **not** `fileid`), `user`, `timestamp` (**bound as a string** — the column is `VARCHAR(12)`), `location = dirname`, `deleted_by`. The nullable `type`/`mime` columns are left `NULL` (PHP does not set them; `type` is only `VARCHAR(4)`, so writing `'folder'` would overflow). Insert failures are logged, not swallowed.
+- [x] Auto-create the `files_trashbin/` and `files_trashbin/files/` collection rows if missing (`ensure_parent_dir`)
+- [x] Permanent delete via `/dav/trashbin/…` stays delegated to PHP-FPM (router forwards `/remote.php/dav/trashbin/*`, unchanged, REQ §6.7.4)
+- [ ] Runs propagation (§9.2) on the source parent — the deleted item's original ancestors keep stale `size`/`etag` until a rescan. Blocked on §9.2.
+
+> **Critique / residual gaps (found during verification):**
+> 1. **No source-parent propagation** (see unchecked item above / §9.2): after trashing, the origin folder's `size` and `etag` are stale, so a desktop-sync client won't see the deletion until a full rescan.
+> 2. **Shared-file deletes ignore the owner's trashbin.** PHP routes a deleted *received share* into the **owner's** trashbin (`owner !== user` → row under `$owner`, plus `copyFilesToUser`). Rust always writes `user`/`deleted_by = self.uid` and trashes within the current user's storage. Deleting a received share therefore lands in the wrong trashbin. **Fix (or explicitly de-scope):** resolve share owner before trashing, or document that shared-mount deletes stay delegated to PHP-FPM.
+> 3. **Versions not retained** (`retainVersions`): PHP moves `files_versions/{path}` → `files_trashbin/versions/…` so a restore also restores versions. Rust does not. Tracked by §9.4; note the cross-dependency here.
+> 4. **No events/hooks emitted.** PHP fires `post_moveToTrash` + typed node events consumed by the activity, tags, and other apps (running in PHP-FPM). Because the delete now happens in Rust, the activity feed and tag cleanup won't fire. This is the general cross-cutting-events gap; decide whether to emit an internal signal to PHP-FPM or accept the loss.
+> 5. **Inline trashbin size check skipped** (`getConfiguredTrashbinSize`): PHP refuses to trash an item larger than the configured max (hard-deletes instead). Rust always trashes. Low severity — background expiry still runs via the PHP `files_trashbin` cron job, independent of this write path.
+> 6. **`location` normalization differs slightly:** PHP stores `.` for root-level items (pathinfo `dirname`), Rust trims it to empty string. PHP restore tolerates both, but exact-match tooling/migrations may expect `.`.
 
 **Verify:** `build/integration/dav_features/webdav-related.feature` DELETE scenarios; then confirm the file is listed under `/dav/trashbin/{user}/` (served by PHP-FPM) and a row exists in `oc_files_trash`. Cypress `cypress/e2e/files/` trashbin flow: delete in web UI → item appears in Deleted files view.
 
