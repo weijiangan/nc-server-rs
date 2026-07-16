@@ -97,7 +97,7 @@ impl NcFileSystem {
     /// Deviation: PHP does NOT call `createParentDirectories()` from chunked
     /// upload v2 assembly, so chunked uploads to paths with a non-existent
     /// parent fail.  Rust calls this uniformly from all write paths (PUT,
-    /// MKCOL, chunked assembly).  See SPECS/PHASE-5.md.
+    /// MKCOL, chunked assembly).  See SPECS/04-tasks/phase-5.md.
     async fn ensure_parent_dir(
         &self,
         fc_path: &str,

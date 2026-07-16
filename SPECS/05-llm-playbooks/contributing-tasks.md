@@ -1,6 +1,8 @@
 # How to Write Tasks for This Project
 
-All implementation work is tracked in phase files (`PHASE-N.md`). This document describes the conventions so that new tasks are consistent and verifiable.
+> LLM navigation: quick playbooks live in [this folder's README](README.md); this file remains the canonical ruleset.
+
+All implementation work is tracked in phase files (`phase-N.md`). This document describes the conventions so that new tasks are consistent and verifiable.
 
 ---
 
@@ -193,12 +195,12 @@ And in the target phase's starting state:
 
 ---
 
-## Updating TASKS.md
+## Updating tasks.md
 
-After adding a new phase file, add a row to the table in `TASKS.md`:
+After adding a new phase file, add a row to the table in `tasks.md`:
 
 ```markdown
-| N — Title | [PHASE-N.md](PHASE-N.md) | ⬜ Not started |
+| N — Title | [phase-N.md](phase-N.md) | ⬜ Not started |
 ```
 
 Status icons:

@@ -100,7 +100,7 @@ Check `GET /status.php` — it should return `"installed":true`.
 > **Maintenance mode:** `nc-server` reads `maintenance` from `config.php` at
 > startup only (PHP writes it via `SystemConfig`, not `oc_appconfig`).  Toggling
 > `occ maintenance:mode --on` while `nc-server` is running requires a restart to
-> take effect.  See [IMPROVEMENTS.md](../../SPECS/IMPROVEMENTS.md) §I.1 for a
+> take effect.  See [improvements.md](../../SPECS/02-specifications/improvements.md) §I.1 for a
 > planned hot-reload fix.
 
 ---

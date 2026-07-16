@@ -2,7 +2,7 @@ use sqlx::AnyPool;
 
 /// Schema migration entry point.
 ///
-/// # DISABLED — see SPECS/IMPROVEMENTS.md §I.3
+/// # DISABLED — see SPECS/02-specifications/improvements.md §I.3
 ///
 /// `sqlx::migrate!()` tracks applied migrations in `_sqlx_migrations`
 /// independently of PHP's Doctrine migration tracker (`oc_migrations`).
@@ -27,7 +27,7 @@ pub async fn run(pool: &AnyPool) -> anyhow::Result<()> {
 
     let _ = pool; // suppress unused warning while migrations are disabled
     tracing::debug!(
-        "Database migrations disabled (PHP owns the schema — see SPECS/IMPROVEMENTS.md §I.3)"
+        "Database migrations disabled (PHP owns the schema — see SPECS/02-specifications/improvements.md §I.3)"
     );
     Ok(())
 }

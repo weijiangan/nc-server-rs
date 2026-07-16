@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Migrations ───────────────────────────────────────────────────────────
     // Currently a no-op: sqlx migrations are disabled because PHP owns the
-    // schema (see SPECS/IMPROVEMENTS.md §I.3 and nc_db::migrate::run docs).
+    // schema (see SPECS/02-specifications/improvements.md §I.3 and nc_db::migrate::run docs).
     nc_db::migrate::run(&pool)
         .await
         .context("Database migration failed")?;
