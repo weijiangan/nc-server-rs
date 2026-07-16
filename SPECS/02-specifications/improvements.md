@@ -87,3 +87,11 @@ Option 1 is recommended. Tracked as a future task because it requires rewriting 
 **Impact:** secret rotation is a disruptive operation — requires coordinated restart. Also overlaps with §I.1 (config.php hot-reload) since `secret` is a system config key.
 
 **Fix:** §I.1's config.php watcher covers this automatically — on secret change, re-parse `NcConfig`, flush the entire token hot cache (since all cached hashes computed under the old secret are now invalid).
+
+## I.9 `{oc:}permissions` `W` flag on movable-mount roots (single-file shares)
+
+**Context:** PHP `DavUtil::getDavPermissions()` (`lib/public/Files/DavUtil.php`) special-cases the `W` ("writable file") letter for the **root of a movable mount** (`getInternalPath() === '' && mount instanceof IMovableMount`): instead of the node's own `UPDATE` bit, it re-derives writability from the underlying storage's root cache entry. The mount layer artificially adds `UPDATE` to a mount root so it can be renamed/moved as a unit, which would otherwise emit a bogus `W`. Since `W` is only appended for files, this only matters for a **single-file share** (a share of one file, mounted as a file at its own root). Rust's `encode_permissions` (`nc-dav/src/props.rs`) derives `W` directly from the persisted `oc_filecache.permissions` bit and has no movable-mount re-derivation.
+
+**Impact:** none today. The inflation is a PHP *runtime* behavior, not a persisted value — the filecache row holds the share's real granted mask — so Rust reading the persisted permissions most likely already emits the correct `W`. Also `{oc:}permissions` is only a web-client UI hint (show/hide the edit affordance); the actual write is permission-checked server-side regardless.
+
+**Fix (only if needed):** revisit **if** Rust ever gains full **native** mounting of shares that replicates PHP's movability-permission inflation on mount roots. At that point Rust would need the same underlying-cache re-derivation for the `W` flag on single-file-share roots. Until native share mounts with inflation exist, there is nothing to fix.

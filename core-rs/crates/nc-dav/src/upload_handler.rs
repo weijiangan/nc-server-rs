@@ -59,7 +59,10 @@ pub async fn upload_handler(State(state): State<NcDavState>, req: Request) -> Re
     if path_user_id != uid {
         return http::Response::builder()
             .status(403)
-            .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+            .header(
+                H_CSP.clone(),
+                HeaderValue::from_static("default-src 'none';"),
+            )
             .body(Body::from("Forbidden"))
             .unwrap();
     }
@@ -525,20 +528,15 @@ async fn handle_move(
         }
     };
 
-    let parent_row = match row::lookup_by_path(
-        &state.pool,
-        &state.table_prefix,
-        storage_id,
-        &parent_path,
-    )
-    .await
-    {
-        Some(r) => r,
-        None => {
-            tracing::error!(parent_path = %parent_path, "Parent directory not found");
-            return internal_error_response();
-        }
-    };
+    let parent_row =
+        match row::lookup_by_path(&state.pool, &state.table_prefix, storage_id, &parent_path).await
+        {
+            Some(r) => r,
+            None => {
+                tracing::error!(parent_path = %parent_path, "Parent directory not found");
+                return internal_error_response();
+            }
+        };
 
     // Create parent directories on disk if needed
     let parent_disk = row::disk_path(&state.data_directory, &user_id, &parent_path);
@@ -548,8 +546,7 @@ async fn handle_move(
     }
 
     // Write the assembled file to disk
-    let final_disk_path =
-        row::disk_path(&state.data_directory, &user_id, &fc_path_full);
+    let final_disk_path = row::disk_path(&state.data_directory, &user_id, &fc_path_full);
 
     if let Some(parent) = final_disk_path.parent() {
         if let Err(e) = fs::create_dir_all(parent).await {
@@ -651,7 +648,7 @@ async fn handle_move(
         let upload_time_val = now; // always set upload_time for new/uploads
         let _ = sqlx::query(&sql)
             .bind(fid)
-            .bind("")    // metadata_etag
+            .bind("") // metadata_etag
             .bind(creation_time_val)
             .bind(upload_time_val)
             .execute(&state.pool)
@@ -686,11 +683,8 @@ async fn handle_move(
                 .map(|r| r.fileid.to_string())
                 .unwrap_or_else(|| fid.to_string()),
         )
-        .header(
-            HeaderName::from_static("etag"),
-            format!("\"{}\"", &etag),
-        )
-        .header(HeaderName::from_static("oc-etag"), &etag);
+        .header(HeaderName::from_static("etag"), format!("\"{}\"", &etag))
+        .header(HeaderName::from_static("oc-etag"), format!("\"{}\"", &etag));
 
     if req.headers().get("x-oc-mtime").is_some() {
         builder = builder.header(HeaderName::from_static("x-oc-mtime"), "accepted");
@@ -718,11 +712,7 @@ async fn cleanup_chunks(state: &NcDavState, upload_id: &str, path: &str) {
 }
 
 /// Handle DELETE - abort upload (PHASE-5.8)
-async fn handle_delete(
-    state: NcDavState,
-    upload_id: Option<&str>,
-    path: &str,
-) -> Response {
+async fn handle_delete(state: NcDavState, upload_id: Option<&str>, path: &str) -> Response {
     let upload_id = match upload_id {
         Some(id) => id,
         None => {
@@ -907,8 +897,7 @@ mod tests {
 
     #[test]
     fn test_parse_destination_path_no_dav_files_prefix() {
-        let result =
-            parse_destination_path("/other/path/file.txt", "/dav/uploads/user/upload123");
+        let result = parse_destination_path("/other/path/file.txt", "/dav/uploads/user/upload123");
         assert_eq!(result, "other/path/file.txt");
     }
 
@@ -933,8 +922,7 @@ mod tests {
     #[test]
     fn test_parse_destination_path_root() {
         // Destination for root of user's files: /dav/files/user
-        let result =
-            parse_destination_path("/dav/files/user", "/dav/uploads/user/upload123");
+        let result = parse_destination_path("/dav/files/user", "/dav/uploads/user/upload123");
         assert_eq!(result, "");
     }
 }

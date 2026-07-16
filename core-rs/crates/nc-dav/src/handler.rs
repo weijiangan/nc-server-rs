@@ -178,7 +178,10 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
                         </d:error>\n";
             let mut resp = http::Response::builder()
                 .status(StatusCode::INSUFFICIENT_STORAGE)
-                .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+                .header(
+                    H_CSP.clone(),
+                    HeaderValue::from_static("default-src 'none';"),
+                )
                 .header(
                     http::header::CONTENT_TYPE,
                     HeaderValue::from_static("application/xml; charset=utf-8"),
@@ -204,8 +207,13 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         );
         let mut resp = http::Response::builder()
             .status(StatusCode::NOT_IMPLEMENTED)
-            .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
-            .body(Body::from("OC-Chunked v1 is not supported. Use chunked upload v2 or simple PUT."))
+            .header(
+                H_CSP.clone(),
+                HeaderValue::from_static("default-src 'none';"),
+            )
+            .body(Body::from(
+                "OC-Chunked v1 is not supported. Use chunked upload v2 or simple PUT.",
+            ))
             .unwrap();
         if let Ok(v) = HeaderValue::from_str(&request_id) {
             resp.headers_mut().insert(H_X_REQUEST_ID.clone(), v);
@@ -219,9 +227,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
     // directory listing (REQ §14.6).  We check pre-dispatch so that normal
     // file GETs (handled by dav-server via `get_file`) are unaffected.
     if req_method == Method::GET {
-        let dav_path = req_path
-            .strip_prefix(strip_prefix.as_str())
-            .unwrap_or("/");
+        let dav_path = req_path.strip_prefix(strip_prefix.as_str()).unwrap_or("/");
         let fc_path = crate::row::dav_to_fc_path(dav_path);
 
         // ── §5.10 ZIP/TAR folder download ────────────────────────────────
@@ -232,10 +238,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         //
         // Mirrors PHP ZipFolderPlugin (apps/dav/.../ZipFolderPlugin.php).
         {
-            let accept_header = req
-                .headers()
-                .get("accept")
-                .and_then(|v| v.to_str().ok());
+            let accept_header = req.headers().get("accept").and_then(|v| v.to_str().ok());
             let uri_query = req.uri().query();
 
             let x_nc_files: Vec<String> = req
@@ -267,8 +270,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         }
 
         if let Some(fc_row) =
-            crate::row::lookup_by_path(&state.pool, &state.table_prefix, storage_id, &fc_path)
-                .await
+            crate::row::lookup_by_path(&state.pool, &state.table_prefix, storage_id, &fc_path).await
         {
             let is_dir = {
                 let cache = state.mime_cache.read().expect("mime cache lock");
@@ -279,7 +281,10 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
             if is_dir {
                 let mut resp = http::Response::builder()
                     .status(200)
-                    .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+                    .header(
+                        H_CSP.clone(),
+                        HeaderValue::from_static("default-src 'none';"),
+                    )
                     .header(
                         http::header::CONTENT_TYPE,
                         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -314,9 +319,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         let sync_req = crate::sync::parse_report_body(&body_bytes);
         if sync_req.is_sync_collection {
             let fc_base = crate::row::dav_to_fc_path(
-                req_path
-                    .strip_prefix(strip_prefix.as_str())
-                    .unwrap_or("/"),
+                req_path.strip_prefix(strip_prefix.as_str()).unwrap_or("/"),
             );
             return crate::sync::build_sync_response(
                 &state,
@@ -331,7 +334,10 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         // Non-sync-collection REPORT types are not implemented on the file tree.
         return http::Response::builder()
             .status(StatusCode::NOT_IMPLEMENTED)
-            .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+            .header(
+                H_CSP.clone(),
+                HeaderValue::from_static("default-src 'none';"),
+            )
             .body(Body::from("Not Implemented"))
             .unwrap();
     }
@@ -385,8 +391,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
                 if trash_enabled {
                     let write_result: crate::SharedWriteResult =
                         Arc::new(std::sync::Mutex::new(None));
-                    let put_error: crate::SharedPutError =
-                        Arc::new(std::sync::Mutex::new(None));
+                    let put_error: crate::SharedPutError = Arc::new(std::sync::Mutex::new(None));
                     let fs = NcFileSystem::new(
                         state,
                         uid.clone(),
@@ -401,7 +406,10 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
                         Ok(()) => {
                             return http::Response::builder()
                                 .status(StatusCode::NO_CONTENT)
-                                .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+                                .header(
+                                    H_CSP.clone(),
+                                    HeaderValue::from_static("default-src 'none';"),
+                                )
                                 .body(Body::empty())
                                 .unwrap();
                         }
@@ -413,7 +421,10 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
                             };
                             return http::Response::builder()
                                 .status(status)
-                                .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+                                .header(
+                                    H_CSP.clone(),
+                                    HeaderValue::from_static("default-src 'none';"),
+                                )
                                 .body(Body::empty())
                                 .unwrap();
                         }
@@ -517,8 +528,9 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
             if let Ok(v) = HeaderValue::from_str(&quoted_etag) {
                 parts.headers.insert(http::header::ETAG, v);
             }
-            // OC-ETag: unquoted mirror of ETag (REQ §6.4)
-            if let Ok(v) = HeaderValue::from_str(&wr.etag) {
+            // OC-ETag: verbatim copy of the (quoted) ETag, matching PHP
+            // `CopyEtagHeaderPlugin::afterMethod` — the quotes are kept (REQ §6.4).
+            if let Ok(v) = HeaderValue::from_str(&quoted_etag) {
                 parts.headers.insert(H_OC_ETAG.clone(), v);
             }
             if wr.mtime_accepted {
@@ -545,11 +557,9 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
     }
 
     if let Some(etag_val) = parts.headers.get(http::header::ETAG).cloned() {
-        // OC-ETag is the ETag value without quotes
-        let oc = etag_val.to_str().unwrap_or("").trim_matches('"');
-        if let Ok(v) = HeaderValue::from_str(oc) {
-            parts.headers.entry(H_OC_ETAG.clone()).or_insert(v);
-        }
+        // OC-ETag mirrors the ETag verbatim (quotes kept), matching PHP
+        // `CopyEtagHeaderPlugin::afterMethod` (REQ §6.4).
+        parts.headers.entry(H_OC_ETAG.clone()).or_insert(etag_val);
     }
 
     // 5. OC-Checksum on GET 200 (REQ §13.2)
@@ -598,9 +608,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
                     .filter(|s| !s.is_empty())
                     .unwrap_or("download");
                 let encoded = percent_encode_filename(file_name);
-                let cd = format!(
-                    "attachment; filename*=UTF-8''{encoded}; filename=\"{encoded}\""
-                );
+                let cd = format!("attachment; filename*=UTF-8''{encoded}; filename=\"{encoded}\"");
                 if let Ok(cd_val) = HeaderValue::from_str(&cd) {
                     parts
                         .headers
@@ -630,9 +638,7 @@ fn write_target_name(
 ) -> Option<String> {
     match method.as_str() {
         "PUT" | "MKCOL" => {
-            let dav_path = req_path
-                .strip_prefix(strip_prefix)
-                .unwrap_or(req_path);
+            let dav_path = req_path.strip_prefix(strip_prefix).unwrap_or(req_path);
             let decoded = percent_decode_path(dav_path.trim_end_matches('/'));
             let name = decoded.rsplit('/').next().unwrap_or("").to_string();
             if name.is_empty() {
@@ -666,9 +672,7 @@ fn percent_decode_path(path: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) =
-                (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
-            {
+            if let (Some(h), Some(l)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
                 out.push((h << 4) | l);
                 i += 3;
                 continue;
@@ -723,7 +727,10 @@ fn build_filename_error_response(e: FilenameError) -> Response {
     );
     http::Response::builder()
         .status(422)
-        .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+        .header(
+            H_CSP.clone(),
+            HeaderValue::from_static("default-src 'none';"),
+        )
         .header(
             http::header::CONTENT_TYPE,
             HeaderValue::from_static("application/xml; charset=utf-8"),
@@ -839,9 +846,7 @@ mod tests {
         // Root collection: strip leaves an empty string → dav_to_fc_path → "files"
         let prefix = determine_prefix("/remote.php/dav/files/alice", "alice");
         assert_eq!(prefix, "/remote.php/dav/files/alice");
-        let dav_after_strip = "/remote.php/dav/files/alice"
-            .strip_prefix(&prefix)
-            .unwrap();
+        let dav_after_strip = "/remote.php/dav/files/alice".strip_prefix(&prefix).unwrap();
         let fc = super::super::row::dav_to_fc_path(dav_after_strip);
         assert_eq!(fc, "files");
     }
@@ -1031,10 +1036,7 @@ mod tests {
 
     #[test]
     fn delete_intercept_root_level_file() {
-        let fc = delete_intercept_fc_path(
-            "/remote.php/webdav/Notes",
-            "/remote.php/webdav",
-        );
+        let fc = delete_intercept_fc_path("/remote.php/webdav/Notes", "/remote.php/webdav");
         assert_eq!(fc, "files/Notes");
     }
 

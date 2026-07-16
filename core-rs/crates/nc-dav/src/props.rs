@@ -19,8 +19,8 @@ use crate::metadata::NcMetaData;
 
 // ─── Namespaces ───────────────────────────────────────────────────────────────
 
-pub const OC_NS: &str  = "http://owncloud.org/ns";
-pub const NC_NS: &str  = "http://nextcloud.org/ns";
+pub const OC_NS: &str = "http://owncloud.org/ns";
+pub const NC_NS: &str = "http://nextcloud.org/ns";
 /// OCS (Open Collaboration Services) namespace — used for `{ocs:}share-permissions`.
 pub const OCS_NS: &str = "http://open-collaboration-services.org/ns";
 
@@ -75,7 +75,13 @@ pub fn build_props(
     // can_rename: matches PHP DavUtil::canRename() — true when updateable
     // (PERMISSION_UPDATE), or deletable + parent creatable (not checked here).
     let can_rename = meta.permissions & 2 != 0;
-    let perms_str = encode_permissions(meta.permissions, meta.is_dir_flag, is_mounted, is_shared, can_rename);
+    let perms_str = encode_permissions(
+        meta.permissions,
+        meta.is_dir_flag,
+        is_mounted,
+        is_shared,
+        can_rename,
+    );
 
     // {oc:}id = fileid zero-padded to 8 chars + instance_id (REQ §4.8)
     let oc_id = format!("{:08}{}", meta.fileid, instance_id);
@@ -92,54 +98,69 @@ pub fn build_props(
     // In oc_filecache the home storage root has path "files" (or ""); its
     // DAV "internal path" (relative to the mount) is then empty — Nextcloud
     // marks that node as the mount root (REQ §6.5, PHASE-4.9).
-    let is_mount_root = matches!(
-        meta.path.as_deref(),
-        Some("") | Some("files")
-    );
+    let is_mount_root = matches!(meta.path.as_deref(), Some("") | Some("files"));
     let is_mount_root_str = if is_mount_root { "true" } else { "false" };
 
     let mut props = vec![
         // ── oc: ──────────────────────────────────────────────────────────
-        make_prop("id",                   "oc", OC_NS, &oc_id),
-        make_prop("fileid",               "oc", OC_NS, &meta.fileid.to_string()),
-        make_prop("permissions",          "oc", OC_NS, &perms_str),
-        make_prop("size",                 "oc", OC_NS, &meta.size.to_string()),
-        make_prop("owner-id",             "oc",  OC_NS, uid),
+        make_prop("id", "oc", OC_NS, &oc_id),
+        make_prop("fileid", "oc", OC_NS, &meta.fileid.to_string()),
+        make_prop("permissions", "oc", OC_NS, &perms_str),
+        make_prop("size", "oc", OC_NS, &meta.size.to_string()),
+        make_prop("owner-id", "oc", OC_NS, uid),
         // {oc:}owner-display-name — resolved from oc_users.displayname (REQ §6.5 / §4.8)
-        make_prop("owner-display-name",   "oc",  OC_NS, owner_display_name),
-        make_prop("etag",                 "oc",  OC_NS, meta.etag.as_deref().unwrap_or("")),
-        make_prop("checksums",            "oc",  OC_NS, &checksums_val),
-        make_prop("data-fingerprint",     "oc",  OC_NS, data_fingerprint),
-        make_prop("downloadURL",          "oc",  OC_NS, download_url),
-        make_prop("tags",                 "oc",  OC_NS, ""),
-        make_prop("favorite",             "oc",  OC_NS, "0"),
+        make_prop("owner-display-name", "oc", OC_NS, owner_display_name),
+        make_prop("etag", "oc", OC_NS, meta.etag.as_deref().unwrap_or("")),
+        make_prop("checksums", "oc", OC_NS, &checksums_val),
+        make_prop("data-fingerprint", "oc", OC_NS, data_fingerprint),
+        make_prop("downloadURL", "oc", OC_NS, download_url),
+        make_prop("tags", "oc", OC_NS, ""),
+        make_prop("favorite", "oc", OC_NS, "0"),
         // {ocs:}share-permissions — per-share MAX permissions from oc_share;
         // defaults to 31 (all permissions) for the owner's own unshared file
         // (REQ §6.5 / §4.8, PHASE-7.6).
-        make_prop("share-permissions",    "ocs", OCS_NS, &share_permissions.to_string()),
-
+        make_prop(
+            "share-permissions",
+            "ocs",
+            OCS_NS,
+            &share_permissions.to_string(),
+        ),
         // ── nc: ──────────────────────────────────────────────────────────
         // NOTE: nc:has-preview only — oc:has-preview does NOT exist (REQ §6.5)
-        make_prop("has-preview",              "nc", NC_NS, "false"),
-        make_prop("creation_time",            "nc", NC_NS, &meta.creation_time.to_string()),
-        make_prop("upload_time",              "nc", NC_NS, &meta.upload_time.to_string()),
-        make_prop("mount-type",               "nc", NC_NS, "local"),
-        make_prop("is-mount-root",            "nc", NC_NS, is_mount_root_str),
-        make_prop("is-federated",             "nc", NC_NS, "false"),
+        make_prop("has-preview", "nc", NC_NS, "false"),
+        make_prop(
+            "creation_time",
+            "nc",
+            NC_NS,
+            &meta.creation_time.to_string(),
+        ),
+        make_prop("upload_time", "nc", NC_NS, &meta.upload_time.to_string()),
+        make_prop("mount-type", "nc", NC_NS, "local"),
+        make_prop("is-mount-root", "nc", NC_NS, is_mount_root_str),
+        make_prop("is-federated", "nc", NC_NS, "false"),
         // {nc:}hide-download — relevant for public shares; always "false" for
         // home-storage nodes (REQ §6.5, PHASE-4.9)
-        make_prop("hide-download",            "nc", NC_NS, "false"),
-        make_prop("contained-folder-count",   "nc", NC_NS, &child_dir_count.to_string()),
-        make_prop("contained-file-count",     "nc", NC_NS, &child_file_count.to_string()),
-        make_prop("remind-me-at",             "nc", NC_NS, ""),
-        make_prop("note",                     "nc", NC_NS, note),
-        make_prop("hidden",                   "nc", NC_NS, "false"),
-        make_prop("share-attributes",         "nc", NC_NS, ""),
-        make_prop("acl-can-read",             "nc", NC_NS, "true"),
-        make_prop("acl-can-write",            "nc", NC_NS, "true"),
-        make_prop("acl-can-delete",           "nc", NC_NS, "true"),
-        make_prop("acl-can-manage",           "nc", NC_NS, "true"),
-
+        make_prop("hide-download", "nc", NC_NS, "false"),
+        make_prop(
+            "contained-folder-count",
+            "nc",
+            NC_NS,
+            &child_dir_count.to_string(),
+        ),
+        make_prop(
+            "contained-file-count",
+            "nc",
+            NC_NS,
+            &child_file_count.to_string(),
+        ),
+        make_prop("remind-me-at", "nc", NC_NS, ""),
+        make_prop("note", "nc", NC_NS, note),
+        make_prop("hidden", "nc", NC_NS, "false"),
+        make_prop("share-attributes", "nc", NC_NS, ""),
+        make_prop("acl-can-read", "nc", NC_NS, "true"),
+        make_prop("acl-can-write", "nc", NC_NS, "true"),
+        make_prop("acl-can-delete", "nc", NC_NS, "true"),
+        make_prop("acl-can-manage", "nc", NC_NS, "true"),
         // ── DAV quota (unlimited) ─────────────────────────────────────────
         //
         // dav-server emits `{DAV:}quota-available-bytes` only when
@@ -242,6 +263,17 @@ pub fn encode_permissions(
     }
 
     // 8. Writable (files) or Creatable (dirs).
+    //
+    // NOTE (see SPECS/02-specifications/improvements.md §I.9): PHP
+    // `DavUtil::getDavPermissions()` special-cases `W` for the root of a
+    // movable mount — it re-derives writability from the underlying storage's
+    // root cache entry instead of the node's own UPDATE bit, because the mount
+    // layer artificially inflates a mount root with UPDATE so it can be
+    // renamed/moved. That only affects a single-file share (a file mounted at
+    // its own root). We use the persisted `oc_filecache.permissions` directly,
+    // which holds the real granted mask (the inflation is a PHP runtime-only
+    // value), so this is correct until Rust gains native share mounts that
+    // replicate the inflation.
     if is_dir {
         if perms & 4 != 0 {
             p.push_str("CK");
@@ -272,48 +304,48 @@ pub fn make_prop(name: &str, prefix: &str, ns: &str, value: &str) -> DavProp {
 fn prop_names() -> Vec<DavProp> {
     fn name_only(name: &str, prefix: &str, ns: &str) -> DavProp {
         DavProp {
-            name:      name.to_string(),
-            prefix:    Some(prefix.to_string()),
+            name: name.to_string(),
+            prefix: Some(prefix.to_string()),
             namespace: Some(ns.to_string()),
-            xml:       None,
+            xml: None,
         }
     }
 
     vec![
-        name_only("id",                       "oc", OC_NS),
-        name_only("fileid",                   "oc", OC_NS),
-        name_only("permissions",              "oc", OC_NS),
-        name_only("size",                     "oc", OC_NS),
-        name_only("owner-id",                 "oc",  OC_NS),
-        name_only("owner-display-name",       "oc",  OC_NS),
-        name_only("etag",                     "oc",  OC_NS),
-        name_only("checksums",                "oc",  OC_NS),
-        name_only("data-fingerprint",         "oc",  OC_NS),
-        name_only("downloadURL",              "oc",  OC_NS),
-        name_only("tags",                     "oc",  OC_NS),
-        name_only("favorite",                 "oc",  OC_NS),
-        name_only("share-permissions",        "ocs", OCS_NS),
-        name_only("has-preview",              "nc", NC_NS),
-        name_only("creation_time",            "nc", NC_NS),
-        name_only("upload_time",              "nc", NC_NS),
-        name_only("metadata_etag",            "nc", NC_NS),
-        name_only("mount-type",               "nc", NC_NS),
-        name_only("is-mount-root",            "nc", NC_NS),
-        name_only("is-federated",             "nc", NC_NS),
-        name_only("hide-download",            "nc", NC_NS),
-        name_only("contained-folder-count",   "nc", NC_NS),
-        name_only("contained-file-count",     "nc", NC_NS),
-        name_only("remind-me-at",             "nc", NC_NS),
-        name_only("note",                     "nc", NC_NS),
-        name_only("hidden",                   "nc", NC_NS),
-        name_only("share-attributes",         "nc", NC_NS),
-        name_only("acl-can-read",             "nc", NC_NS),
-        name_only("acl-can-write",            "nc", NC_NS),
-        name_only("acl-can-delete",           "nc", NC_NS),
-        name_only("acl-can-manage",           "nc", NC_NS),
+        name_only("id", "oc", OC_NS),
+        name_only("fileid", "oc", OC_NS),
+        name_only("permissions", "oc", OC_NS),
+        name_only("size", "oc", OC_NS),
+        name_only("owner-id", "oc", OC_NS),
+        name_only("owner-display-name", "oc", OC_NS),
+        name_only("etag", "oc", OC_NS),
+        name_only("checksums", "oc", OC_NS),
+        name_only("data-fingerprint", "oc", OC_NS),
+        name_only("downloadURL", "oc", OC_NS),
+        name_only("tags", "oc", OC_NS),
+        name_only("favorite", "oc", OC_NS),
+        name_only("share-permissions", "ocs", OCS_NS),
+        name_only("has-preview", "nc", NC_NS),
+        name_only("creation_time", "nc", NC_NS),
+        name_only("upload_time", "nc", NC_NS),
+        name_only("metadata_etag", "nc", NC_NS),
+        name_only("mount-type", "nc", NC_NS),
+        name_only("is-mount-root", "nc", NC_NS),
+        name_only("is-federated", "nc", NC_NS),
+        name_only("hide-download", "nc", NC_NS),
+        name_only("contained-folder-count", "nc", NC_NS),
+        name_only("contained-file-count", "nc", NC_NS),
+        name_only("remind-me-at", "nc", NC_NS),
+        name_only("note", "nc", NC_NS),
+        name_only("hidden", "nc", NC_NS),
+        name_only("share-attributes", "nc", NC_NS),
+        name_only("acl-can-read", "nc", NC_NS),
+        name_only("acl-can-write", "nc", NC_NS),
+        name_only("acl-can-delete", "nc", NC_NS),
+        name_only("acl-can-manage", "nc", NC_NS),
         // {DAV:}sync-token: RFC 6578 delta sync property on collections
         // (PHASE-4.11).  Listed here so allprop/propname responses include it.
-        name_only("sync-token",               "D",  "DAV:"),
+        name_only("sync-token", "D", "DAV:"),
         // Note: {DAV:}quota-available-bytes is listed by dav-server's own
         // allprop/propname set so we do NOT duplicate it here.
     ]
@@ -328,13 +360,21 @@ mod tests {
 
     fn test_meta(checksum: Option<&str>) -> NcMetaData {
         NcMetaData {
-            fileid: 42, size: 100, mtime: 1700000000, is_dir_flag: false,
+            fileid: 42,
+            size: 100,
+            mtime: 1700000000,
+            is_dir_flag: false,
             mime_type: "text/plain".into(),
-            etag: Some("abc".into()), permissions: 27,
-            creation_time: 1700000000, upload_time: 1700000000,
+            etag: Some("abc".into()),
+            permissions: 27,
+            creation_time: 1700000000,
+            upload_time: 1700000000,
             checksum: checksum.map(String::from),
-            display_name: "test.txt".into(), metadata_etag: None,
-            storage: 1, path: Some("files/test.txt".into()), parent: 2,
+            display_name: "test.txt".into(),
+            metadata_etag: None,
+            storage: 1,
+            path: Some("files/test.txt".into()),
+            parent: 2,
         }
     }
 
@@ -342,7 +382,22 @@ mod tests {
     /// §4.11, and §7.6: `owner_display_name` as `"Alice Test"`; `sync_token = None`;
     /// `is_mounted = false`; `is_shared = false`; `share_permissions = 31`; `download_url = ""`; `note = ""`.
     fn build(meta: &NcMetaData) -> Vec<DavProp> {
-        build_props(meta, "inst", "alice", "Alice Test", true, "", 0, 0, None, false, false, 31, "", "")
+        build_props(
+            meta,
+            "inst",
+            "alice",
+            "Alice Test",
+            true,
+            "",
+            0,
+            0,
+            None,
+            false,
+            false,
+            31,
+            "",
+            "",
+        )
     }
 
     // ── encode_permissions ────────────────────────────────────────────────────
@@ -385,7 +440,11 @@ mod tests {
         // PHP: N V W = "NVW"
         let s = encode_permissions(6, false, false, false, true);
         assert_eq!(s, "NVW", "perms=6 file: expected NVW, got {s}");
-        assert_eq!(s.matches("CK").count(), 0, "CK must not appear on files: {s}");
+        assert_eq!(
+            s.matches("CK").count(),
+            0,
+            "CK must not appear on files: {s}"
+        );
     }
 
     #[test]
@@ -411,7 +470,10 @@ mod tests {
         // PHP: N V = "NV"
         let s = encode_permissions(2, true, false, false, true);
         assert_eq!(s, "NV", "perms=2 dir: expected NV, got {s}");
-        assert!(!s.contains("CK"), "CK must NOT be added for dir UPDATE without CREATE: {s}");
+        assert!(
+            !s.contains("CK"),
+            "CK must NOT be added for dir UPDATE without CREATE: {s}"
+        );
     }
 
     #[test]
@@ -420,7 +482,11 @@ mod tests {
         // PHP: N V CK = "NVCK"
         let s = encode_permissions(6, true, false, false, true);
         assert_eq!(s, "NVCK", "perms=6 dir: expected NVCK, got {s}");
-        assert_eq!(s.matches("CK").count(), 1, "CK should appear exactly once: {s}");
+        assert_eq!(
+            s.matches("CK").count(),
+            1,
+            "CK should appear exactly once: {s}"
+        );
     }
 
     // ── is_mounted / M flag (PHASE-7.6) ──────────────────────────────────────
@@ -428,21 +494,30 @@ mod tests {
     #[test]
     fn permissions_m_flag_when_mounted() {
         let s = encode_permissions(1, false, true, false, false);
-        assert!(s.contains('M'), "M flag must be present when is_mounted=true: {s}");
+        assert!(
+            s.contains('M'),
+            "M flag must be present when is_mounted=true: {s}"
+        );
         assert_eq!(s, "MG", "perms=1 mounted file: expected MG, got {s}");
     }
 
     #[test]
     fn permissions_no_m_flag_when_not_mounted() {
         let s = encode_permissions(31, false, false, false, true);
-        assert!(!s.contains('M'), "M flag must NOT be present for home storage: {s}");
+        assert!(
+            !s.contains('M'),
+            "M flag must NOT be present for home storage: {s}"
+        );
     }
 
     #[test]
     fn permissions_m_flag_in_full_perms_string() {
         // perms=31, file, mounted — PHP encoding order: R M G D N V W
         let s = encode_permissions(31, false, true, false, true);
-        assert_eq!(s, "RMGDNVW", "perms=31 mounted file: expected RMGDNVW, got {s}");
+        assert_eq!(
+            s, "RMGDNVW",
+            "perms=31 mounted file: expected RMGDNVW, got {s}"
+        );
     }
 
     // ── owner-display-name (§4.8) ─────────────────────────────────────────────
@@ -450,15 +525,39 @@ mod tests {
     #[test]
     fn owner_display_name_uses_provided_value() {
         let props = build(&test_meta(None));
-        let p = props.iter().find(|p| p.name == "owner-display-name").unwrap();
+        let p = props
+            .iter()
+            .find(|p| p.name == "owner-display-name")
+            .unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(xml.contains("Alice Test"), "should contain display name: {xml}");
+        assert!(
+            xml.contains("Alice Test"),
+            "should contain display name: {xml}"
+        );
     }
 
     #[test]
     fn owner_display_name_not_same_as_uid_when_different() {
-        let props = build_props(&test_meta(None), "inst", "alice", "Alice Test", true, "", 0, 0, None, false, false, 31, "", "");
-        let p = props.iter().find(|p| p.name == "owner-display-name").unwrap();
+        let props = build_props(
+            &test_meta(None),
+            "inst",
+            "alice",
+            "Alice Test",
+            true,
+            "",
+            0,
+            0,
+            None,
+            false,
+            false,
+            31,
+            "",
+            "",
+        );
+        let p = props
+            .iter()
+            .find(|p| p.name == "owner-display-name")
+            .unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
         assert!(!xml.contains(">alice<"), "must not contain raw uid: {xml}");
     }
@@ -473,19 +572,40 @@ mod tests {
             .find(|p| p.name == "downloadURL" && p.namespace.as_deref() == Some(OC_NS))
             .expect("{oc:}downloadURL must be present");
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(!xml.is_empty(), "xml element should be present even if value is empty: {xml}");
+        assert!(
+            !xml.is_empty(),
+            "xml element should be present even if value is empty: {xml}"
+        );
     }
 
     #[test]
     fn download_url_set_when_provided() {
         let url = "https://nc.example.com/remote.php/webdav/Photos/img.jpg";
-        let props = build_props(&test_meta(None), "inst", "u", "U", true, "", 0, 0, None, false, false, 31, url, "");
+        let props = build_props(
+            &test_meta(None),
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            None,
+            false,
+            false,
+            31,
+            url,
+            "",
+        );
         let p = props
             .iter()
             .find(|p| p.name == "downloadURL" && p.namespace.as_deref() == Some(OC_NS))
             .expect("{oc:}downloadURL must be present");
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(xml.contains(url), "downloadURL must contain the provided URL: {xml}");
+        assert!(
+            xml.contains(url),
+            "downloadURL must contain the provided URL: {xml}"
+        );
     }
 
     // ── share-permissions real value (PHASE-7.6) ──────────────────────────────
@@ -493,13 +613,31 @@ mod tests {
     #[test]
     fn share_permissions_reflects_passed_value() {
         // A file shared read-only has permissions=1 in oc_share
-        let props = build_props(&test_meta(None), "inst", "u", "U", true, "", 0, 0, None, false, false, 1, "", "");
+        let props = build_props(
+            &test_meta(None),
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            None,
+            false,
+            false,
+            1,
+            "",
+            "",
+        );
         let p = props
             .iter()
             .find(|p| p.name == "share-permissions" && p.namespace.as_deref() == Some(OCS_NS))
             .expect("{ocs:}share-permissions must be present");
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(xml.contains(">1<"), "share-permissions must reflect passed value 1: {xml}");
+        assert!(
+            xml.contains(">1<"),
+            "share-permissions must reflect passed value 1: {xml}"
+        );
     }
 
     // ── note (PHASE-7.6) ──────────────────────────────────────────────────────
@@ -509,15 +647,36 @@ mod tests {
         let props = build(&test_meta(None));
         let p = props.iter().find(|p| p.name == "note").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(!xml.contains("hello"), "should not contain note text when empty: {xml}");
+        assert!(
+            !xml.contains("hello"),
+            "should not contain note text when empty: {xml}"
+        );
     }
 
     #[test]
     fn note_propagated_when_provided() {
-        let props = build_props(&test_meta(None), "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "hello share note");
+        let props = build_props(
+            &test_meta(None),
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            None,
+            false,
+            false,
+            31,
+            "",
+            "hello share note",
+        );
         let p = props.iter().find(|p| p.name == "note").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(xml.contains("hello share note"), "note must contain provided text: {xml}");
+        assert!(
+            xml.contains("hello share note"),
+            "note must contain provided text: {xml}"
+        );
     }
 
     // ── share-permissions (§4.8) ──────────────────────────────────────────────
@@ -530,7 +689,10 @@ mod tests {
             .find(|p| p.name == "share-permissions" && p.namespace.as_deref() == Some(OCS_NS))
             .expect("{ocs:}share-permissions must be present");
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(xml.contains("31"), "default share-permissions should be 31: {xml}");
+        assert!(
+            xml.contains("31"),
+            "default share-permissions should be 31: {xml}"
+        );
     }
 
     #[test]
@@ -548,7 +710,22 @@ mod tests {
 
     #[test]
     fn checksums_wraps_in_checksum_element() {
-        let props = build_props(&test_meta(Some("SHA1:abc123")), "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "");
+        let props = build_props(
+            &test_meta(Some("SHA1:abc123")),
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            None,
+            false,
+            false,
+            31,
+            "",
+            "",
+        );
         let p = props.iter().find(|p| p.name == "checksums").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
         assert!(xml.contains("oc:checksum"), "missing inner element: {xml}");
@@ -557,20 +734,57 @@ mod tests {
 
     #[test]
     fn checksums_empty_when_no_checksum() {
-        let props = build_props(&test_meta(None), "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "");
+        let props = build_props(
+            &test_meta(None),
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            None,
+            false,
+            false,
+            31,
+            "",
+            "",
+        );
         let p = props.iter().find(|p| p.name == "checksums").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
         // Should just be <oc:checksums …></oc:checksums> with no inner element
-        assert!(!xml.contains("oc:checksum>S"), "should not have checksum when none stored: {xml}");
+        assert!(
+            !xml.contains("oc:checksum>S"),
+            "should not have checksum when none stored: {xml}"
+        );
     }
 
     // ── namespace correctness ─────────────────────────────────────────────────
 
     #[test]
     fn no_oc_has_preview_only_nc_has_preview() {
-        let props = build_props(&test_meta(None), "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "");
-        let oc_pv = props.iter().find(|p| p.name == "has-preview" && p.namespace.as_deref() == Some(OC_NS));
-        let nc_pv = props.iter().find(|p| p.name == "has-preview" && p.namespace.as_deref() == Some(NC_NS));
+        let props = build_props(
+            &test_meta(None),
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            None,
+            false,
+            false,
+            31,
+            "",
+            "",
+        );
+        let oc_pv = props
+            .iter()
+            .find(|p| p.name == "has-preview" && p.namespace.as_deref() == Some(OC_NS));
+        let nc_pv = props
+            .iter()
+            .find(|p| p.name == "has-preview" && p.namespace.as_deref() == Some(NC_NS));
         assert!(oc_pv.is_none(), "oc:has-preview must not be emitted");
         assert!(nc_pv.is_some(), "nc:has-preview must be emitted");
     }
@@ -581,40 +795,64 @@ mod tests {
 
     fn test_meta_with_path(path: Option<&str>) -> NcMetaData {
         NcMetaData {
-            fileid: 1, size: 0, mtime: 0, is_dir_flag: true,
+            fileid: 1,
+            size: 0,
+            mtime: 0,
+            is_dir_flag: true,
             mime_type: "httpd/unix-directory".into(),
-            etag: None, permissions: 31,
-            creation_time: 0, upload_time: 0, checksum: None,
-            display_name: "".into(), metadata_etag: None,
-            storage: 1, path: path.map(String::from), parent: 0,
+            etag: None,
+            permissions: 31,
+            creation_time: 0,
+            upload_time: 0,
+            checksum: None,
+            display_name: "".into(),
+            metadata_etag: None,
+            storage: 1,
+            path: path.map(String::from),
+            parent: 0,
         }
     }
 
     #[test]
     fn is_mount_root_true_for_files_path() {
         let meta = test_meta_with_path(Some("files"));
-        let props = build_props(&meta, "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "");
+        let props = build_props(
+            &meta, "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "",
+        );
         let p = props.iter().find(|p| p.name == "is-mount-root").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(xml.contains("true"), "is-mount-root must be true for path=files: {xml}");
+        assert!(
+            xml.contains("true"),
+            "is-mount-root must be true for path=files: {xml}"
+        );
     }
 
     #[test]
     fn is_mount_root_true_for_empty_path() {
         let meta = test_meta_with_path(Some(""));
-        let props = build_props(&meta, "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "");
+        let props = build_props(
+            &meta, "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "",
+        );
         let p = props.iter().find(|p| p.name == "is-mount-root").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(xml.contains("true"), "is-mount-root must be true for path=\"\": {xml}");
+        assert!(
+            xml.contains("true"),
+            "is-mount-root must be true for path=\"\": {xml}"
+        );
     }
 
     #[test]
     fn is_mount_root_false_for_subdir() {
         let meta = test_meta_with_path(Some("files/Photos"));
-        let props = build_props(&meta, "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "");
+        let props = build_props(
+            &meta, "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "",
+        );
         let p = props.iter().find(|p| p.name == "is-mount-root").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(xml.contains("false"), "is-mount-root must be false for subdir: {xml}");
+        assert!(
+            xml.contains("false"),
+            "is-mount-root must be false for subdir: {xml}"
+        );
     }
 
     // ── hide-download (§4.9) ──────────────────────────────────────────────────
@@ -627,15 +865,25 @@ mod tests {
             .find(|p| p.name == "hide-download" && p.namespace.as_deref() == Some(NC_NS))
             .expect("{nc:}hide-download must be present");
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(xml.contains("false"), "{{nc:}}hide-download must be false for home nodes: {xml}");
+        assert!(
+            xml.contains("false"),
+            "{{nc:}}hide-download must be false for home nodes: {xml}"
+        );
     }
 
     #[test]
     fn hide_download_in_prop_names() {
         let meta = test_meta(None);
-        let names = build_props(&meta, "inst", "u", "U", false, "", 0, 0, None, false, false, 31, "", "");
-        let found = names.iter().any(|p| p.name == "hide-download" && p.namespace.as_deref() == Some(NC_NS));
-        assert!(found, "{{nc:}}hide-download must appear in propnames response");
+        let names = build_props(
+            &meta, "inst", "u", "U", false, "", 0, 0, None, false, false, 31, "", "",
+        );
+        let found = names
+            .iter()
+            .any(|p| p.name == "hide-download" && p.namespace.as_deref() == Some(NC_NS));
+        assert!(
+            found,
+            "{{nc:}}hide-download must appear in propnames response"
+        );
     }
 
     // ── sync-token (§4.11) ────────────────────────────────────────────────────
@@ -647,7 +895,22 @@ mod tests {
         meta.mime_type = "httpd/unix-directory".into();
         meta.is_dir_flag = true;
         let token_val = "http://sabre.io/ns/sync/1705322096";
-        let props = build_props(&meta, "inst", "u", "U", true, "", 0, 0, Some(token_val), false, false, 31, "", "");
+        let props = build_props(
+            &meta,
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            Some(token_val),
+            false,
+            false,
+            31,
+            "",
+            "",
+        );
         let p = props
             .iter()
             .find(|p| p.name == "sync-token" && p.namespace.as_deref() == Some("DAV:"))
@@ -659,8 +922,22 @@ mod tests {
     #[test]
     fn sync_token_not_emitted_for_file() {
         let meta = test_meta(None); // is_dir_flag = false
-        let props = build_props(&meta, "inst", "u", "U", true, "", 0, 0,
-            Some("http://sabre.io/ns/sync/0"), false, false, 31, "", "");
+        let props = build_props(
+            &meta,
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            Some("http://sabre.io/ns/sync/0"),
+            false,
+            false,
+            31,
+            "",
+            "",
+        );
         let found = props.iter().any(|p| p.name == "sync-token");
         assert!(!found, "sync-token must NOT appear on a file node");
     }
@@ -669,7 +946,9 @@ mod tests {
     fn sync_token_not_emitted_when_none() {
         let mut meta = test_meta(None);
         meta.is_dir_flag = true;
-        let props = build_props(&meta, "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "");
+        let props = build_props(
+            &meta, "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "",
+        );
         let found = props.iter().any(|p| p.name == "sync-token");
         assert!(!found, "sync-token must not appear when None is passed");
     }
@@ -677,14 +956,36 @@ mod tests {
     #[test]
     fn sync_token_in_prop_names() {
         let meta = test_meta(None);
-        let names = build_props(&meta, "inst", "u", "U", false, "", 0, 0, None, false, false, 31, "", "");
-        let found = names.iter().any(|p| p.name == "sync-token" && p.namespace.as_deref() == Some("DAV:"));
-        assert!(found, "{{DAV:}}sync-token must appear in propnames response");
+        let names = build_props(
+            &meta, "inst", "u", "U", false, "", 0, 0, None, false, false, 31, "", "",
+        );
+        let found = names
+            .iter()
+            .any(|p| p.name == "sync-token" && p.namespace.as_deref() == Some("DAV:"));
+        assert!(
+            found,
+            "{{DAV:}}sync-token must appear in propnames response"
+        );
     }
 
     #[test]
     fn data_fingerprint_present() {
-        let props = build_props(&test_meta(None), "inst", "u", "U", true, "fp123", 0, 0, None, false, false, 31, "", "");
+        let props = build_props(
+            &test_meta(None),
+            "inst",
+            "u",
+            "U",
+            true,
+            "fp123",
+            0,
+            0,
+            None,
+            false,
+            false,
+            31,
+            "",
+            "",
+        );
         let p = props.iter().find(|p| p.name == "data-fingerprint").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
         assert!(xml.contains("fp123"), "{xml}");
@@ -692,7 +993,22 @@ mod tests {
 
     #[test]
     fn mount_type_is_local() {
-        let props = build_props(&test_meta(None), "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "");
+        let props = build_props(
+            &test_meta(None),
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            None,
+            false,
+            false,
+            31,
+            "",
+            "",
+        );
         let p = props.iter().find(|p| p.name == "mount-type").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
         assert!(xml.contains("local"), "{xml}");
@@ -700,12 +1016,33 @@ mod tests {
 
     #[test]
     fn child_counts_present() {
-        let props = build_props(&test_meta(None), "inst", "u", "U", true, "", 3, 7, None, false, false, 31, "", "");
-        let dirs = props.iter().find(|p| p.name == "contained-folder-count").unwrap();
-        let files = props.iter().find(|p| p.name == "contained-file-count").unwrap();
-        let dirs_xml  = std::str::from_utf8(dirs.xml.as_ref().unwrap()).unwrap();
+        let props = build_props(
+            &test_meta(None),
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            3,
+            7,
+            None,
+            false,
+            false,
+            31,
+            "",
+            "",
+        );
+        let dirs = props
+            .iter()
+            .find(|p| p.name == "contained-folder-count")
+            .unwrap();
+        let files = props
+            .iter()
+            .find(|p| p.name == "contained-file-count")
+            .unwrap();
+        let dirs_xml = std::str::from_utf8(dirs.xml.as_ref().unwrap()).unwrap();
         let files_xml = std::str::from_utf8(files.xml.as_ref().unwrap()).unwrap();
-        assert!(dirs_xml.contains('3'),  "{dirs_xml}");
+        assert!(dirs_xml.contains('3'), "{dirs_xml}");
         assert!(files_xml.contains('7'), "{files_xml}");
     }
 
@@ -716,23 +1053,59 @@ mod tests {
     /// so we inject it here without producing a duplicate.
     #[test]
     fn quota_available_bytes_is_minus_three() {
-        let props = build_props(&test_meta(None), "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "");
+        let props = build_props(
+            &test_meta(None),
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            None,
+            false,
+            false,
+            31,
+            "",
+            "",
+        );
         let p = props
             .iter()
             .find(|p| p.name == "quota-available-bytes" && p.namespace.as_deref() == Some("DAV:"))
             .expect("{DAV:}quota-available-bytes must be present");
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(xml.contains("-3"), "quota-available-bytes must be -3 (SPACE_UNLIMITED): {xml}");
+        assert!(
+            xml.contains("-3"),
+            "quota-available-bytes must be -3 (SPACE_UNLIMITED): {xml}"
+        );
     }
 
     /// `{DAV:}quota-available-bytes` must NOT appear under the OC or NC namespace.
     #[test]
     fn quota_available_bytes_not_in_oc_or_nc_namespace() {
-        let props = build_props(&test_meta(None), "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "");
+        let props = build_props(
+            &test_meta(None),
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            None,
+            false,
+            false,
+            31,
+            "",
+            "",
+        );
         for p in &props {
             if p.name == "quota-available-bytes" {
                 let ns = p.namespace.as_deref().unwrap_or("");
-                assert_eq!(ns, "DAV:", "quota-available-bytes must be in DAV: namespace, got {ns}");
+                assert_eq!(
+                    ns, "DAV:",
+                    "quota-available-bytes must be in DAV: namespace, got {ns}"
+                );
             }
         }
     }
@@ -743,7 +1116,7 @@ mod tests {
     fn make_prop_produces_xml() {
         let p = make_prop("fileid", "oc", OC_NS, "42");
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(xml.contains("42"),     "should contain value: {xml}");
+        assert!(xml.contains("42"), "should contain value: {xml}");
         assert!(xml.contains("fileid"), "should contain name:  {xml}");
     }
 }
