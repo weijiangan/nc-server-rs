@@ -988,6 +988,15 @@ impl DavFileSystem for NcFileSystem {
                     .bind(row.fileid)
                     .execute(&self.state.pool)
                     .await;
+
+                // Clean up custom DAV properties for this file (task §10.11).
+                let _ = crate::row::delete_custom_properties_for_path(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    &self.uid,
+                    &fc_path,
+                )
+                .await;
             }
 
             Ok(())
@@ -1016,6 +1025,17 @@ impl DavFileSystem for NcFileSystem {
 
                 let prefix = &self.state.table_prefix;
                 let like_pat = format!("{fc_path}/%");
+
+                // Clean up custom DAV properties before deleting filecache rows
+                // (delete_custom_properties_for_dir queries filecache for paths).
+                let _ = crate::row::delete_custom_properties_for_dir(
+                    &self.state.pool,
+                    prefix,
+                    &self.uid,
+                    self.storage_id,
+                    &fc_path,
+                )
+                .await;
 
                 let sql_ext = format!(
                     "DELETE FROM {prefix}filecache_extended \
@@ -1117,6 +1137,16 @@ impl DavFileSystem for NcFileSystem {
                 .await
                 .map_err(|_| FsError::GeneralFailure)?;
 
+            // Update custom DAV property paths for the renamed node (task §10.11).
+            let _ = crate::row::update_custom_properties_path(
+                &self.state.pool,
+                prefix,
+                &self.uid,
+                &from_fc,
+                &to_fc,
+            )
+            .await;
+
             // Update all descendants (directory move).
             if from_row.mimetype == {
                 let cache = self.state.mime_cache.read().expect("mime cache lock");
@@ -1127,6 +1157,18 @@ impl DavFileSystem for NcFileSystem {
                 let _ = self
                     .rename_subtree_paths(&from_fc, &to_fc, from_row.fileid, prefix)
                     .await;
+
+                // Update custom DAV property paths for the directory subtree
+                // (task §10.11).
+                let _ = crate::row::update_custom_properties_path_subtree(
+                    &self.state.pool,
+                    prefix,
+                    &self.uid,
+                    self.storage_id,
+                    &from_fc,
+                    &to_fc,
+                )
+                .await;
             }
 
             Ok(())
@@ -1396,7 +1438,7 @@ impl DavFileSystem for NcFileSystem {
             // Shared nodes (from oc_share) are detected via is_mounted/share_permissions.
             let is_shared = false;
 
-            Ok(crate::props::build_props(
+            let mut props = crate::props::build_props(
                 &meta,
                 instance_id,
                 &self.uid,
@@ -1410,7 +1452,39 @@ impl DavFileSystem for NcFileSystem {
                 share_permissions,
                 &download_url,
                 &note,
-            ))
+            );
+
+            // ── Append custom properties from oc_properties (task §10.11) ─────
+            if do_content {
+                let custom_props = crate::row::list_custom_properties(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    &self.uid,
+                    &fc_path,
+                )
+                .await;
+                for (propname, propvalue, _valuetype) in custom_props {
+                    if let Some((ns, name)) = crate::row::parse_clark_notation(&propname) {
+                        // Skip known-namespace props — they are handled above or
+                        // by the dav-server framework.
+                        if ns == "DAV:"
+                            || ns == "http://owncloud.org/ns"
+                            || ns == "http://nextcloud.org/ns"
+                            || ns == "http://open-collaboration-services.org/ns"
+                        {
+                            continue;
+                        }
+                        props.push(DavProp::new(
+                            name.to_string(),
+                            String::new(),
+                            ns.to_string(),
+                            propvalue,
+                        ));
+                    }
+                }
+            }
+
+            Ok(props)
         }
         .boxed()
     }
@@ -1583,11 +1657,49 @@ impl DavFileSystem for NcFileSystem {
                             }
                         }
 
-                        _ => http::StatusCode::FORBIDDEN,
+                        _ => {
+                            // Custom property → store in oc_properties (task §10.11).
+                            let prop_name_full = format!("{{{ns}}}{name}");
+                            if let Some(ref xml_bytes) = prop.xml {
+                                let _ = crate::row::upsert_custom_property(
+                                    &self.state.pool,
+                                    &self.state.table_prefix,
+                                    &self.uid,
+                                    &fc_path,
+                                    &prop_name_full,
+                                    xml_bytes,
+                                    2, // PROPERTY_TYPE_XML
+                                )
+                                .await;
+                                http::StatusCode::OK
+                            } else {
+                                http::StatusCode::BAD_REQUEST
+                            }
+                        }
                     }
                 } else {
-                    // DELETE — NC built-in props are not deletable
-                    http::StatusCode::FORBIDDEN
+                    // DELETE — built-in props cannot be removed; custom props are
+                    // deleted from oc_properties (task §10.11).
+                    match (ns, name) {
+                        ("DAV:", _)
+                        | ("http://nextcloud.org/ns", _)
+                        | ("http://owncloud.org/ns", _)
+                        | ("http://open-collaboration-services.org/ns", _) => {
+                            http::StatusCode::FORBIDDEN
+                        }
+                        _ => {
+                            let prop_name_full = format!("{{{ns}}}{name}");
+                            let _ = crate::row::delete_custom_property(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                &self.uid,
+                                &fc_path,
+                                &prop_name_full,
+                            )
+                            .await;
+                            http::StatusCode::OK
+                        }
+                    }
                 };
                 results.push((status, prop));
             }

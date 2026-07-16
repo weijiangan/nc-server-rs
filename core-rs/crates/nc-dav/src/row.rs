@@ -420,6 +420,238 @@ pub async fn list_changed_since(
 }
 
 
+// ─── oc_properties helpers (task §10.11) ─────────────────────────────────────
+
+/// Parse Clark notation `{namespace}name` → `("namespace", "name")`.
+pub fn parse_clark_notation(s: &str) -> Option<(&str, &str)> {
+    let inner = s.strip_prefix('{')?;
+    let (ns, name) = inner.split_once('}')?;
+    Some((ns, name))
+}
+
+/// Format a path for `oc_properties.propertypath` (VARCHAR 255).
+///
+/// Hashes with SHA-1 when the path exceeds 250 bytes, matching PHP's
+/// `CustomPropertiesBackend::formatPath()`.
+pub fn format_property_path(path: &str) -> String {
+    if path.len() > 250 {
+        use sha1::{Digest, Sha1};
+        let mut hasher = Sha1::new();
+        hasher.update(path.as_bytes());
+        format!("{:x}", hasher.finalize())
+    } else {
+        path.to_string()
+    }
+}
+
+/// List custom properties for a user + path from `oc_properties`.
+pub async fn list_custom_properties(
+    pool: &DbPool,
+    prefix: &str,
+    userid: &str,
+    path: &str,
+) -> Vec<(String, String, i16)> {
+    let prop_path = format_property_path(path);
+    let sql = format!(
+        "SELECT propertyname, propertyvalue, valuetype \
+         FROM {prefix}properties \
+         WHERE userid=$1 AND propertypath=$2"
+    );
+    let rows = match sqlx::query(&sql)
+        .bind(userid)
+        .bind(&prop_path)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "list_custom_properties query failed");
+            return vec![];
+        }
+    };
+    rows.iter()
+        .map(|r| {
+            (
+                r.try_get::<String, _>("propertyname").unwrap_or_default(),
+                r.try_get::<String, _>("propertyvalue").unwrap_or_default(),
+                r.try_get::<i16, _>("valuetype").unwrap_or(1),
+            )
+        })
+        .collect()
+}
+
+/// Upsert a custom property — delete-then-insert to avoid PK / composite-key
+/// complexity across SQLite and PostgreSQL.
+pub async fn upsert_custom_property(
+    pool: &DbPool,
+    prefix: &str,
+    userid: &str,
+    path: &str,
+    propname: &str,
+    value_xml: &[u8],
+    valuetype: i16,
+) -> anyhow::Result<()> {
+    let prop_path = format_property_path(path);
+    let val_str = std::str::from_utf8(value_xml).unwrap_or("");
+    let del_sql = format!(
+        "DELETE FROM {prefix}properties \
+         WHERE userid=$1 AND propertypath=$2 AND propertyname=$3"
+    );
+    sqlx::query(&del_sql)
+        .bind(userid)
+        .bind(&prop_path)
+        .bind(propname)
+        .execute(pool)
+        .await?;
+    let ins_sql = format!(
+        "INSERT INTO {prefix}properties \
+         (userid, propertypath, propertyname, propertyvalue, valuetype) \
+         VALUES ($1,$2,$3,$4,$5)"
+    );
+    sqlx::query(&ins_sql)
+        .bind(userid)
+        .bind(&prop_path)
+        .bind(propname)
+        .bind(val_str)
+        .bind(valuetype)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Delete a single custom property by name.
+pub async fn delete_custom_property(
+    pool: &DbPool,
+    prefix: &str,
+    userid: &str,
+    path: &str,
+    propname: &str,
+) -> anyhow::Result<()> {
+    let prop_path = format_property_path(path);
+    let sql = format!(
+        "DELETE FROM {prefix}properties \
+         WHERE userid=$1 AND propertypath=$2 AND propertyname=$3"
+    );
+    sqlx::query(&sql)
+        .bind(userid)
+        .bind(&prop_path)
+        .bind(propname)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Delete all custom properties for an exact path (single file/node delete).
+pub async fn delete_custom_properties_for_path(
+    pool: &DbPool,
+    prefix: &str,
+    userid: &str,
+    path: &str,
+) -> anyhow::Result<()> {
+    let prop_path = format_property_path(path);
+    let sql = format!(
+        "DELETE FROM {prefix}properties WHERE userid=$1 AND propertypath=$2"
+    );
+    sqlx::query(&sql)
+        .bind(userid)
+        .bind(&prop_path)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Delete custom properties for a directory and all its descendants.
+///
+/// Queries `oc_filecache` for all paths under the directory, then deletes
+/// each one from `oc_properties`.  This avoids LIKE-based queries that would
+/// miss hashed (SHA-1) long paths.
+pub async fn delete_custom_properties_for_dir(
+    pool: &DbPool,
+    prefix: &str,
+    userid: &str,
+    storage_id: i64,
+    dir_fc_path: &str,
+) {
+    let like_pat = format!("{dir_fc_path}/%");
+    let sql = format!(
+        "SELECT path FROM {prefix}filecache \
+         WHERE storage=$1 AND (path=$2 OR path LIKE $3)"
+    );
+    let rows = match sqlx::query(&sql)
+        .bind(storage_id)
+        .bind(dir_fc_path)
+        .bind(&like_pat)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for r in &rows {
+        let child_path: String = r.try_get("path").unwrap_or_default();
+        let _ = delete_custom_properties_for_path(pool, prefix, userid, &child_path).await;
+    }
+}
+
+/// Update `propertypath` for a single node (rename).
+pub async fn update_custom_properties_path(
+    pool: &DbPool,
+    prefix: &str,
+    userid: &str,
+    old_path: &str,
+    new_path: &str,
+) -> anyhow::Result<()> {
+    let old_prop = format_property_path(old_path);
+    let new_prop = format_property_path(new_path);
+    let sql = format!(
+        "UPDATE {prefix}properties SET propertypath=$1 \
+         WHERE userid=$2 AND propertypath=$3"
+    );
+    sqlx::query(&sql)
+        .bind(&new_prop)
+        .bind(userid)
+        .bind(&old_prop)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Update `propertypath` for a directory subtree (rename).
+///
+/// Queries `oc_filecache` for all descendant paths, then updates each one
+/// individually to avoid LIKE-based string prefix replacement that would
+/// miss hashed (SHA-1) long paths.
+pub async fn update_custom_properties_path_subtree(
+    pool: &DbPool,
+    prefix: &str,
+    userid: &str,
+    storage_id: i64,
+    old_prefix: &str,
+    new_prefix: &str,
+) {
+    let like_pat = format!("{old_prefix}/%");
+    let sql = format!(
+        "SELECT path FROM {prefix}filecache \
+         WHERE storage=$1 AND path LIKE $2"
+    );
+    let rows = match sqlx::query(&sql)
+        .bind(storage_id)
+        .bind(&like_pat)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for r in &rows {
+        let old_child_path: String = r.try_get("path").unwrap_or_default();
+        let new_child_path = old_child_path.replacen(old_prefix, new_prefix, 1);
+        let _ =
+            update_custom_properties_path(pool, prefix, userid, &old_child_path, &new_child_path)
+                .await;
+    }
+}
+
 // ─── private helper ───────────────────────────────────────────────────────────
 
 fn fc_row_from_any(r: &sqlx::any::AnyRow) -> FileCacheRow {
@@ -443,5 +675,238 @@ fn fc_row_from_any(r: &sqlx::any::AnyRow) -> FileCacheRow {
         // and apply_extended() to fill in the authoritative values.
         creation_time: 0,
         upload_time: 0,
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_clark_notation ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_clark_notation_basic() {
+        assert_eq!(
+            parse_clark_notation("{urn:example}state"),
+            Some(("urn:example", "state"))
+        );
+    }
+
+    #[test]
+    fn parse_clark_notation_dav_namespace() {
+        assert_eq!(
+            parse_clark_notation("{DAV:}getetag"),
+            Some(("DAV:", "getetag"))
+        );
+    }
+
+    #[test]
+    fn parse_clark_notation_nc_namespace() {
+        assert_eq!(
+            parse_clark_notation("{http://nextcloud.org/ns}creation_time"),
+            Some(("http://nextcloud.org/ns", "creation_time"))
+        );
+    }
+
+    #[test]
+    fn parse_clark_notation_no_brace_returns_none() {
+        assert_eq!(parse_clark_notation("no-brace"), None);
+    }
+
+    #[test]
+    fn parse_clark_notation_no_closing_brace_returns_none() {
+        assert_eq!(parse_clark_notation("{nsname"), None);
+    }
+
+    #[test]
+    fn parse_clark_notation_empty_returns_none() {
+        assert_eq!(parse_clark_notation(""), None);
+    }
+
+    // ── format_property_path ──────────────────────────────────────────────
+
+    #[test]
+    fn format_property_path_short_path_is_unchanged() {
+        let path = "files/Documents/note.txt";
+        assert_eq!(format_property_path(path), path);
+    }
+
+    #[test]
+    fn format_property_path_exactly_250_chars_is_unchanged() {
+        let path = "f".repeat(250);
+        assert_eq!(format_property_path(&path), path);
+    }
+
+    #[test]
+    fn format_property_path_251_chars_is_hashed() {
+        let path = "f".repeat(251);
+        let result = format_property_path(&path);
+        // SHA-1 hex digest is 40 chars
+        assert_eq!(result.len(), 40);
+        assert_ne!(result, path);
+    }
+
+    #[test]
+    fn format_property_path_very_long_path_is_hashed() {
+        let path = "files/".to_string() + &"x".repeat(500);
+        let result = format_property_path(&path);
+        assert_eq!(result.len(), 40);
+    }
+
+    #[test]
+    fn format_property_path_consistent_hash() {
+        let path = "a".repeat(300);
+        let a = format_property_path(&path);
+        let b = format_property_path(&path);
+        assert_eq!(a, b);
+    }
+
+    // ── oc_properties CRUD smoke test (SQLite in-memory) ─────────────────
+
+    async fn fresh_props_db() -> DbPool {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite");
+        // Create the table matching 0013_properties.sql
+        sqlx::query(
+            "CREATE TABLE oc_properties (
+                id            INTEGER NOT NULL PRIMARY KEY,
+                userid        VARCHAR(64) NOT NULL DEFAULT '',
+                propertypath  VARCHAR(255) NOT NULL DEFAULT '',
+                propertyname  VARCHAR(255) NOT NULL DEFAULT '',
+                propertyvalue TEXT NOT NULL DEFAULT '',
+                valuetype     SMALLINT NOT NULL DEFAULT 1
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+        sqlx::query("CREATE INDEX IF NOT EXISTS properties_path_uid ON oc_properties (userid, propertypath)")
+            .execute(&pool)
+            .await
+            .expect("create index");
+        pool
+    }
+
+    #[tokio::test]
+    async fn custom_props_roundtrip_upsert_and_list() {
+        let pool = fresh_props_db().await;
+        let prefix = "oc_";
+        let xml = b"<ok xmlns=\"urn:example\">hello</ok>";
+
+        // Insert
+        upsert_custom_property(&pool, prefix, "alice", "files/notes.txt", "{urn:example}state", xml, 2)
+            .await
+            .expect("upsert");
+
+        // Read back
+        let props = list_custom_properties(&pool, prefix, "alice", "files/notes.txt").await;
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].0, "{urn:example}state");
+        assert_eq!(props[0].1, "<ok xmlns=\"urn:example\">hello</ok>");
+        assert_eq!(props[0].2, 2);
+    }
+
+    #[tokio::test]
+    async fn custom_props_upsert_overwrites_existing() {
+        let pool = fresh_props_db().await;
+        let prefix = "oc_";
+
+        // First write
+        upsert_custom_property(&pool, prefix, "alice", "files/x.txt", "{urn:a}v", b"<a/>", 2)
+            .await
+            .expect("upsert 1");
+
+        // Second write with different value
+        upsert_custom_property(&pool, prefix, "alice", "files/x.txt", "{urn:a}v", b"<b/>", 2)
+            .await
+            .expect("upsert 2");
+
+        // Should have exactly one row with the latest value
+        let props = list_custom_properties(&pool, prefix, "alice", "files/x.txt").await;
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].1, "<b/>");
+    }
+
+    #[tokio::test]
+    async fn custom_props_delete_single() {
+        let pool = fresh_props_db().await;
+        let prefix = "oc_";
+
+        upsert_custom_property(&pool, prefix, "alice", "files/a.txt", "{urn:x}p", b"<p/>", 2)
+            .await
+            .expect("upsert");
+
+        // Delete it
+        delete_custom_property(&pool, prefix, "alice", "files/a.txt", "{urn:x}p")
+            .await
+            .expect("delete");
+
+        let props = list_custom_properties(&pool, prefix, "alice", "files/a.txt").await;
+        assert_eq!(props.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn custom_props_delete_path_removes_all() {
+        let pool = fresh_props_db().await;
+        let prefix = "oc_";
+
+        upsert_custom_property(&pool, prefix, "alice", "files/b.txt", "{urn:a}p1", b"<p1/>", 2)
+            .await
+            .expect("upsert p1");
+        upsert_custom_property(&pool, prefix, "alice", "files/b.txt", "{urn:a}p2", b"<p2/>", 2)
+            .await
+            .expect("upsert p2");
+
+        // Delete all for this path
+        delete_custom_properties_for_path(&pool, prefix, "alice", "files/b.txt")
+            .await
+            .expect("delete path");
+
+        let props = list_custom_properties(&pool, prefix, "alice", "files/b.txt").await;
+        assert_eq!(props.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn custom_props_user_isolation() {
+        let pool = fresh_props_db().await;
+        let prefix = "oc_";
+
+        upsert_custom_property(&pool, prefix, "alice", "files/shared.txt", "{urn:x}p", b"<alice/>", 2)
+            .await
+            .expect("upsert alice");
+        upsert_custom_property(&pool, prefix, "bob", "files/shared.txt", "{urn:x}p", b"<bob/>", 2)
+            .await
+            .expect("upsert bob");
+
+        let alice_props = list_custom_properties(&pool, prefix, "alice", "files/shared.txt").await;
+        assert_eq!(alice_props.len(), 1);
+        assert_eq!(alice_props[0].1, "<alice/>");
+
+        let bob_props = list_custom_properties(&pool, prefix, "bob", "files/shared.txt").await;
+        assert_eq!(bob_props.len(), 1);
+        assert_eq!(bob_props[0].1, "<bob/>");
+    }
+
+    #[tokio::test]
+    async fn custom_props_path_format_hashes_long_paths() {
+        let pool = fresh_props_db().await;
+        let prefix = "oc_";
+        let long_path = "files/".to_string() + &"d".repeat(260);
+
+        upsert_custom_property(&pool, prefix, "alice", &long_path, "{urn:x}p", b"<p/>", 2)
+            .await
+            .expect("upsert long");
+
+        // The stored path should be hashed, but lookups use the same hash so
+        // it round-trips correctly.
+        let props = list_custom_properties(&pool, prefix, "alice", &long_path).await;
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].1, "<p/>");
     }
 }
