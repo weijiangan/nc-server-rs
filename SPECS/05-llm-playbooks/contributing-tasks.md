@@ -14,6 +14,31 @@ Every task must have a stated way to confirm it works. Unit tests are the prefer
 
 ---
 
+## Grounding claims in the PHP source
+
+The reference implementation is the PHP source at `~/Git/nc-server` (all PHP paths in task files are relative to that root). Task descriptions frequently make **concrete claims** — a DB column value, a wire/HTTP format, a filename scheme, a status code, a default. These must be grounded, not paraphrased from the requirements or inferred from a skim.
+
+### Rule 1 — Cite or flag every concrete claim
+
+Any field-level detail must carry an inline source cite: the `path/file.php` and the actual statement (a line number if stable). If you cannot point to the specific line that proves it, write the claim as `ASSUMPTION (unverified)` — never state a paraphrase-derived specific as if it were verified behaviour.
+
+```markdown
+- [ ] Insert one `oc_files_trash` row: `id = basename` (PHP `apps/files_trashbin/lib/Trashbin.php` `->setValue('id', $filename)`), `location = pathinfo dirname`
+- [ ] Retry interval defaults to 30s — ASSUMPTION (unverified): confirm against `lib/private/...`
+```
+
+### Rule 2 — Three-way reconcile before marking anything "spec"
+
+For file/column/format details, check all three sources and make them agree:
+
+**requirements ↔ PHP source ↔ existing Rust code.**
+
+If the two implementations agree and the doc disagrees, the **doc** is wrong. A doc-vs-code diff alone catches most drift, because the Rust code was usually written from a correct reading of PHP even when the task prose was not.
+
+> **Why this rule exists:** phase-9.3 task prose drifted from PHP (`id=fileid`, `location=files/{path}`, `_N` collision suffix) because the specifics were written from the requirements paraphrase after only skimming `move2trash()` — the line-by-line read happened later. The Rust code was already correct; only the doc was wrong.
+
+---
+
 ## Phase file structure
 
 Each phase file follows this skeleton:
