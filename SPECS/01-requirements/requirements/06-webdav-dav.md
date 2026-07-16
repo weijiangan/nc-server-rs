@@ -39,8 +39,7 @@ All sub-trees are served by Nextcloud's SabreDAV server (`apps/dav`). Its `RootC
 Additional Nextcloud methods:
 - `PATCH` (checksum recalculation via `X-Recalculate-Hash` header)
 - `POST` on `/dav/bulk` (bulk upload)
-- `SEARCH` (file search via `SearchDAV` library — returns `207 Multi-Status`)
-- `REPORT` (delta sync via RFC 6578 `sync-collection` — requires `{DAV:}sync-token` property on collections)
+- `SEARCH` (file search via the `SearchDAV` library — issued at the DAV **root**, returns `207 Multi-Status`; see §6.11)
 - `REPORT` (`{http://owncloud.org/ns}filter-files` — powers the web Files app's **Favorites / Tags / Recent** views; see §6.10)
 
 ### 6.3 `dav-server-rs` integration
@@ -86,6 +85,10 @@ After any successful `PUT`, `COPY`, `MOVE`, or chunked upload assembly:
 | `X-Accel-Buffering: no` | on all file GET responses (disables nginx buffering) |
 | `Content-Disposition` | `attachment; filename*=UTF-8''...` or `attachment; filename="..."` |
 
+> **GET download-start cookie:** a `GET` carrying a `downloadStartSecret` query parameter (`<= 32` alphanumeric chars) sets a short-lived cookie `ocDownloadStarted={token}` (Max-Age 20, path `/`) so the web UI can detect that the download has begun (PHP `FilesPlugin::httpGet`).
+
+> **MOVE/COPY mimetype:** when a file is moved or copied across an **extension change** (e.g. `note.txt` → `photo.jpg`), `oc_filecache.mimetype`/`mimepart` must be recomputed from the new name and updated (PHP `Files\Cache\Updater::copyOrRenameFromStorage`); otherwise `{DAV:}getcontenttype`, the icon/preview, and type filters go stale.
+
 ### 6.5 DAV properties
 
 > **PHP source:** the core `oc:`/`nc:` properties below are provided by `apps/dav/lib/Connector/Sabre/FilesPlugin.php`. Several additional properties requested by the **web Files client** on every PROPFIND are provided by *separate* SabreDAV plugins registered on the same (Rust-native) files tree — see §6.5.1. All of these must be produced by the Rust PROPFIND handler.
@@ -129,7 +132,7 @@ All the following are **read-only** (protected) unless noted:
 
 | Property | Description |
 |---|---|
-| `{nc:}has-preview` | JSON `true`/`false` |
+| `{nc:}has-preview` | JSON `true`/`false` — **computed** from preview availability (`IPreview::isAvailable(mimetype)`, gated on `enable_previews`), not a constant. `true` for previewable types (images, video, PDF, office/OpenDocument, SVG, …). The web Files app reads this to decide whether to request a thumbnail. |
 | `{nc:}mount-type` | Mount point type string (`local`, `shared`, `external`, etc.) |
 | `{nc:}is-mount-root` | `"true"` if node's internal path is empty (shared root) |
 | `{nc:}is-federated` | `"true"` if mount is a federated external share |
@@ -175,6 +178,8 @@ The web Files app's default PROPFIND (`getDefaultPropfind()` in `@nextcloud/file
 | `{oc:}favorite` | Star/unstar the node (writes `oc_vcategory_to_object`; see §6.5.1, §9.9) — `TagsPlugin` |
 | `{oc:}tags` | Set the node's personal tag list (`TagsPlugin`) |
 | `{DAV:}displayname` | Return 403 (blocked) |
+
+> **Custom properties:** any PROPPATCH property **not** matched above is persisted to `oc_properties` (`userid`, `propertypath`, `propertyname`, `propertyvalue`, `valuetype`) by the SabreDAV `PropertyStorage` plugin (`CustomPropertiesBackend`) and returned on subsequent PROPFIND; a PROPPATCH-remove deletes the row. These rows must be cleaned up on file `DELETE` and re-pathed on `MOVE`. (Clients such as macOS Finder store extended attributes this way.)
 
 ### 6.7 Trash bin on DELETE
 
@@ -288,6 +293,20 @@ The web Files app's **Favorites**, **Tags**, and **Recent** sidebar views are no
 - An **empty** `filter-rules` block must be rejected with `400 Bad Request` (matches PHP — an empty filter would scan all files).
 - Filtering by a non-existent tag returns `412 Precondition Failed`.
 - Response is `207 Multi-Status` with one `<d:response>` per matching node, scoped to the report target's subtree.
+
+### 6.11 `SEARCH` method (DAV basic search)
+
+> **PHP source:** the `SearchDAV` library's `SearchPlugin` (registered in `apps/dav/lib/Server.php`), with the Nextcloud backend `apps/dav/lib/Files/FileSearchBackend.php` defining the searchable schema and translating the query.
+
+The web client and some third-party/desktop clients issue an HTTP `SEARCH` with a `{DAV:}searchrequest` → `{DAV:}basicsearch` body. The rules the Rust handler must honour:
+
+- **Endpoint:** `SEARCH` is served at the DAV **arbiter root** (`/remote.php/dav/` and `/dav/`), **not** at `/dav/files/{userId}` — `getArbiterPath()` returns `''`. Each `{DAV:}scope` in the body carries a `path` relative to the arbiter (e.g. `/files/{userId}/Photos`) that must resolve to a **directory**, otherwise the request is rejected.
+- **Queryable properties** (usable in the `{DAV:}where` clause): `{DAV:}displayname`, `{DAV:}getcontenttype`, `{DAV:}getlastmodified`, `{DAV:}creationdate`, `{nc:}upload_time`, `{oc:}size`, `{oc:}favorite`, `{oc:}fileid`, `{oc:}owner-id`, and dynamic `{nc:}metadata-{key}` for **indexed** metadata keys.
+- **Select-only properties** (returnable in results but not searchable): `{DAV:}resourcetype`, `{DAV:}getcontentlength`, `{oc:}checksums`, `{oc:}permissions`, `{DAV:}getetag`, `{oc:}owner-display-name`, `{oc:}data-fingerprint`, `{nc:}has-preview`, `{oc:}id`.
+- **Operators:** `eq`, `lt`, `lte`, `gt`, `gte`, `like` (contains), plus boolean `and`/`or`/`not`. A query with more than **100** operators (`OPERATOR_LIMIT`) is rejected with `400`.
+- **`{oc:}owner-id`** may only be filtered to the **current user** (which limits the search to the home storage); any other value is rejected.
+- **Paging / sort:** `{DAV:}limit` with a maximum result count (`0` = unlimited) and a first-result offset; `orderby` is supported, including on metadata keys.
+- **Response:** `207 Multi-Status`, one `<d:response>` per match (href `/files/{userId}/{relativePath}`) carrying the requested property set.
 
 ---
 

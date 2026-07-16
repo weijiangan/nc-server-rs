@@ -87,13 +87,16 @@ Goal: all upload methods used by desktop and mobile clients work end-to-end, inc
 **Verify:** `build/integration/files_features/download.feature` — ZIP and TAR download scenarios. Download a folder via each format, extract, verify contents match.
 
 ### 5.11 Checksum recalculation (`PATCH`) — STRETCH GOAL
-> **Deferred:** `X-Recalculate-Hash` is an admin/integrity-check operation not triggered by any standard client sync or upload flow. Implement after all core upload flows are verified.
+> **Decision — delegate to PHP-FPM (do not implement natively):** `X-Recalculate-Hash` is a rare admin/integrity operation, off the sync hot path, and a discrete request PHP-FPM can serve end-to-end. **Forward `PATCH` on `/dav/files/…` to PHP-FPM** rather than implementing it in Rust (verify the files-tree router forwards `PATCH` instead of returning `405`). The grounded detail below is retained for reference and for the case PHP-FPM is later removed.
+> PHP source: `apps/dav/lib/Connector/Sabre/ChecksumUpdatePlugin.php` (registered on `method:PATCH` at `:21`; `httpPatch` at `:33`).
 
-- [ ] `PATCH /dav/files/{userId}/{path}` with `X-Recalculate-Hash: {algorithm}`
-- [ ] Recompute hash of stored file, update `oc_filecache.checksum`
-- [ ] `204 No Content`, `OC-Checksum: {ALG}:{new_hash}` in response
+- [ ] `PATCH /dav/files/{userId}/{path}` with header `X-Recalculate-Hash: {algorithm}` — handled **only** when the path resolves to a **file** node (`$node instanceof File`, `:37`); a directory or non-file path falls through to the default handler (no recalculation)
+- [ ] The algorithm from the header is **lowercased** for hashing (`strtolower`, `:38-40`), then the stored file is re-hashed via `File::hash($type)` (`:42`); supported algorithms match the PUT-time set (§4.4): `md5`, `sha1`, `sha256`, `adler32`
+- [ ] On success: persist `oc_filecache.checksum = {ALG}:{hash}` with `ALG` **uppercased** (e.g. header `sha256` → `SHA256:…`) via `setChecksum` (`:44-45`)
+- [ ] Response: `204 No Content` with `OC-Checksum: {ALG}:{new_hash}` and `Content-Length: 0` (`:46-48`)
+- [ ] If `File::hash()` returns empty (unknown algorithm / storage can't hash), do **nothing** — fall through to default `PATCH` handling; no `204`, checksum unchanged (`:43`)
 
-**Verify:** `build/integration/files_features/checksums.feature` — PATCH recalculation scenario.
+**Verify:** `build/integration/files_features/checksums.feature` — PATCH recalculation scenario. Assert `PATCH` with `X-Recalculate-Hash: sha256` on a file → `204` + `OC-Checksum: SHA256:…`; the same on a directory → not recalculated.
 
 ---
 

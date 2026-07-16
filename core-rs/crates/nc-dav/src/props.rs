@@ -36,10 +36,6 @@ pub const OCS_NS: &str = "http://open-collaboration-services.org/ns";
 ///   `uid` when no display name is set.  Used for `{oc:}owner-display-name`.
 /// - `child_dir_count` / `child_file_count`: count of direct child directories
 ///   and files; pass 0 for non-directories.
-/// - `sync_token`: RFC 6578 sync token string for collection nodes, e.g.
-///   `"http://sabre.io/ns/sync/1705322096"`.  Pass `None` for files or when
-///   the token has not been computed.  Emitted as `{DAV:}sync-token` only
-///   when `Some` (PHASE-4.11).
 /// - `is_mounted`: `true` when the file lives on a non-home mount (i.e.
 ///   `oc_storages.id` does not start with `"home::"`).  Adds the `M` flag to
 ///   `{oc:}permissions` (PHASE-7.6).
@@ -61,7 +57,6 @@ pub fn build_props(
     data_fingerprint: &str,
     child_dir_count: i64,
     child_file_count: i64,
-    sync_token: Option<&str>,
     is_mounted: bool,
     is_shared: bool,
     share_permissions: i32,
@@ -178,16 +173,6 @@ pub fn build_props(
     // Conditionally include metadata_etag if present.
     if let Some(ref etag) = meta.metadata_etag {
         props.push(make_prop("metadata_etag", "nc", NC_NS, etag));
-    }
-
-    // {DAV:}sync-token — RFC 6578 delta sync; only on collections (PHASE-4.11).
-    // Emitted only when the caller has computed and provided the token value.
-    if let Some(token) = sync_token {
-        if meta.is_dir_flag {
-            // dav-server parses {DAV:} props with prefix "D"; using "d" produces
-            // duplicate namespace declarations so we use "D" for consistency.
-            props.push(make_prop("sync-token", "D", "DAV:", token));
-        }
     }
 
     props
@@ -343,9 +328,6 @@ fn prop_names() -> Vec<DavProp> {
         name_only("acl-can-write", "nc", NC_NS),
         name_only("acl-can-delete", "nc", NC_NS),
         name_only("acl-can-manage", "nc", NC_NS),
-        // {DAV:}sync-token: RFC 6578 delta sync property on collections
-        // (PHASE-4.11).  Listed here so allprop/propname responses include it.
-        name_only("sync-token", "D", "DAV:"),
         // Note: {DAV:}quota-available-bytes is listed by dav-server's own
         // allprop/propname set so we do NOT duplicate it here.
     ]
@@ -391,7 +373,6 @@ mod tests {
             "",
             0,
             0,
-            None,
             false,
             false,
             31,
@@ -547,7 +528,6 @@ mod tests {
             "",
             0,
             0,
-            None,
             false,
             false,
             31,
@@ -590,7 +570,6 @@ mod tests {
             "",
             0,
             0,
-            None,
             false,
             false,
             31,
@@ -622,7 +601,6 @@ mod tests {
             "",
             0,
             0,
-            None,
             false,
             false,
             1,
@@ -664,7 +642,6 @@ mod tests {
             "",
             0,
             0,
-            None,
             false,
             false,
             31,
@@ -719,7 +696,6 @@ mod tests {
             "",
             0,
             0,
-            None,
             false,
             false,
             31,
@@ -743,7 +719,6 @@ mod tests {
             "",
             0,
             0,
-            None,
             false,
             false,
             31,
@@ -772,7 +747,6 @@ mod tests {
             "",
             0,
             0,
-            None,
             false,
             false,
             31,
@@ -817,7 +791,7 @@ mod tests {
     fn is_mount_root_true_for_files_path() {
         let meta = test_meta_with_path(Some("files"));
         let props = build_props(
-            &meta, "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "",
+            &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",
         );
         let p = props.iter().find(|p| p.name == "is-mount-root").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -831,7 +805,7 @@ mod tests {
     fn is_mount_root_true_for_empty_path() {
         let meta = test_meta_with_path(Some(""));
         let props = build_props(
-            &meta, "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "",
+            &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",
         );
         let p = props.iter().find(|p| p.name == "is-mount-root").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -845,7 +819,7 @@ mod tests {
     fn is_mount_root_false_for_subdir() {
         let meta = test_meta_with_path(Some("files/Photos"));
         let props = build_props(
-            &meta, "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "",
+            &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",
         );
         let p = props.iter().find(|p| p.name == "is-mount-root").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -875,7 +849,7 @@ mod tests {
     fn hide_download_in_prop_names() {
         let meta = test_meta(None);
         let names = build_props(
-            &meta, "inst", "u", "U", false, "", 0, 0, None, false, false, 31, "", "",
+            &meta, "inst", "u", "U", false, "", 0, 0, false, false, 31, "", "",
         );
         let found = names
             .iter()
@@ -883,88 +857,6 @@ mod tests {
         assert!(
             found,
             "{{nc:}}hide-download must appear in propnames response"
-        );
-    }
-
-    // ── sync-token (§4.11) ────────────────────────────────────────────────────
-
-    #[test]
-    fn sync_token_emitted_for_dir_when_provided() {
-        let mut meta = test_meta_with_path(Some("files"));
-        // make it a directory
-        meta.mime_type = "httpd/unix-directory".into();
-        meta.is_dir_flag = true;
-        let token_val = "http://sabre.io/ns/sync/1705322096";
-        let props = build_props(
-            &meta,
-            "inst",
-            "u",
-            "U",
-            true,
-            "",
-            0,
-            0,
-            Some(token_val),
-            false,
-            false,
-            31,
-            "",
-            "",
-        );
-        let p = props
-            .iter()
-            .find(|p| p.name == "sync-token" && p.namespace.as_deref() == Some("DAV:"))
-            .expect("{DAV:}sync-token must be present on a directory when provided");
-        let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(xml.contains(token_val), "sync-token value wrong: {xml}");
-    }
-
-    #[test]
-    fn sync_token_not_emitted_for_file() {
-        let meta = test_meta(None); // is_dir_flag = false
-        let props = build_props(
-            &meta,
-            "inst",
-            "u",
-            "U",
-            true,
-            "",
-            0,
-            0,
-            Some("http://sabre.io/ns/sync/0"),
-            false,
-            false,
-            31,
-            "",
-            "",
-        );
-        let found = props.iter().any(|p| p.name == "sync-token");
-        assert!(!found, "sync-token must NOT appear on a file node");
-    }
-
-    #[test]
-    fn sync_token_not_emitted_when_none() {
-        let mut meta = test_meta(None);
-        meta.is_dir_flag = true;
-        let props = build_props(
-            &meta, "inst", "u", "U", true, "", 0, 0, None, false, false, 31, "", "",
-        );
-        let found = props.iter().any(|p| p.name == "sync-token");
-        assert!(!found, "sync-token must not appear when None is passed");
-    }
-
-    #[test]
-    fn sync_token_in_prop_names() {
-        let meta = test_meta(None);
-        let names = build_props(
-            &meta, "inst", "u", "U", false, "", 0, 0, None, false, false, 31, "", "",
-        );
-        let found = names
-            .iter()
-            .any(|p| p.name == "sync-token" && p.namespace.as_deref() == Some("DAV:"));
-        assert!(
-            found,
-            "{{DAV:}}sync-token must appear in propnames response"
         );
     }
 
@@ -979,7 +871,6 @@ mod tests {
             "fp123",
             0,
             0,
-            None,
             false,
             false,
             31,
@@ -1002,7 +893,6 @@ mod tests {
             "",
             0,
             0,
-            None,
             false,
             false,
             31,
@@ -1025,7 +915,6 @@ mod tests {
             "",
             3,
             7,
-            None,
             false,
             false,
             31,
@@ -1062,7 +951,6 @@ mod tests {
             "",
             0,
             0,
-            None,
             false,
             false,
             31,
@@ -1092,7 +980,6 @@ mod tests {
             "",
             0,
             0,
-            None,
             false,
             false,
             31,

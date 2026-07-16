@@ -15,6 +15,7 @@ Phase-by-phase execution tracking. Each phase is intentionally kept as a single 
   - [`phase-7.md`](phase-7.md) — PHP-FPM FastCGI Dispatch — ⬜
   - [`phase-8.md`](phase-8.md) — Load Validation and Starvation Regression — ⬜
   - [`phase-9.md`](phase-9.md) — Cross-Cutting Filesystem Concerns (Requirement-Gap Remediation) — ⬜
+  - [`phase-10.md`](phase-10.md) — PHP-Parity Discrepancy Remediation — ⬜
 
 ## Related
 - How to write/track tasks: [`../05-llm-playbooks/README.md`](../05-llm-playbooks/README.md)

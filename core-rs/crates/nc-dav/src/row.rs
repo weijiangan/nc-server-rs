@@ -135,17 +135,14 @@ pub async fn lookup_by_path(
                 "SELECT fileid, storage, path FROM {prefix}filecache WHERE path_hash = $1",
                 prefix = prefix
             );
-            let debug_rows: Vec<(i64, i64, Option<String>)> =
-                sqlx::query(&debug_sql)
-                    .bind(&hash)
-                    .fetch_all(pool)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|r| {
-                        (r.get(0), r.get(1), r.get(2))
-                    })
-                    .collect();
+            let debug_rows: Vec<(i64, i64, Option<String>)> = sqlx::query(&debug_sql)
+                .bind(&hash)
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2)))
+                .collect();
             tracing::info!(
                 path = %path, hash = %hash, storage, ?debug_rows,
                 "lookup_by_path: not found (any storage)"
@@ -165,11 +162,7 @@ pub async fn lookup_by_id(pool: &DbPool, prefix: &str, fileid: i64) -> Option<Fi
          size, mtime, storage_mtime, etag, permissions, checksum \
          FROM {prefix}filecache WHERE fileid = $1"
     );
-    match sqlx::query(&sql)
-        .bind(fileid)
-        .fetch_optional(pool)
-        .await
-    {
+    match sqlx::query(&sql).bind(fileid).fetch_optional(pool).await {
         Err(e) => {
             tracing::error!(error = %e, fileid = fileid, "lookup_by_id: SQL error");
             None
@@ -326,35 +319,6 @@ pub async fn lookup_user_display_name(pool: &DbPool, prefix: &str, uid: &str) ->
         .unwrap_or_else(|| uid.to_string())
 }
 
-/// MAX(`mtime`) of every node in the subtree rooted at `fc_path`.
-///
-/// Used to build `{DAV:}sync-token` values in the format
-/// `http://sabre.io/ns/sync/{max_mtime}` (PHASE-4.11 / RFC 6578).
-///
-/// Returns `0` if the subtree is empty or does not exist.
-pub async fn get_subtree_max_mtime(
-    pool: &DbPool,
-    prefix: &str,
-    storage_id: i64,
-    fc_path: &str,
-) -> i64 {
-    let like_pat = format!("{fc_path}/%");
-    let sql = format!(
-        "SELECT MAX(mtime) AS m \
-         FROM {prefix}filecache \
-         WHERE storage = $1 AND (path = $2 OR path LIKE $3)"
-    );
-    sqlx::query_scalar::<_, Option<i64>>(&sql)
-        .bind(storage_id)
-        .bind(fc_path)
-        .bind(&like_pat)
-        .fetch_one(pool)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(0)
-}
-
 /// Look up the string ID for a storage row by its numeric ID.
 ///
 /// Used in `get_props()` to determine whether a file's storage is a home
@@ -379,12 +343,7 @@ pub async fn get_storage_string_id(pool: &DbPool, prefix: &str, numeric_id: i64)
 ///
 /// Returns `31` (all permissions) when the file has no share rows, which
 /// represents the owner's own unshared file (REQ §6.5, PHASE-7.6).
-pub async fn get_share_max_permissions(
-    pool: &DbPool,
-    prefix: &str,
-    uid: &str,
-    fileid: i64,
-) -> i32 {
+pub async fn get_share_max_permissions(pool: &DbPool, prefix: &str, uid: &str, fileid: i64) -> i32 {
     let sql = format!(
         "SELECT MAX(permissions) FROM {prefix}share \
          WHERE (uid_owner = $1 OR uid_initiator = $2) AND file_source = $3 \

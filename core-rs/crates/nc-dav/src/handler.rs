@@ -307,31 +307,13 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         }
     }
 
-    // ── Intercept REPORT (RFC 6578 sync-collection, PHASE-4.11) ──────────
+    // ── REPORT is not implemented on the file tree ──────────────────
     //
-    // dav-server-rs does not implement REPORT.  We handle sync-collection
-    // natively here and return 501 for any other REPORT type.  This must
-    // happen before `state` is moved into the per-request NcFileSystem.
+    // dav-server-rs does not implement REPORT, and the Nextcloud files tree has
+    // no native REPORT: `sync-collection` is CalDAV/CardDAV-only in PHP (the
+    // files connector never implements `ISyncCollection`), and `filter-files`
+    // is tracked for a later phase.  Return 501.
     if req_method.as_str() == "REPORT" {
-        let body_bytes = axum::body::to_bytes(req.into_body(), 2 * 1024 * 1024)
-            .await
-            .unwrap_or_default();
-        let sync_req = crate::sync::parse_report_body(&body_bytes);
-        if sync_req.is_sync_collection {
-            let fc_base = crate::row::dav_to_fc_path(
-                req_path.strip_prefix(strip_prefix.as_str()).unwrap_or("/"),
-            );
-            return crate::sync::build_sync_response(
-                &state,
-                &uid,
-                storage_id,
-                &strip_prefix,
-                &fc_base,
-                sync_req.since_mtime,
-            )
-            .await;
-        }
-        // Non-sync-collection REPORT types are not implemented on the file tree.
         return http::Response::builder()
             .status(StatusCode::NOT_IMPLEMENTED)
             .header(

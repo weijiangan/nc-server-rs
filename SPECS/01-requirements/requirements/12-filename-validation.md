@@ -8,7 +8,7 @@ Before any write (PUT, MKCOL, MOVE, COPY target), validate against:
 
 Lists are configurable via `oc_appconfig` for `core` app, with defaults matching `.htaccess`, `web.config`, etc.
 
-On violation: `422 Unprocessable Entity` (SabreDAV `InvalidPath` exception → HTTP 400/422).
+On violation: `400 Bad Request`. PHP throws `OCP\Files\InvalidPathException`, which the DAV connector (`apps/dav/lib/Connector/Sabre/Directory.php`) re-throws as `Connector\Sabre\Exception\InvalidPath`, whose `getHTTPCode()` returns **`400`** (`Exception/InvalidPath.php`). The DAV error body carries an `<o:reason>` element.
 
 ---
 

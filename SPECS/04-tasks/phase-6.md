@@ -1,6 +1,6 @@
 # Phase 6 — Files App HTTP APIs — STRETCH GOAL
 
-> **Deferred:** All `/apps/files/api/v1/` and OCS files endpoints are called by the web browser SPA and mobile apps, but none are on the sync hot path that causes starvation. In the interim these routes are forwarded to PHP-FPM via the Phase 7 catch-all, so functionality is preserved. Implement natively in Rust once Phases 0–5 and 7 are complete and verified.
+> **Decision — delegate to PHP-FPM (do not implement natively):** all `/apps/files/api/v1/` and OCS files endpoints are web-SPA / mobile routes; **none are on the sync hot path** and none are inline enrichment of a Rust-native request, so they are fully proxyable. They are served by the Phase 7 PHP-FPM catch-all, so functionality is preserved. Reimplementing them in Rust would duplicate working PHP with **no latency benefit**, so this phase stays delegated. Revisit **only** if removing PHP-FPM entirely becomes a goal (see the plan's "future architectural evolution"). *(Note: the `{nc:}metadata-{key}` PROPFIND/PROPPATCH property, previously pointed here from §4.9/§4.10, is **not** part of this phase — it is inline on the Rust-native DAV path and is now tracked in-place in Phase 4.)*
 
 Goal: the files app REST and OCS endpoints used by the web UI and extended clients work correctly.
 

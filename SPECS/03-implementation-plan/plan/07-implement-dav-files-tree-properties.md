@@ -11,12 +11,10 @@
    - `{nc:}has-preview`, `{nc:}mount-type`, `{nc:}creation_time`, `{nc:}upload_time`, `{nc:}hidden`, `{nc:}download-url-expiration`, etc.
    - `{nc:}metadata_etag`: read from `oc_filecache_extended.metadata_etag`. **TODO:** The PHP reference implementation defines `METADATA_ETAG_PROPERTYNAME` in `FilesPlugin` but never wires it to a `$propFind->handle()` call, so it is never returned. Implement it correctly in Rust.
    - DAV quota properties (`{DAV:}quota-available-bytes` reports `-3` (`FileInfo::SPACE_UNLIMITED`) for unlimited quota; `{DAV:}quota-used-bytes`). Any negative free-space value skips the quota check and allows the write.
-   - `{DAV:}sync-token` on collections (required for RFC 6578 delta sync REPORT requests).
 3. Implement `SEARCH` request handling via `SearchDAV` library / `FileSearchBackend`:
    - Scope: `Directory` nodes, typically `/dav/files/{userId}`.
    - Supported filters: name, MIME type, size, last-modified, tags, file metadata.
    - Response: `207 Multi-Status`.
-4. Implement RFC 6578 `sync-collection` REPORT support for delta sync (clients use this to fetch only changed resources since their last sync).
 5. Respond with required headers after writes:
    - `OC-FileId`, `OC-ETag` (mirror ETag), `X-OC-MTime: accepted` when mtime honored.
 

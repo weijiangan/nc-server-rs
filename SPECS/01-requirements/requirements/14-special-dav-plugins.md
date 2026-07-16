@@ -20,7 +20,7 @@ Block clients outside a configured version range. Return `403 Forbidden` with an
 
 > **PHP source:** `apps/dav/lib/Connector/Sabre/RequestIdHeaderPlugin.php`, `apps/dav/lib/Connector/Sabre/UserIdHeaderPlugin.php`
 
-Add `X-Request-Id` and `X-Nextcloud-User-Id` headers to all responses for tracing.
+Add `X-Request-Id` (`RequestIdHeaderPlugin`) and `X-User-Id` (`UserIdHeaderPlugin`) headers to all responses for tracing. The user header is `X-User-Id` — **not** `X-Nextcloud-User-Id` (`UserIdHeaderPlugin.php` sets `X-User-Id`).
 
 ### 14.4 CopyEtagHeaderPlugin
 

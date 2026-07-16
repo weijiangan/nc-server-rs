@@ -177,9 +177,12 @@ Implementation in `apps/dav/lib/Files/FileSearchBackend.php`.
 
 ### WebDAV delta sync (RFC 6578)
 
-`Sabre\DAV\Sync\Plugin` is registered on all DAV trees.  Clients may use
-`sync-collection` REPORT requests with a `sync-token` to fetch only changed resources
-since their last sync.  The `{DAV:}sync-token` property is available on collections.
+`Sabre\DAV\Sync\Plugin` is registered on the DAV server, but it only activates for
+collections that implement `ISyncCollection` — i.e. the **CalDAV and CardDAV** trees.
+The **files** connector does **not** implement `getChanges()`/`ISyncCollection`, so
+`sync-collection` REPORT and the `{DAV:}sync-token` property are **not** available on
+file collections. The Nextcloud desktop client syncs files via ETag propagation on
+parent folders, not RFC 6578.
 
 ### Zip folder download
 

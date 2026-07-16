@@ -24,7 +24,7 @@ Goal: PROPFIND on a user file tree returns the correct properties; all RFC 4918 
 - [x] Resolve `oc_filecache` row → open file from `datadirectory/{storageId}/{path}`
 - [x] Stream response body; no full-file buffering in memory
 - [x] `X-Accel-Buffering: no` on response
-- [x] `Content-Disposition: attachment; filename*=UTF-8''…` for non-inline MIME types
+- [x] `Content-Disposition: attachment; filename*=UTF-8''…` forced on all file downloads (matches PHP `FilesPlugin::httpGet`)
 - [x] Include `OC-Checksum` header if `oc_filecache.checksum` is non-empty
 
 **Verify:** `build/integration/files_features/download.feature` and `build/integration/files_features/checksums.feature` — GET download assertions pass. Confirm `Content-Disposition: attachment` on `.mp4` download; absent on `text/plain`.
@@ -83,7 +83,7 @@ Goal: PROPFIND on a user file tree returns the correct properties; all RFC 4918 
 - [x] `{nc:}mount-type`, `{nc:}is-federated`, `{nc:}contained-folder-count`, `{nc:}contained-file-count` present
 - [x] `{nc:}is-mount-root` — `"true"` when `meta.path` is `"files"` or `""`; `"false"` otherwise
 - [x] `{nc:}hide-download` — present with value `"false"` for home tree nodes
-- [ ] `{nc:}metadata-{key}` dynamic properties from `oc_files_metadata` — **deferred to Phase 6**
+- [ ] `{nc:}metadata-{key}` — dynamic per-file metadata properties (in scope: inline on the Rust-native PROPFIND, cannot be proxied). Emit one `{nc:}metadata-{key}` for **every** key present in the node's metadata: PHP iterates `FileInfo::getMetadata()` and calls `$propFind->handle(FILE_METADATA_PREFIX . $key, $value)` (`apps/dav/lib/Connector/Sabre/FilesPlugin.php:444-446`; prefix `{http://nextcloud.org/ns}metadata-` at `:74`). Source = `oc_files_metadata` (JSON `metadata` column + indexed values) via the files-metadata manager. Not a fixed list — whatever keys exist for the node (e.g. `photos-size`, `files-live-photo`, `gps`)
 - [ ] `{nc:}download-url-expiration` — **deferred to Phase 6** (public-share feature)
 - [ ] `{nc:}hidden` — **deferred to Phase 6** (live-photo MOV companion detection)
 - [ ] `{nc:}note` hard-coded empty string; share note from `oc_share.note` — **deferred to Phase 7**
@@ -96,23 +96,23 @@ Goal: PROPFIND on a user file tree returns the correct properties; all RFC 4918 
 - [x] `{DAV:}creationdate` / `{nc:}creation_time` → update `oc_filecache_extended.creation_time`
 - [x] `{DAV:}displayname` → `403 Forbidden`
 - [x] `creationdate` PROPPATCH UPSERT preserves existing `upload_time` from `oc_filecache` for new extended rows (same for `{nc:}creation_time` and `{nc:}upload_time`)
-- [ ] `{nc:}metadata-{key}` → update `oc_files_metadata` (permission-checked) — **deferred to Phase 6**
+- [ ] `{nc:}metadata-{key}` PROPPATCH → write `oc_files_metadata` (in scope: inline on the Rust-native PROPPATCH). Per `handleUpdatePropertiesMetadata` (`apps/dav/lib/Connector/Sabre/FilesPlugin.php:623`): for each mutation prefixed `{http://nextcloud.org/ns}metadata-`, **permission-check per key** — reject when the key's edit-permission requirement exceeds the user's access right to the node (`$knownMetadata->getEditPermission($key) < $accessRight`, `:~645`). A `null` value **unsets** the key; otherwise set by the key's declared type (string/int/float/bool/array/string-list/int-list), flagging indexed keys, then persist via the files-metadata manager
 
 **Verify:** PROPPATCH each writable property; subsequent PROPFIND returns the new value. Confirm `{nc:}upload_time` unchanged after a `creationdate` PROPPATCH.
 
-### 4.11 `{DAV:}sync-token` and RFC 6578 delta sync
-- [x] `{DAV:}sync-token` on collections: `"http://sabre.io/ns/sync/{MAX(mtime)}"` of the subtree; emitted via `get_props()` in `filesystem.rs` using `row::get_subtree_max_mtime()`
-- [x] `REPORT` with `sync-collection` body returns only nodes changed since the given sync token; handler in `sync.rs`, intercepted in `handler.rs` before dav-server
-- [x] Response: `207 Multi-Status` with full OC/NC property set per changed node and trailing `<d:sync-token>` with updated value
+### 4.12 `SEARCH` method (DAV basic search)
+> PHP source: the `SearchDAV` library's `SearchPlugin`, registered at `apps/dav/lib/Server.php:281` (handles the `SEARCH` method and the `{DAV:}searchrequest` → `{DAV:}basicsearch` grammar, returning `207 Multi-Status`); the Nextcloud backend `apps/dav/lib/Files/FileSearchBackend.php` defines the searchable schema and translates the query.
 
-**Verify:** sync a directory, add a file, send `REPORT sync-collection` with old token — confirm only the new file appears.
+- [ ] `SEARCH` is handled at the DAV **arbiter root** — `getArbiterPath()` returns `''` → `/remote.php/dav/` (and `/dav/`), **not** `/dav/files/{userId}` (`FileSearchBackend.php:62`). The `{DAV:}basicsearch` body's `{DAV:}from`/`scope` entries carry a `path` relative to the arbiter (e.g. `/files/{userId}/Photos`); each scope must resolve to a **directory** or the request is rejected (`isValidScope` `FileSearchBackend.php:66`, `getFolderForPath` throws otherwise)
+- [ ] Queryable properties (usable in `WHERE`, from `getPropertyDefinitionsForScope` `FileSearchBackend.php:80-104`): `{DAV:}displayname`, `{DAV:}getcontenttype`, `{DAV:}getlastmodified` (datetime), `{DAV:}creationdate` (datetime), `{nc:}upload_time` (datetime), `{oc:}size` (non-negative int), `{oc:}favorite` (boolean), `{oc:}fileid` (`INTERNAL_FILEID_PROPERTYNAME`, non-negative int), `{oc:}owner-id`, plus dynamic `{nc:}metadata-{key}` for **indexed** metadata keys
+- [ ] Select-only properties (returnable, not searchable): `{DAV:}resourcetype`, `{DAV:}getcontentlength`, `{oc:}checksums`, `{oc:}permissions`, `{DAV:}getetag`, `{oc:}owner-display-name`, `{oc:}data-fingerprint`, `{nc:}has-preview`, `{oc:}id` (`FILEID_PROPERTYNAME`)
+- [ ] Operators (`transformSearchOperation` `FileSearchBackend.php:~283`): `eq`, `lt`, `lte`, `gt`, `gte`, `like` (contains), and boolean `and`/`or`/`not`. Exceeding `OPERATOR_LIMIT = 100` operators (`FileSearchBackend.php:46`) → reject with `400`/InvalidArgument
+- [ ] `{oc:}owner-id` filter must equal the current user (sets limit-to-home); any other value is rejected with InvalidArgument (`transformQuery` `FileSearchBackend.php:~340`)
+- [ ] Paging/sort: `{DAV:}limit` `maxResults` (`0` = unlimited, `array_slice` at `:233`) + `firstResult` offset; `orderby` supported, including metadata keys
+- [ ] Result `href` = `/files/{userId}/{relativePath}` (`getHrefForNode` `FileSearchBackend.php:~318`)
+- [ ] Response: `207 Multi-Status`, one `<d:response>` per match carrying the requested `{DAV:}prop` set
 
-### 4.12 `SEARCH` method
-- [ ] `SEARCH` request on `/dav/files/{userId}` with DAV `basicsearch` body
-- [ ] Supported filters: name contains, MIME type, size lt/gt, last-modified lt/gt
-- [ ] Response: `207 Multi-Status`
-
-**Verify:** `build/integration/dav_features/webdav-related.feature` — SEARCH scenarios; or integration test: search by name, assert correct file returned.
+**Verify:** `build/integration/dav_features/webdav-related.feature` — SEARCH scenarios; or integration test: `SEARCH /remote.php/dav` with a `{DAV:}basicsearch` body scoped to `/files/{userId}` filtering `{DAV:}displayname` `like` — assert only matching files return, a non-directory scope → error, and `>100` operators → `400`.
 
 ### 4.13 `DavLockSystem` — fake locker
 - [x] `LOCK` → `200 OK` with `lockdiscovery` body (via `FakeLs`)

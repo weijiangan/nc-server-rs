@@ -1340,23 +1340,6 @@ impl DavFileSystem for NcFileSystem {
                 (0, 0)
             };
 
-            // {DAV:}sync-token on collections — RFC 6578 (PHASE-4.11).
-            // Query MAX(mtime) of the subtree and format the token value.
-            // Only computed for directories when content is requested.
-            let sync_token_str: Option<String> = if meta.is_dir_flag && do_content {
-                let fc_path = meta.path.as_deref().unwrap_or("files");
-                let max_mtime = row::get_subtree_max_mtime(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    self.storage_id,
-                    fc_path,
-                )
-                .await;
-                Some(format!("http://sabre.io/ns/sync/{max_mtime}"))
-            } else {
-                None
-            };
-
             // Resolve {oc:}owner-display-name from oc_users.displayname (REQ §6.5 / §4.8).
             // Falls back to the raw UID when no display name is set.
             let owner_display_name = row::lookup_user_display_name(
@@ -1428,7 +1411,6 @@ impl DavFileSystem for NcFileSystem {
                 &data_fingerprint,
                 child_dirs,
                 child_files,
-                sync_token_str.as_deref(),
                 is_mounted,
                 is_shared,
                 share_permissions,

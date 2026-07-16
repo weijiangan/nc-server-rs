@@ -11,7 +11,6 @@ pub mod metadata;
 pub mod props;
 pub mod quota;
 pub mod row;
-pub mod sync;
 pub mod upload;
 pub mod upload_handler;
 

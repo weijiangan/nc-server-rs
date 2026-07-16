@@ -105,7 +105,7 @@ Goal: implement the cross-cutting PHP behaviours that execute **inline on the Ru
 ### 9.8 `filter-files` REPORT — web Favorites / Tags / Recent views (REQ §6.10)
 > PHP source: `apps/dav/lib/Connector/Sabre/FilesReportPlugin.php` (registered for logged-in users at `apps/dav/lib/Server.php:361`).
 
-- [ ] `REPORT` `{http://owncloud.org/ns}filter-files` (`REPORT_NAME` `FilesReportPlugin.php:33`) on `/dav/files/{userId}/…` handled natively (intercept before dav-server, like §4.11 sync-collection); only when the target is a `Directory` (`onReport` `:108-111`)
+- [ ] `REPORT` `{http://owncloud.org/ns}filter-files` (`REPORT_NAME` `FilesReportPlugin.php:33`) on `/dav/files/{userId}/…` handled natively (intercept before dav-server, which does not implement REPORT); only when the target is a `Directory` (`onReport` `:108-111`)
 - [ ] `{oc:}filter-rules` parsing (`:122-125`):
   - `{oc:}favorite` — **presence-based** (the rule's value is ignored): if present, results = `fileTagger->load('files')->getFavorites()` from `oc_vcategory` (`:228-243`). *(Correction: not a `1`/`0` toggle.)*
   - `{oc:}systemtag` (`SYSTEMTAG_PROPERTYNAME` `:34`) — repeatable tag id; resolves via `getTagsByIds` + `userFolder->searchBySystemTag`, intersected across multiple tags (`:253-290`)

@@ -82,14 +82,14 @@ The Rust server manages the following tables (minimum required for core + files)
 - `last_checked` INT
 
 **`oc_filecache`**
-- `fileid` BIGINT PK AI
+- `fileid` BIGINT PK, auto-increment — **allocated by the DB sequence** (Postgres/MySQL). Because this table is shared with PHP-FPM inserts (versions, trash restore, `occ`), Rust must let the DB assign it (`INSERT … DEFAULT … RETURNING`), **never** hand-pick `MAX(fileid)+1` (that doesn't advance the Postgres sequence and causes duplicate-key collisions with later PHP inserts)
 - `storage` BIGINT FK `oc_storages.numeric_id`
 - `path` VARCHAR(4000)
 - `path_hash` VARCHAR(32) — md5 of path; unique with storage
 - `parent` BIGINT FK self
 - `name` VARCHAR(250)
 - `mimetype` BIGINT FK `oc_mimetypes.id`
-- `mimepart` BIGINT FK `oc_mimetypes.id`
+- `mimepart` BIGINT FK `oc_mimetypes.id` — id of the **type part** (the substring before `/`: `image` for `image/png`, `httpd` for `httpd/unix-directory`), stored **without** a trailing slash. Type-filter queries use `WHERE mimepart = {id}`, so it must match PHP's `getId(substr(mimetype, 0, strpos('/')))`
 - `size` BIGINT — -1 = unscanned
 - `mtime` INT
 - `storage_mtime` INT

@@ -18,6 +18,8 @@ Headers in response:
 - `X-OC-MTime: accepted` if mtime was set
 - `X-OC-CTime: accepted` if ctime was set
 
+`X-OC-MTime` / `X-OC-CTime` values are **sanitized** (`MtimeSanitizer`): they must be numeric (not hexadecimal) and `> 86400` (one day); an invalid value is rejected rather than silently honoured.
+
 ### 7.2 Chunked upload v1 (OC-Chunked)
 
 Used by older desktop clients. Header `OC-Chunked: 1` present on each PUT.
@@ -77,8 +79,9 @@ Calls `storage->cancelChunkedWrite(...)`. Cleans up cache entry.
 
 Each part has per-part headers:
 - `X-File-Path: /path/relative/to/user/root`
-- `X-OC-MTime: {timestamp}` (also accepted as `X-File-MTime` for legacy clients)
-- `Content-Length: {n}`
+- `X-File-MTime` (preferred) or `X-OC-MTime: {timestamp}` — mtime, sanitized as in §7.1
+- `Content-Length: {n}` — **required** (a missing length is `411 Length Required`)
+- `X-File-MD5` and/or `OC-Checksum: {ALG}:{hash}` — the part content is **validated** against these; a mismatch fails that part (PHP `MultipartRequestParser::validateHash()`)
 
 Response: JSON map of path → `{error, etag, fileid, permissions}` for each file.
 
