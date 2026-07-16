@@ -481,20 +481,6 @@ async fn handle_move(
         row::lookup_by_path(&state.pool, &state.table_prefix, storage_id, &fc_path_full).await;
     let target_exists = existing_row.is_some();
 
-    // Get fileid for response - either from existing or new
-    let fid: i64;
-    if let Some(ref existing) = existing_row {
-        fid = existing.fileid;
-    } else {
-        fid = match row::next_fileid(&state.pool, &state.table_prefix).await {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to get next fileid");
-                return internal_error_response();
-            }
-        };
-    }
-
     // Determine file name and extension
     let file_name = dav_path.rsplit('/').next().unwrap_or("").to_string();
     let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
@@ -580,8 +566,10 @@ async fn handle_move(
     let etag_raw = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
     let etag = etag_raw.clone();
 
-    // Insert or update oc_filecache
+    // Insert or update oc_filecache — allocate fileid for new files
+    let fid: i64;
     if let Some(ref existing) = existing_row {
+        fid = existing.fileid;
         let sql = format!(
             "UPDATE {prefix}filecache SET size=$1, mtime=$2, storage_mtime=$3, etag=$4, mimetype=$5, mimepart=$6 \
             WHERE fileid=$7",
@@ -604,13 +592,13 @@ async fn handle_move(
         let hash = row::path_hash(&fc_path_full);
         let sql = format!(
             "INSERT INTO {prefix}filecache \
-            (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+            (storage, path, path_hash, parent, name, mimetype, mimepart, \
              size, mtime, storage_mtime, etag, permissions, checksum) \
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+            RETURNING fileid",
             prefix = state.table_prefix
         );
-        if let Err(e) = sqlx::query(&sql)
-            .bind(fid)
+        fid = match sqlx::query_scalar(&sql)
             .bind(storage_id)
             .bind(&fc_path_full)
             .bind(&hash)
@@ -624,11 +612,15 @@ async fn handle_move(
             .bind(&etag)
             .bind(27i32) // CRUDS permissions (READ|UPDATE|DELETE|SHARE)
             .bind("")
-            .execute(&state.pool)
+            .fetch_one(&state.pool)
             .await
         {
-            tracing::error!(error = %e, "Failed to insert filecache");
-        }
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to insert filecache");
+                return internal_error_response();
+            }
+        };
     }
 
     // Update oc_filecache_extended with upload_time and optionally creation_time.

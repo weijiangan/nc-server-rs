@@ -189,9 +189,6 @@ impl NcFileSystem {
                 .unwrap_or_default()
                 .as_secs() as i64;
             let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
-            let fid = row::next_fileid(&self.state.pool, &self.state.table_prefix)
-                .await
-                .map_err(|e| format!("fileid: {e}"))?;
 
             let dir_mime_id = {
                 let cache = self.state.mime_cache.read().expect("mime cache lock");
@@ -202,13 +199,13 @@ impl NcFileSystem {
 
             let sql = format!(
                 "INSERT INTO {prefix}filecache \
-                 (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+                 (storage, path, path_hash, parent, name, mimetype, mimepart, \
                   size, mtime, storage_mtime, etag, permissions, checksum) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+                 RETURNING fileid",
                 prefix = self.state.table_prefix
             );
-            if let Err(e) = sqlx::query(&sql)
-                .bind(fid)
+            let fid: i64 = match sqlx::query_scalar(&sql)
                 .bind(self.storage_id)
                 .bind(&built)
                 .bind(&hash)
@@ -222,26 +219,29 @@ impl NcFileSystem {
                 .bind(&etag)
                 .bind(31i32)
                 .bind("")
-                .execute(&self.state.pool)
+                .fetch_one(&self.state.pool)
                 .await
             {
-                // TOCTOU race: another request created this directory between
-                // our lookup and INSERT.  Re-read the row that the other
-                // request inserted.
-                warn!("ensure_parent_dir insert race for {built}: {e}");
-                if let Some(r) = row::lookup_by_path(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    self.storage_id,
-                    &built,
-                )
-                .await
-                {
-                    last_existing_row = Some(r);
-                    continue;
+                Ok(id) => id,
+                Err(e) => {
+                    // TOCTOU race: another request created this directory between
+                    // our lookup and INSERT.  Re-read the row that the other
+                    // request inserted.
+                    warn!("ensure_parent_dir insert race for {built}: {e}");
+                    if let Some(r) = row::lookup_by_path(
+                        &self.state.pool,
+                        &self.state.table_prefix,
+                        self.storage_id,
+                        &built,
+                    )
+                    .await
+                    {
+                        last_existing_row = Some(r);
+                        continue;
+                    }
+                    return Err(format!("insert: {e}"));
                 }
-                return Err(format!("insert: {e}"));
-            }
+            };
 
             // Also create the extended-cache row.
             {
@@ -904,9 +904,6 @@ impl DavFileSystem for NcFileSystem {
                 .unwrap_or_default()
                 .as_secs() as i64;
             let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
-            let fid = row::next_fileid(&self.state.pool, &self.state.table_prefix)
-                .await
-                .map_err(|_| FsError::GeneralFailure)?;
 
             let dir_mime_id = {
                 let cache = self.state.mime_cache.read().expect("mime cache lock");
@@ -917,13 +914,13 @@ impl DavFileSystem for NcFileSystem {
 
             let sql = format!(
                 "INSERT INTO {prefix}filecache \
-                 (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+                 (storage, path, path_hash, parent, name, mimetype, mimepart, \
                   size, mtime, storage_mtime, etag, permissions, checksum) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+                 RETURNING fileid",
                 prefix = self.state.table_prefix
             );
-            sqlx::query(&sql)
-                .bind(fid)
+            let _fid: i64 = sqlx::query_scalar(&sql)
                 .bind(self.storage_id)
                 .bind(&fc_path)
                 .bind(&hash)
@@ -937,7 +934,7 @@ impl DavFileSystem for NcFileSystem {
                 .bind(&etag)
                 .bind(31i32)
                 .bind("")
-                .execute(&self.state.pool)
+                .fetch_one(&self.state.pool)
                 .await
                 .map_err(|e| {
                     warn!("create_dir DB insert failed: {e}");
@@ -1191,9 +1188,6 @@ impl DavFileSystem for NcFileSystem {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as i64;
-                    let fid = row::next_fileid(&self.state.pool, &self.state.table_prefix)
-                        .await
-                        .unwrap_or(from_row.fileid + 1);
                     let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
                     let name = to_fc.rsplit('/').next().unwrap_or("").to_string();
                     let hash = row::path_hash(&to_fc);
@@ -1201,12 +1195,12 @@ impl DavFileSystem for NcFileSystem {
 
                     let sql = format!(
                         "INSERT INTO {prefix}filecache \
-                         (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+                         (storage, path, path_hash, parent, name, mimetype, mimepart, \
                           size, mtime, storage_mtime, etag, permissions, checksum) \
-                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+                         RETURNING fileid"
                     );
-                    let _ = sqlx::query(&sql)
-                        .bind(fid)
+                    let _ = sqlx::query_scalar::<_, i64>(&sql)
                         .bind(self.storage_id)
                         .bind(&to_fc)
                         .bind(&hash)
@@ -1220,7 +1214,7 @@ impl DavFileSystem for NcFileSystem {
                         .bind(&etag)
                         .bind(from_row.permissions)
                         .bind(from_row.checksum.as_deref().unwrap_or(""))
-                        .execute(&self.state.pool)
+                        .fetch_one(&self.state.pool)
                         .await;
                 }
             }

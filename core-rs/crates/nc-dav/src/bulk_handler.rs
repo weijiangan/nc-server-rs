@@ -263,14 +263,6 @@ async fn write_file(
     let existing =
         row::lookup_by_path(&state.pool, &state.table_prefix, storage_id, &fc_path).await;
 
-    let fid = if let Some(ref existing) = existing {
-        existing.fileid
-    } else {
-        row::next_fileid(&state.pool, &state.table_prefix)
-            .await
-            .map_err(|e| format!("Failed to get fileid: {}", e))?
-    };
-
     let final_disk_path = row::disk_path(&state.data_directory, uid, &fc_path);
 
     if let Some(parent) = final_disk_path.parent() {
@@ -298,7 +290,9 @@ async fn write_file(
     let etag = format!("\"{}\"", etag_raw);
 
     let hash = row::path_hash(&fc_path);
-    if existing.is_some() {
+    let fid: i64;
+    if let Some(ref existing) = existing {
+        fid = existing.fileid;
         let sql = format!(
             "UPDATE {prefix}filecache SET size=$1, mtime=$2, storage_mtime=$3, etag=$4, mimetype=$5, mimepart=$6 WHERE fileid=$7",
             prefix = state.table_prefix
@@ -316,13 +310,13 @@ async fn write_file(
     } else {
         let sql = format!(
             "INSERT INTO {prefix}filecache \
-            (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+            (storage, path, path_hash, parent, name, mimetype, mimepart, \
              size, mtime, storage_mtime, etag, permissions, checksum) \
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+            RETURNING fileid",
             prefix = state.table_prefix
         );
-        let _ = sqlx::query(&sql)
-            .bind(fid)
+        fid = sqlx::query_scalar(&sql)
             .bind(storage_id)
             .bind(&fc_path)
             .bind(&hash)
@@ -336,8 +330,9 @@ async fn write_file(
             .bind(&etag_raw)
             .bind(27i32) // CRUDS permissions (READ|UPDATE|DELETE|SHARE)
             .bind("")
-            .execute(&state.pool)
-            .await;
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|e| format!("Failed to insert filecache: {}", e))?;
     }
 
     // Set upload_time in extended cache for new files

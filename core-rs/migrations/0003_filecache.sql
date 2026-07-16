@@ -10,7 +10,7 @@
 --     MySQL honour the length limit.
 
 CREATE TABLE IF NOT EXISTS oc_filecache (
-    fileid           BIGINT       NOT NULL PRIMARY KEY,
+    fileid           INTEGER      NOT NULL PRIMARY KEY,
     storage          BIGINT       NOT NULL DEFAULT 0,
     path             VARCHAR(4000),
     path_hash        VARCHAR(32)  NOT NULL DEFAULT '',

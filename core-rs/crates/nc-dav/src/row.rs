@@ -419,15 +419,6 @@ pub async fn list_changed_since(
     }
 }
 
-/// Generate the next available `fileid` for INSERT.
-///
-/// This is a simple MAX+1 approach, safe for SQLite.
-/// For PostgreSQL, a `BIGSERIAL` column will replace this in the future.
-pub async fn next_fileid(pool: &DbPool, prefix: &str) -> anyhow::Result<i64> {
-    let sql = format!("SELECT COALESCE(MAX(fileid), 0) + 1 FROM {prefix}filecache");
-    let id: Option<i64> = sqlx::query_scalar(&sql).fetch_one(pool).await?;
-    Ok(id.unwrap_or(1))
-}
 
 // ─── private helper ───────────────────────────────────────────────────────────
 

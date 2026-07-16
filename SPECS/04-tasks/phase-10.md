@@ -80,11 +80,13 @@ Goal: fix behaviours in **already-implemented** Phase 4/5 tasks that were found 
 ### 10.9 `fileid` allocation collides with PHP's DB sequence (from §4.4/§4.5/§5.x) — DB-integrity bug (Postgres)
 > PHP source: `core/Migrations/Version13000Date20170718121200.php:156-158` — `oc_filecache.fileid` is `BIGINT` with `'autoincrement' => true`, i.e. a **sequence** on Postgres/MySQL. PHP inserts allocate via that sequence.
 
-- [ ] Rust allocates `fileid` with `SELECT COALESCE(MAX(fileid), 0) + 1` (`nc-db`/`nc-dav/src/row.rs:426-427`, used by every filecache insert: `davfile.rs:372`, `filesystem.rs:192,907,1194`, `bulk_handler.rs:269`, `upload_handler.rs:489`). An **explicit** id insert does **not** advance the Postgres sequence, so the next PHP-FPM insert (`files_versions` version rows, trash restore, any PHP file op) draws `nextval` = an id Rust already used → **duplicate-key violation** and the PHP operation fails
-- [ ] Fix: allocate `fileid` from the DB's own sequence to match PHP — on Postgres `INSERT … (fileid, …) VALUES (DEFAULT, …) RETURNING fileid` (or `nextval(pg_get_serial_sequence('oc_filecache','fileid'))`); MySQL `AUTO_INCREMENT` + `LAST_INSERT_ID()`; SQLite `INTEGER PRIMARY KEY` rowid. Never hand-pick `MAX+1` on a PHP-owned schema
-- [ ] Update the isolated test schema (`migrations/0003_filecache.sql`) so `fileid` auto-increments there too, keeping the fix engine-consistent
+- [x] Rust allocates `fileid` with `SELECT COALESCE(MAX(fileid), 0) + 1` (`nc-db`/`nc-dav/src/row.rs:426-427`, used by every filecache insert: `davfile.rs:372`, `filesystem.rs:192,907,1194`, `bulk_handler.rs:269`, `upload_handler.rs:489`). An **explicit** id insert does **not** advance the Postgres sequence, so the next PHP-FPM insert (`files_versions` version rows, trash restore, any PHP file op) draws `nextval` = an id Rust already used → **duplicate-key violation** and the PHP operation fails
+- [x] Fix: allocate `fileid` from the DB's own sequence to match PHP — on Postgres `INSERT … (fileid, …) VALUES (DEFAULT, …) RETURNING fileid` (or `nextval(pg_get_serial_sequence('oc_filecache','fileid'))`); MySQL `AUTO_INCREMENT` + `LAST_INSERT_ID()`; SQLite `INTEGER PRIMARY KEY` rowid. Never hand-pick `MAX+1` on a PHP-owned schema
+- [x] Update the isolated test schema (`migrations/0003_filecache.sql`) so `fileid` auto-increments there too, keeping the fix engine-consistent
 
 **Verify:** with a PHP-created DB, upload files via Rust, then trigger a PHP-FPM filecache insert (e.g. create a version, or `occ files:scan`) → no duplicate-key error; `SELECT last_value FROM oc_filecache_fileid_seq` stays ahead of `MAX(fileid)`.
+
+> **Implementation note:** The migration uses `INTEGER` (not `BIGINT`) because it only runs against SQLite tests, where `INTEGER PRIMARY KEY` is required for auto-increment. Production PostgreSQL has `BIGSERIAL` from PHP Doctrine.
 
 ### 10.10 `MOVE`/`COPY` does not update `mimetype` on extension change (from §4.x) — stale type
 > PHP source: `lib/private/Files/Cache/Updater.php:181-186` (`copyOrRenameFromStorage`) — when `sourceExtension !== targetExtension` and the node is a file (and not a trash move), PHP recomputes the mimetype (`storage->getMimeType(target)`) and `cache->update(fileId, ['mimetype' => …])`.
