@@ -13,4 +13,4 @@ This provides the horizontal scalability benefits of ownCloud OCIS without the "
 
 ---
 
-Prev: [`12-existing-tests-you-can-directly-reuse.md`](12-existing-tests-you-can-directly-reuse.md) · Up: [`README.md`](README.md)
+Prev: [`12-existing-tests-you-can-directly-reuse.md`](12-existing-tests-you-can-directly-reuse.md) · Up: [`README.md`](README.md) · Next: [`14-native-preview-thumbnail-fast-path.md`](14-native-preview-thumbnail-fast-path.md)

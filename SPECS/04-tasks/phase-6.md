@@ -7,7 +7,7 @@ Goal: the files app REST and OCS endpoints used by the web UI and extended clien
 ---
 
 ### 6.1 REST endpoints under `/apps/files/api/v1/`
-- [ ] `GET /thumbnail/{x}/{y}/{file+}` — return thumbnail (generate or fetch from cache)
+- [ ] `GET /thumbnail/{x}/{y}/{file+}` — return thumbnail (generate or fetch from cache). *Native fast-path serving/generation is designed in [`phase-11.md`](phase-11.md); until then this route is served by the Phase 7 PHP-FPM catch-all.*
 - [ ] `POST /files/{path+}` — update file tags (REQ §8.1)
 - [ ] `GET /recent/` — return recently modified files list
 - [ ] `GET /stats` — return `{used, free, total}` for authenticated user's storage

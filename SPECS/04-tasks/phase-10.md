@@ -107,7 +107,8 @@ Goal: fix behaviours in **already-implemented** Phase 4/5 tasks that were found 
 > PHP source: `apps/dav/lib/Connector/Sabre/FilesPlugin.php:392-393` — `has-preview` = `json_encode($previewManager->isAvailable($node->getFileInfo()))`, i.e. `true` when a registered preview provider supports the file's mimetype (and `enable_previews` is on).
 
 - [ ] Rust emits a constant `"false"` for `{nc:}has-preview` (`nc-dav/src/props.rs`, `make_prop("has-preview", "nc", NC_NS, "false")`). The web Files app uses this flag to decide whether to request a thumbnail — so **every** file shows a generic icon and no image/video thumbnails render in grid/photos views
-- [ ] Compute it from the mimetype against the enabled preview providers (config `enabledPreviewProviders`, default set covers `image/*`, `video/*`, `application/pdf`, text, office/OpenDocument, SVG, …) gated on the `enable_previews` config (default on). Thumbnail *generation* itself stays PHP-FPM (Phase 6) — this property only tells the client a preview is available
+- [ ] Compute it from the mimetype against the enabled preview providers (config `enabledPreviewProviders`, default set covers `image/*`, `video/*`, `application/pdf`, text, office/OpenDocument, SVG, …) gated on the `enable_previews` config (default on). Thumbnail *serving/generation* is designed in [`phase-11.md`](phase-11.md) — this property only tells the client a preview is available
+- [ ] Shared with **Phase 11.1** (it is the prerequisite for the native preview fast path); completing it in either place satisfies both. Keep the two cross-referenced.
 
 **Verify:** PROPFIND an image → `{nc:}has-preview` = `true`; a `.bin` → `false`. Web Files grid view renders image thumbnails for Rust-served files.
 
