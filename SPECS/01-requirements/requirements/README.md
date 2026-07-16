@@ -6,13 +6,26 @@ Split from the original `REQ.md` (Requirements: Nextcloud Core + Files in Rust (
 
 This document captures the detailed requirements for reimplementing Nextcloud's **core** and **files** subsystems in Rust such that all existing clients (desktop sync, iOS, Android, WebDAV mounts, web UI) continue to work unchanged. PHP apps remain supported by forwarding requests to a PHP-FPM backend.
 
-### ⚠ Requirement Gap: Trash Bin on DELETE
+### ⚠ Requirement Gap: Cross-cutting concerns on the Rust-native files subtree
 
-The `files_trashbin` app was categorised as "out of scope / delegated to PHP-FPM" (§1, §10.5) and its DAV endpoint (`/remote.php/dav/trashbin/…`) was routed to PHP-FPM (§6.1). This correctly covers the *read-side* (listing and restoring deleted files), but **misses the write-side**: the trash bin is not a self-contained app — it is a storage-wrapper that intercepts every `unlink()` call across the filesystem. The act of moving a file to trash happens during `DELETE /remote.php/dav/files/{userId}/…` — the Rust-native handler — not on the trashbin endpoint. By the time a request reaches `/dav/trashbin/…`, the file is already expected to be in the trash.
+The original scope boundaries were drawn along **app/endpoint lines** — e.g. "the `files_trashbin` app and its `/dav/trashbin/…` subtree are PHP-FPM" (§1, §10). This is correct for *self-contained* apps, but it misses a whole class of functionality that is **not** self-contained: features implemented in PHP as **storage-wrappers**, **event listeners**, or **SabreDAV property/report plugins** that execute *inline* on the very requests the Rust server handles natively — `PROPFIND`, `PUT`, `DELETE`, `MOVE`, `COPY`, and `REPORT` on `/dav/files/{userId}/…`.
 
-This gap was introduced because the scope boundaries were drawn along app/endpoint lines (the trashbin *app* and its *DAV subtree* are PHP-FPM), without tracing the cross-cutting dataflow: the write path runs through the files endpoint, not the trashbin endpoint. The `oc_files_trash` table and the `files_trashbin/files/` storage layout were also absent from the database schema (§9).
+Because these run on the Rust-native path, they **cannot be proxied to PHP-FPM after the fact**: by the time the delegated app's own endpoint is reached, the Rust handler has already served (or must have already served) the request. The trash-bin-on-DELETE case (the first one found) is the archetype; tracing the same cross-cutting dataflow surfaces several more, many of which are exercised by the **web Files client** on every folder view.
 
-See §6.7 and §9.7 for the corrected requirements.
+| Cross-cutting concern | Triggered on (Rust-native) | Why it can't be a pure PHP-FPM delegation | Corrected req |
+|---|---|---|---|
+| **Trash bin** (move-to-trash) | `DELETE /dav/files/…` | Storage-wrapper intercepts `unlink()`; the move happens on the files endpoint, not `/dav/trashbin/…` | §6.7, §9.7 |
+| **Cache propagation** (parent `etag`/`mtime`/`size`) | `PUT`/`DELETE`/`MOVE`/`COPY`/`MKCOL` | Core `Updater`→`Propagator`; **every** client (web + sync) detects changes by polling parent-folder ETags. Perf-critical, must be Rust. | §6.8 |
+| **File versions** (copy-on-overwrite) | `PUT` (overwrite) + `MOVE`/`COPY` | `files_versions` storage-wrapper/listeners preserve prior content *before* the write completes | §6.9 |
+| **Favorites & tags** (`{oc:}favorite`, `{oc:}tags`) | `PROPFIND`/`PROPPATCH` on files tree | `TagsPlugin` runs during PROPFIND; web client shows/sets stars inline | §6.5, §9.9 |
+| **Share badges** (`{oc:}share-types`, `{nc:}sharees`) | `PROPFIND` on files tree | `SharesPlugin`; data lives in `oc_share` (Rust already owns) | §6.5 |
+| **Comments count** (`{oc:}comments-*`) | `PROPFIND` on files tree | `CommentPropertiesPlugin`; web client shows unread-comment badges | §6.5 |
+| **System tags** (`{nc:}system-tags`) | `PROPFIND` on files tree | `SystemTagPlugin`; collaborative tags shown in web sidebar | §6.5 |
+| **Filter REPORT** (`{oc:}filter-files`) | `REPORT` on `/dav/files/…` | `FilesReportPlugin` powers the web **Favorites / Tags / Recent** views | §6.10 |
+
+Guiding rule for the corrections (per the project's latency-driven scope boundary): a concern is only pulled into Rust when it is triggered **inline on a Rust-native request**. Where the underlying data is already owned by Rust (`oc_share`, filecache, favorites tags), Rust computes it directly. Where a concern is *not* performance-sensitive and its data is owned by a PHP-FPM app (comments, system tags), Rust may satisfy the inline property by a read-only query (or a scoped call-back), while all **write** operations for that app stay delegated to PHP-FPM.
+
+See §6.5, §6.7–§6.10, §9.7 and §9.9 for the corrected requirements.
 
 ---
 

@@ -111,14 +111,16 @@ The Rust server manages the following tables (minimum required for core + files)
 - `creation_time` INT — authoritative source for `{nc:}creation_time`; this is the **only** table that has this column
 - `upload_time` INT — authoritative source for `{nc:}upload_time`; this is the **only** table that has this column
 
-**`oc_files_trash`**
+**`oc_files_trash`** (PHP migration `apps/files_trashbin/lib/Migration/Version1010Date20200630192639.php`)
 - `auto_id` BIGINT PK AI
-- `id` BIGINT NOT NULL — `oc_filecache.fileid` of the trashed node
-- `user` VARCHAR(64) NOT NULL — UID of the user who deleted the file
-- `timestamp` INT NOT NULL — Unix timestamp of deletion
-- `location` VARCHAR(512) NOT NULL — original path before deletion (e.g. `files/Documents/report.pdf`)
-- `type` VARCHAR(8) — `'file'` or `'folder'`
-- `deleted_by` VARCHAR(64) — UID of the user who performed the deletion (same as `user` for direct deletes)
+- `id` VARCHAR(250) NOT NULL — original **basename** of the trashed node (PHP stores the filename, **not** a fileid)
+- `user` VARCHAR(64) NOT NULL — UID of the user who owns the trashbin
+- `timestamp` VARCHAR(12) NOT NULL — Unix timestamp of deletion, stored as a **string**
+- `location` VARCHAR(512) NOT NULL — original parent directory relative to `files/` (PHP `pathinfo()['dirname']`, e.g. `Documents`; `.` for root-level items)
+- `type` VARCHAR(4) — nullable; `move2trash()` does **not** set it (left `NULL`)
+- `mime` VARCHAR(255) — nullable; also not set by `move2trash()`
+- `deleted_by` VARCHAR(64) — UID of the user who performed the deletion (added by `Version1020Date20240403003535`; same as `user` for direct deletes)
+- Indexes: PK `auto_id`; `id_index(id)`, `timestamp_index(timestamp)`, `user_index(user)`
 
 **`oc_files_metadata`**
 - `id` BIGINT PK AI
@@ -165,6 +167,24 @@ The Rust server manages the following tables (minimum required for core + files)
 - `password_by_talk` SMALLINT
 
 **`oc_share_external`** (federated shares — queried by PHP-FPM app)
+
+### 9.9 Favorites / personal tags (files object tagging)
+
+These tables back the `{oc:}favorite` and `{oc:}tags` DAV properties (§6.5.1), the star/unstar PROPPATCH, and the `favorite` rule of the `filter-files` REPORT (§6.10). In PHP they are the `ITags`/`ITagManager` store (`OC\Tagging`), used by `apps/dav/.../TagsPlugin.php`. Because these are read on every web PROPFIND and written on the Rust-native files tree, Rust owns them.
+
+**`oc_vcategory`**
+- `id` BIGINT PK AI
+- `uid` VARCHAR(64) — owner user
+- `type` VARCHAR(64) — object type; `'files'` for file tags/favorites
+- `category` VARCHAR(255) — tag name; the favorite tag is the literal `_$!<Favorite>!$_`
+
+**`oc_vcategory_to_object`**
+- `objectid` BIGINT — `oc_filecache.fileid`
+- `categoryid` BIGINT — FK `oc_vcategory.id`
+- `type` VARCHAR(64) — `'files'`
+- PK (`objectid`, `categoryid`, `type`)
+
+> The favorite flag is not a filecache column — it is the presence of a `(fileid, favorite-category)` row here. Deleting/moving a file to trash keeps the `fileid`, so favorites survive a trash round-trip; permanent delete (PHP-FPM) removes the mapping.
 
 ### 9.8 Two-factor auth (required for DAV auth enforcement)
 

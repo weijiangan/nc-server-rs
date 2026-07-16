@@ -38,6 +38,8 @@ At startup Rust scans `apps/*/appinfo/routes.php` (or a pre-built JSON manifest)
 
 ### 10.5 PHP apps that remain in PHP-FPM
 
+> **Cross-cutting caveat (see [`06-webdav-dav.md`](06-webdav-dav.md) §6.7\u2013§6.10 and the "Requirement Gap" note in [`requirements/README.md`](README.md)):** delegating an app's *routes* to PHP-FPM does **not** delegate the parts of that app that execute inline on the Rust-native files subtree. Specifically `files_trashbin` (move-to-trash on `DELETE`, §6.7), `files_versions` (copy-on-overwrite on `PUT`/`MOVE`/`COPY`, §6.9), and the PROPFIND enrichment / `filter-files` REPORT served for `comments`, `systemtags` and file favorites (§6.5.1, §6.10) have a Rust-native write-/read-side even though their own routes below stay in PHP-FPM.
+
 | App | Routes |
 |---|---|
 | `files_sharing` | `/apps/files_sharing/…`, `/ocs/…/apps/files_sharing/…` |

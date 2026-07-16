@@ -17,6 +17,7 @@ Each phase lives in its own file for context-size management:
 | 6 — Files App HTTP APIs (STRETCH) | [phase-6.md](phase-6.md) | ⬜ Not started |
 | 7 — PHP-FPM FastCGI Dispatch | [phase-7.md](phase-7.md) | ⬜ Not started |
 | 8 — Load Validation and Starvation Regression | [phase-8.md](phase-8.md) | ⬜ Not started |
+| 9 — Cross-Cutting Filesystem Concerns (Requirement-Gap Remediation) | [phase-9.md](phase-9.md) | ⬜ Not started |
 
 | Deferred improvements (nice-to-have) | [../02-specifications/improvements.md](../02-specifications/improvements.md) | ⬜ |
 
@@ -31,5 +32,6 @@ All phases are done when:
 4. `litmus` reports zero failures
 5. Phase 8.1 load test passes at N = 2× PHP-FPM ceiling with 0% error rate
 6. An existing PHP Nextcloud DB is connectable with no destructive migrations applied
+7. Phase 9 cross-cutting concerns (trash-on-DELETE, ETag propagation, versions, favorites/tags, share/comment/system-tag props, `filter-files` REPORT) are implemented — required for the Cypress web-client suites in (3) to pass
 
 Goal: the binary connects to an existing Nextcloud DB or creates a fresh one, and all process-lifetime caches are populated before the first request is served.

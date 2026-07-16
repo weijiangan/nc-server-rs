@@ -23,6 +23,8 @@
 - The Nextcloud web UI HTML rendering (served from PHP-FPM via the index route)
 - Two-factor authentication challenge pages (PHP-FPM renders these; Rust enforces 2FA status check)
 
+> **⚠ Cross-cutting exception:** the app boundary above is drawn by *route ownership*, but a few delegated apps have behaviour that executes **inline on the Rust-native files subtree** and therefore has a Rust-native slice even though the app's own routes stay in PHP-FPM. These are: `files_trashbin` (move-to-trash on `DELETE`, §6.7), `files_versions` (copy-on-overwrite on `PUT`/`MOVE`/`COPY`, §6.9), core filecache **ETag/size/mtime propagation** (§6.8), and the web-client PROPFIND/REPORT enrichment for favorites, `comments`, `systemtags` and shares (§6.5.1, §6.10). See the "Requirement Gap" note in [`requirements/README.md`](README.md).
+
 ---
 
 ---
