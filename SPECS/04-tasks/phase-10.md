@@ -9,9 +9,9 @@ Goal: fix behaviours in **already-implemented** Phase 4/5 tasks that were found 
 ### 10.1 `X-User-Id` response header (from §4.14.8)
 > PHP source: `apps/dav/lib/Connector/Sabre/UserIdHeaderPlugin.php:33` — `$response->setHeader('X-User-Id', $user->getUID());`
 
-- [ ] The authenticated-response header is `X-User-Id`, **not** `X-Nextcloud-User-Id`. Rust currently emits `x-nextcloud-user-id` (`nc-dav/src/handler.rs:39` `H_X_NC_USER_ID`, also `nc-dav/src/archive.rs:217`). Rename the emitted header to `X-User-Id` on every authenticated DAV response
-- [ ] Update the §4.14.8 task text and REQ §14.3 to the correct header name
-- [ ] Grep for any other emitter / test asserting `x-nextcloud-user-id` and reconcile
+- [x] The authenticated-response header is `X-User-Id`, **not** `X-Nextcloud-User-Id`. Rust currently emits `x-nextcloud-user-id` (`nc-dav/src/handler.rs:39` `H_X_NC_USER_ID`, also `nc-dav/src/archive.rs:217`). Rename the emitted header to `X-User-Id` on every authenticated DAV response
+- [x] Update the §4.14.8 task text and REQ §14.3 to the correct header name
+- [x] Grep for any other emitter / test asserting `x-nextcloud-user-id` and reconcile
 
 **Verify:** authenticated `PROPFIND` response carries `X-User-Id: {uid}` (matching PHP); no `X-Nextcloud-User-Id` header is emitted. `build/integration/dav_features/` header assertions pass.
 

@@ -132,10 +132,10 @@ Goal: PROPFIND on a user file tree returns the correct properties; all RFC 4918 
 - 4.14.5 [ ] `BlockLegacyClientPlugin`: `403` for desktop sync clients (`mirall/X.Y.Z` UA) below `minimum.supported.desktop.version` or above `maximum.supported.desktop.version` from `oc_appconfig`
 - 4.14.6 [x] `DummyGetResponsePlugin`: `GET` on a DAV collection → `200` plain-text body (not HTML or 404)
 - 4.14.7 [x] `RequestIdHeaderPlugin`: mirror incoming `X-Request-Id` onto every DAV response (generate UUID if absent)
-- 4.14.8 [x] `UserIdHeaderPlugin`: `X-Nextcloud-User-Id: {uid}` on every authenticated DAV response
+- 4.14.8 [x] `UserIdHeaderPlugin`: `X-User-Id: {uid}` on every authenticated DAV response
 - 4.14.9 [ ] `FilesDropPlugin`: public-share method enforcement (PUT/MKCOL/MOVE only) — **deferred to Phase 6** (no `/public.php/dav` handler yet)
 
-**Verify:** `build/integration/dav_features/principal-property-search.feature` for AppleQuirks. Manual: browser GET on `/remote.php/webdav` → plain text. Anonymous OPTIONS from MS Office UA → 200. Authenticated PROPFIND → `X-Nextcloud-User-Id` header present.
+**Verify:** `build/integration/dav_features/principal-property-search.feature` for AppleQuirks. Manual: browser GET on `/remote.php/webdav` → plain text. Anonymous OPTIONS from MS Office UA → 200. Authenticated PROPFIND → `X-User-Id` header present.
 
 ### 4.15 WebDAV litmus compliance
 - [ ] Run full `litmus` test suite against the running server

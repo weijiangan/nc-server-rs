@@ -161,7 +161,7 @@ These headers are sent on successful write operations and must be included:
 | `OC-ETag` | `CopyEtagHeaderPlugin` | Mirrors the `ETag` header on every response that has one. |
 | `X-OC-MTime: accepted` | `File.put` / `ChunkingV2Plugin` | Echoed when `X-OC-MTime` was honored. |
 | `X-Request-ID` | `RequestIdHeaderPlugin` | Unique request ID for tracing. |
-| `X-Nextcloud-User-Id` | `UserIdHeaderPlugin` | UID of the authenticated user. |
+| `X-User-Id` | `UserIdHeaderPlugin` | UID of the authenticated user. |
 
 ### DAV SEARCH method
 

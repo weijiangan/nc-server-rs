@@ -36,7 +36,7 @@ static H_X_OC_MTIME: HeaderName = HeaderName::from_static("x-oc-mtime");
 static H_X_OC_CTIME: HeaderName = HeaderName::from_static("x-oc-ctime");
 static H_X_ACCEL_BUFFERING: HeaderName = HeaderName::from_static("x-accel-buffering");
 static H_X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
-static H_X_NC_USER_ID: HeaderName = HeaderName::from_static("x-nextcloud-user-id");
+static H_X_USER_ID: HeaderName = HeaderName::from_static("x-user-id");
 
 // ─── Public handler ───────────────────────────────────────────────────────────
 
@@ -300,7 +300,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
                     resp.headers_mut().insert(H_X_REQUEST_ID.clone(), v);
                 }
                 if let Ok(v) = HeaderValue::from_str(&uid) {
-                    resp.headers_mut().insert(H_X_NC_USER_ID.clone(), v);
+                    resp.headers_mut().insert(H_X_USER_ID.clone(), v);
                 }
                 return resp;
             }
@@ -533,9 +533,9 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
     if let Ok(v) = HeaderValue::from_str(&request_id) {
         parts.headers.insert(H_X_REQUEST_ID.clone(), v);
     }
-    // 4.14.8 UserIdHeaderPlugin: X-Nextcloud-User-Id on every authenticated response (REQ §14.3)
+    // 4.14.8 UserIdHeaderPlugin: X-User-Id on every authenticated response (REQ §14.3)
     if let Ok(v) = HeaderValue::from_str(&uid) {
-        parts.headers.insert(H_X_NC_USER_ID.clone(), v);
+        parts.headers.insert(H_X_USER_ID.clone(), v);
     }
 
     if let Some(etag_val) = parts.headers.get(http::header::ETAG).cloned() {

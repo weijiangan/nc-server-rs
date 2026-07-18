@@ -37,7 +37,7 @@ Implement the following plugins that parallel SabreDAV plugins used in productio
 | `FakeLockerPlugin` | Already covered by `DavLockSystem` trait |
 | `DummyGetResponsePlugin` | Intercepts any `GET` request on the DAV tree (priority 200) and returns HTTP 200 with the plain-text body: `"This is the WebDAV interface. It can only be accessed by WebDAV clients such as the Nextcloud desktop sync client."` No debug-mode check. Prevents SabreDAV's built-in directory browser from being shown. |
 | `RequestIdHeaderPlugin` | Inject `X-Request-Id` UUID on all responses |
-| `UserIdHeaderPlugin` | Inject `X-Nextcloud-User-Id` on all authenticated responses |
+| `UserIdHeaderPlugin` | Inject `X-User-Id` on all authenticated responses |
 | `CopyEtagHeaderPlugin` | Mirror `ETag` as `OC-ETag` on every response that has an ETag |
 | `FilesDropPlugin` | Enforces upload-only restrictions on file-drop public shares (`/public.php/dav`). Allowed methods: `PUT`, `MKCOL`, and `MOVE` (the last only for chunked upload assembly). All other methods throw `MethodNotAllowed` (HTTP **405**). Also handles nickname headers, path rewriting, and conflict resolution for duplicate filenames. |
 

@@ -214,7 +214,7 @@ pub async fn try_serve_archive(
     }
     if let Ok(v) = HeaderValue::from_str(uid) {
         resp.headers_mut().insert(
-            HeaderName::from_static("x-nextcloud-user-id"),
+            HeaderName::from_static("x-user-id"),
             v,
         );
     }
