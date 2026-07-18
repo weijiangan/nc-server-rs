@@ -21,7 +21,7 @@ use crate::config::NcConfig;
 /// Reason why a filename was rejected.
 ///
 /// The `Display` impl produces human-readable messages suitable for use in
-/// a DAV `<s:message>` XML element or a 422 response body.
+/// a DAV `<s:message>` XML element or a 400 response body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilenameError {
     Empty,

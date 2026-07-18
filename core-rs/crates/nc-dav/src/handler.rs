@@ -115,7 +115,8 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
     // ── §5.1 Filename validation (write methods) ──────────────────────────
     //
     // Check the target filename BEFORE issuing any DB query so that invalid
-    // names fail immediately with 422 Unprocessable Entity.
+    // names fail immediately with 400 Bad Request (matching PHP
+    // InvalidPath exception, which carries HTTP status 400).
     //
     // Covered methods (per REQ §7 / IMPL_PLAN §5):
     //   PUT    — last segment of the request path
@@ -695,10 +696,10 @@ fn url_to_path(url: &str) -> &str {
     }
 }
 
-/// Build a `422 Unprocessable Entity` response for a filename validation failure.
+/// Build a `400 Bad Request` response for a filename validation failure.
 ///
 /// The XML body mirrors what PHP/SabreDAV emits for
-/// `OCA\DAV\Connector\Sabre\Exception\InvalidPath` (HTTP 422).
+/// `OCA\DAV\Connector\Sabre\Exception\InvalidPath` (HTTP 400).
 fn build_filename_error_response(e: FilenameError) -> Response {
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
@@ -708,7 +709,7 @@ fn build_filename_error_response(e: FilenameError) -> Response {
          </d:error>\n"
     );
     http::Response::builder()
-        .status(422)
+        .status(400)
         .header(
             H_CSP.clone(),
             HeaderValue::from_static("default-src 'none';"),

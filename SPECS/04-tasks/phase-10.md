@@ -28,8 +28,8 @@ Goal: fix behaviours in **already-implemented** Phase 4/5 tasks that were found 
 ### 10.3 Filename-validation status code `400`, not `422` (from §5.1)
 > PHP source: forbidden/invalid filenames throw `OCP\Files\InvalidPathException`, caught in `apps/dav/lib/Connector/Sabre/Directory.php:133-134` (and `:164`, `:209`) and re-thrown as `Connector\Sabre\Exception\InvalidPath`, whose `getHTTPCode()` returns **`400`** (`apps/dav/lib/Connector/Sabre/Exception/InvalidPath.php:33`).
 
-- [ ] Rust returns **`422 Unprocessable Entity`** for filename violations (`nc-dav/src/handler.rs:117-138` `build_filename_error_response`; `nc-db/src/filename_validator.rs:24`). PHP returns **`400 Bad Request`**. Change the filename-rejection response status to `400` to match PHP (keep the `{DAV:}error` / `<o:reason>` body)
-- [ ] Update the §5.1 task text (`422 Unprocessable Entity` → `400 Bad Request`) and REQ §7 accordingly
+- [x] Rust returns **`422 Unprocessable Entity`** for filename violations (`nc-dav/src/handler.rs:117-138` `build_filename_error_response`; `nc-db/src/filename_validator.rs:24`). PHP returns **`400 Bad Request`**. Change the filename-rejection response status to `400` to match PHP (keep the `{DAV:}error` / `<o:reason>` body)
+- [x] Update the §5.1 task text (`422 Unprocessable Entity` → `400 Bad Request`) and REQ §7 accordingly
 
 **Verify:** PUT/MKCOL/MOVE/COPY of a forbidden name (e.g. `.htaccess`) → `400` (matching PHP); `build/integration/dav_features/webdav-related.feature` filename scenarios pass. Confirm the DAV error body still carries the reason element.
 
