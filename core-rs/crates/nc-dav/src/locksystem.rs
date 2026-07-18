@@ -5,8 +5,8 @@
 //! OneNote, and Microsoft WebDAVFS (REQ §6.3 / IMPL_PLAN §4 DavLockSystem).
 //!
 //! Key differences from `dav_server::fakels::FakeLs`:
-//! - Lock token is **deterministic**: `urn:uuid:{md5_hex(path)}` instead of
-//!   a random UUID, matching the PHP `FakeLockerPlugin` token derivation.
+//! - Lock token is **deterministic**: raw 32-char MD5 hex of the path
+//!   (`md5_hex(path)`), matching the PHP `FakeLockerPlugin` token derivation.
 //! - Timeout is **1800 seconds** (30 min) rather than 120 s, matching the
 //!   PHP reference implementation.
 //! - `check()` always returns `Ok(())` so every `If:` header lock token is
@@ -40,12 +40,12 @@ impl NcLockSystem {
 
     /// Derive a deterministic lock token from a path.
     ///
-    /// Returns `urn:uuid:{md5_hex(path)}`, e.g.
-    /// `urn:uuid:d41d8cd98f00b204e9800998ecf8427e` for the empty path.
+    /// Returns the raw 32-char MD5 hex of the path URL string, matching
+    /// PHP's `FakeLockerPlugin` (`md5($request->getPath())`).
     fn token_for(path: &DavPath) -> String {
         let path_str = path.as_url_string();
         let hash = Md5::digest(path_str.as_bytes());
-        format!("urn:uuid:{:x}", hash)
+        format!("{:x}", hash)
     }
 }
 
@@ -56,7 +56,7 @@ impl Default for NcLockSystem {
 }
 
 impl DavLockSystem for NcLockSystem {
-    /// Returns a fake lock with a deterministic token (`urn:uuid:{md5(path)}`).
+    /// Returns a fake lock with a deterministic raw-MD5-hex token matching PHP.
     ///
     /// Always succeeds (returns `Ok`). The token is stable across calls for
     /// the same path, which means concurrent LOCK requests for the same
@@ -153,7 +153,11 @@ mod tests {
         let t1 = NcLockSystem::token_for(&p);
         let t2 = NcLockSystem::token_for(&p);
         assert_eq!(t1, t2);
-        assert!(t1.starts_with("urn:uuid:"), "token should start with urn:uuid:");
+        assert_eq!(t1.len(), 32, "token should be 32-char MD5 hex");
+        assert!(
+            t1.chars().all(|c| c.is_ascii_hexdigit()),
+            "token should be all hex digits"
+        );
     }
 
     #[test]
@@ -168,15 +172,14 @@ mod tests {
     }
 
     #[test]
-    fn token_format_is_urn_uuid_md5() {
+    fn token_format_is_raw_md5_hex() {
         // md5("") = d41d8cd98f00b204e9800998ecf8427e
         let p = make_path("/");
         let t = NcLockSystem::token_for(&p);
-        // Token is urn:uuid: followed by 32 hex chars (md5 of the url string form)
-        let hex_part = t.strip_prefix("urn:uuid:").expect("urn:uuid: prefix missing");
-        assert_eq!(hex_part.len(), 32, "md5 hex should be 32 chars");
+        // Token is raw 32-char MD5 hex, matching PHP FakeLockerPlugin
+        assert_eq!(t.len(), 32, "md5 hex should be 32 chars");
         assert!(
-            hex_part.chars().all(|c| c.is_ascii_hexdigit()),
+            t.chars().all(|c| c.is_ascii_hexdigit()),
             "all chars should be hex"
         );
     }
@@ -189,14 +192,14 @@ mod tests {
         assert!(result.is_ok());
         let lock = result.unwrap();
         assert_eq!(lock.timeout, Some(Duration::from_secs(1800)));
-        assert!(lock.token.starts_with("urn:uuid:"));
+        assert_eq!(lock.token.len(), 32, "token must be 32-char MD5 hex");
     }
 
     #[tokio::test]
     async fn unlock_always_succeeds() {
         let ls = NcLockSystem;
         let p = make_path("/dav/files/alice/doc.txt");
-        let result = ls.unlock(&p, "urn:uuid:deadbeef").await;
+        let result = ls.unlock(&p, "d41d8cd98f00b204e9800998ecf8427e").await;
         assert!(result.is_ok());
     }
 
@@ -204,7 +207,7 @@ mod tests {
     async fn check_always_valid() {
         let ls = NcLockSystem;
         let p = make_path("/dav/files/alice/doc.txt");
-        let tokens = vec!["urn:uuid:some-random-token".to_string()];
+        let tokens = vec!["00000000000000000000000000000000".to_string()];
         let result = ls.check(&p, Some("alice"), false, false, &tokens).await;
         assert!(
             result.is_ok(),

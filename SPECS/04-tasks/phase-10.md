@@ -18,8 +18,8 @@ Goal: fix behaviours in **already-implemented** Phase 4/5 tasks that were found 
 ### 10.2 Fake lock token format (from §4.13)
 > PHP source: `apps/dav/lib/Connector/Sabre/FakeLockerPlugin.php:114` — `$lockInfo->token = md5($request->getPath());` (raw 32-char MD5 hex, **no** prefix; timeout `1800` at `:117`).
 
-- [ ] Rust issues `urn:uuid:{md5_hex(path)}` (`nc-dav/src/locksystem.rs:48`, and the doc comments at `:8`, `:43`, `:59` claim "matching the PHP `FakeLockerPlugin`" — which is inaccurate). PHP returns the **raw** `md5(path)` with no `urn:uuid:` prefix. Either (a) emit the raw `md5(path)` to match PHP exactly, or (b) if the prefix is retained deliberately, correct the misleading "matches PHP" comments and note the intentional deviation
-- [ ] Reconcile the §4.13 task line (`urn:uuid:{md5_hex(path)}`) with whichever decision is taken
+- [x] Rust issues `urn:uuid:{md5_hex(path)}` (`nc-dav/src/locksystem.rs:48`, and the doc comments at `:8`, `:43`, `:59` claim "matching the PHP `FakeLockerPlugin`" — which is inaccurate). PHP returns the **raw** `md5(path)` with no `urn:uuid:` prefix. Either (a) emit the raw `md5(path)` to match PHP exactly, or (b) if the prefix is retained deliberately, correct the misleading "matches PHP" comments and note the intentional deviation
+- [x] Reconcile the §4.13 task line (`urn:uuid:{md5_hex(path)}`) with whichever decision is taken
 
 **Verify:** `LOCK` response `{DAV:}lockdiscovery` carries the chosen token; `litmus` lock tests pass. If matching PHP, the `<d:locktoken>` value is a bare 32-char hex string.
 
