@@ -16,6 +16,7 @@ pub mod quota;
 pub mod row;
 pub mod upload;
 pub mod upload_handler;
+pub(crate) mod versions;
 
 pub use bulk_handler::bulk_handler;
 pub use filesystem::NcFileSystem;

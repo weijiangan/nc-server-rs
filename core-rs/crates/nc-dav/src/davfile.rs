@@ -24,6 +24,7 @@ use tokio::task;
 
 use crate::metadata::NcMetaData;
 use crate::propagator::Propagator;
+use nc_db::mime::SharedMimeCache;
 use nc_db::pool::DbPool;
 
 // ─── Running hash ─────────────────────────────────────────────────────────────
@@ -107,6 +108,21 @@ pub struct WriteCtx {
     /// Size of the existing file before overwrite (0 for new files).
     /// Used to compute `sizeDifference` for cache propagation (§9.2).
     pub old_size: i64,
+    /// Mtime of the existing file before overwrite (0 for new files).
+    /// Used to name the version file: `{path}.v{old_mtime}` (§9.4).
+    pub old_mtime: i64,
+    /// Mimetype ID of the existing file before overwrite (0 for new files).
+    /// Used for the version's filecache row (§9.4).
+    pub old_mimetype: i64,
+    /// Permissions of the existing file before overwrite (27 for new files).
+    /// Inherited by the version row so PHP-FPM versions PROPFIND shows correct owner metadata (§9.4).
+    pub old_permissions: i32,
+    /// Creation time of the existing file before overwrite (0 for new files).
+    /// Inherited by the version row (§9.4).
+    pub old_creation_time: i64,
+    /// Upload time of the existing file before overwrite (0 for new files).
+    /// Inherited by the version row (§9.4).
+    pub old_upload_time: i64,
     /// Expected file size from `OpenOptions.size` (for validation).
     pub expected_size:  Option<u64>,
     /// Checksum from `OC-Checksum` header (e.g. `"SHA1:abc…"`).
@@ -126,6 +142,10 @@ pub struct WriteCtx {
     /// Cache propagator — used in `flush()` to update parent ETag/mtime/size
     /// after the file is committed (§9.2).
     pub propagator:     Propagator,
+    /// Data directory root — needed for version disk copy (§9.4).
+    pub data_dir:       std::path::PathBuf,
+    /// MIME cache — needed for version filecache row (§9.4).
+    pub mime_cache:     SharedMimeCache,
 }
 
 impl std::fmt::Debug for WriteCtx {
@@ -312,6 +332,29 @@ impl DavFile for NcDavFile {
             let mtime_accepted   = ctx.x_oc_mtime.is_some();
             let ctime_accepted   = ctx.x_oc_ctime.is_some();
 
+            // §9.4: save a version BEFORE the rename overwrites the old file.
+            // The old file still exists at ctx.final_path.
+            if let Some(source_fileid) = ctx.initial_fileid {
+                crate::versions::store_version(
+                    &ctx.pool,
+                    &ctx.prefix,
+                    &ctx.data_dir,
+                    &ctx.uid,
+                    ctx.storage_id,
+                    &ctx.mime_cache,
+                    &ctx.fc_path,
+                    &ctx.final_path,
+                    ctx.old_size,
+                    ctx.old_mtime,
+                    ctx.old_mimetype,
+                    ctx.old_permissions,
+                    ctx.old_creation_time,
+                    ctx.old_upload_time,
+                    source_fileid,
+                )
+                .await;
+            }
+
             // ── Blocking: flush OS buffer + get size + atomic rename ──────────
             let temp_path  = ctx.temp_path.clone();
             let final_path = ctx.final_path.clone();
@@ -450,6 +493,21 @@ impl DavFile for NcDavFile {
                 .propagate_change(&ctx.fc_path, use_mtime, size_diff)
                 .await;
 
+            // §9.4: insert oc_files_versions for the file's current mtime so
+            // PHP-FPM's versions PROPFIND has nc:version-author.
+            // Matches PHP NodeWrittenEvent → post_write_hook → created()
+            // → createVersionEntity() + VersionAuthorListener for every
+            // successful write (new file or overwrite).
+            crate::versions::insert_version_entity(
+                &ctx.pool,
+                &ctx.prefix,
+                fileid,
+                use_mtime,
+                self.meta.size as i64,
+                ctx.mime_type_id,
+                &ctx.uid,
+            )
+            .await;
             Ok(())
         }
         .boxed()

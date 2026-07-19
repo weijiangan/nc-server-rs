@@ -1066,6 +1066,23 @@ impl DavFileSystem for NcFileSystem {
                 .map_err(io_to_fs)?;
 
                 let old_size = existing.as_ref().map(|r| r.size).unwrap_or(0);
+                let old_mtime = existing.as_ref().map(|r| r.mtime).unwrap_or(0);
+                let old_mimetype = existing.as_ref().map(|r| r.mimetype).unwrap_or(0);
+                // §9.4: inherit permissions + extended times from the source file
+                // so that the version row carries correct metadata for PHP-FPM.
+                let old_permissions = existing.as_ref().map(|r| r.permissions).unwrap_or(27);
+                let (old_creation_time, old_upload_time) =
+                    if let Some(ref ex) = existing {
+                        let ext = row::get_extended(
+                            &self.state.pool,
+                            &self.state.table_prefix,
+                            ex.fileid,
+                        )
+                        .await;
+                        (ext.creation_time, ext.upload_time)
+                    } else {
+                        (0, 0)
+                    };
                 let write_ctx = WriteCtx {
                     temp_path,
                     final_path: disk,
@@ -1079,6 +1096,11 @@ impl DavFileSystem for NcFileSystem {
                     mimepart_id,
                     initial_fileid: existing.map(|r| r.fileid),
                     old_size,
+                    old_mtime,
+                    old_mimetype,
+                    old_permissions,
+                    old_creation_time,
+                    old_upload_time,
                     expected_size: options.size,
                     oc_checksum: options.checksum.clone(),
                     running_hash: crate::davfile::RunningHash::from_checksum_header(
@@ -1089,6 +1111,8 @@ impl DavFileSystem for NcFileSystem {
                     write_result: self.write_result.clone(),
                     put_error: self.put_error.clone(),
                     propagator: self.propagator.clone(),
+                    data_dir: self.state.data_directory.clone(),
+                    mime_cache: self.state.mime_cache.clone(),
                 };
 
                 Ok(Box::new(NcDavFile {
@@ -1374,6 +1398,17 @@ impl DavFileSystem for NcFileSystem {
                 .await;
             }
 
+            // §9.4: relocate versions alongside the renamed file.
+            crate::versions::rename_versions(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.state.data_directory,
+                &self.uid,
+                &from_fc,
+                &to_fc,
+            )
+            .await;
+
             // §9.2: MOVE propagates both source and target chains with
             // sizeDifference=0 (etag/mtime only).  The immediate source/target
             // parents' sizes are fixed by correctFolderSize (PHP
@@ -1513,7 +1548,7 @@ impl DavFileSystem for NcFileSystem {
                          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
                          RETURNING fileid"
                     );
-                    let _ = sqlx::query_scalar::<_, i64>(&sql)
+                    let copy_fid: Option<i64> = match sqlx::query_scalar::<_, i64>(&sql)
                         .bind(self.storage_id)
                         .bind(&to_fc)
                         .bind(&hash)
@@ -1528,9 +1563,42 @@ impl DavFileSystem for NcFileSystem {
                         .bind(from_row.permissions)
                         .bind(from_row.checksum.as_deref().unwrap_or(""))
                         .fetch_one(&self.state.pool)
+                        .await
+                    {
+                        Ok(fid) => Some(fid),
+                        Err(e) => {
+                            tracing::warn!(to_fc = to_fc, error = %e, "Failed to insert filecache row on copy");
+                            None
+                        }
+                    };
+
+                    // §9.4: insert oc_files_versions for the copied file.
+                    // Matches PHP NodeCreatedEvent → created() → createVersionEntity().
+                    if let Some(fid) = copy_fid {
+                        crate::versions::insert_version_entity(
+                            &self.state.pool,
+                            &self.state.table_prefix,
+                            fid,
+                            now,
+                            from_row.size,
+                            copy_mid,
+                            &self.uid,
+                        )
                         .await;
+                    }
                 }
             }
+
+            // §9.4: copy versions alongside the copied file.
+            crate::versions::copy_versions(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.state.data_directory,
+                &self.uid,
+                &from_fc,
+                &to_fc,
+            )
+            .await;
 
             // §9.2: COPY propagates the target chain with
             // sizeDifference=0 (etag/mtime only), then corrects the

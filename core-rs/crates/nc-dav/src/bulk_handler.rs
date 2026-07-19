@@ -18,7 +18,7 @@ use http::{HeaderName, HeaderValue, StatusCode};
 use nc_auth::AuthInfo;
 use tokio::fs;
 
-use crate::{propagator::Propagator, row, NcDavState};
+use crate::{propagator::Propagator, row, versions, NcDavState};
 
 static H_CSP: HeaderName = HeaderName::from_static("content-security-policy");
 static H_JSON: HeaderName = HeaderName::from_static("content-type");
@@ -335,6 +335,33 @@ async fn write_file(
             .map_err(|e| format!("Failed to create directory: {}", e))?;
     }
 
+    // §9.4: save a version BEFORE overwriting the existing file.
+    // Unlike davfile.rs (which writes to a temp file first), the bulk
+    // handler writes directly to the final path — so we must copy the
+    // old content before `fs::write()` destroys it.
+    if let Some(ref old) = existing {
+        let old_perms = old.permissions;
+        let ext = row::get_extended(&state.pool, &state.table_prefix, old.fileid).await;
+        versions::store_version(
+            &state.pool,
+            &state.table_prefix,
+            &state.data_directory,
+            uid,
+            storage_id,
+            &state.mime_cache,
+            &fc_path,
+            &final_disk_path,
+            old.size,
+            old.mtime,
+            old.mimetype,
+            old_perms,
+            ext.creation_time,
+            ext.upload_time,
+            old.fileid,
+        )
+        .await;
+    }
+
     fs::write(&final_disk_path, data)
         .await
         .map_err(|e| format!("Failed to write file: {}", e))?;
@@ -430,6 +457,19 @@ async fn write_file(
             .propagate_change(&fc_path, file_mtime, size_diff)
             .await;
     }
+
+    // §9.4: insert oc_files_versions for every successful write so the
+    // current mtime entry has nc:version-author.
+    crate::versions::insert_version_entity(
+        &state.pool,
+        &state.table_prefix,
+        fid,
+        file_mtime,
+        data.len() as i64,
+        mime_type_id,
+        uid,
+    )
+    .await;
 
     // fileid: PHP DavUtil::getDavFileId() formats as zero-padded 8-char id + instanceId.
     let dav_file_id = format!("{:08}{}", fid, instance_id);

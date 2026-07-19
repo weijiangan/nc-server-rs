@@ -62,17 +62,27 @@ Goal: implement the cross-cutting PHP behaviours that execute **inline on the Ru
 
 **Verify:** `build/integration/dav_features/webdav-related.feature` DELETE scenarios; then confirm the file is listed under `/dav/trashbin/{user}/` (served by PHP-FPM) and a row exists in `oc_files_trash`. Cypress `cypress/e2e/files/` trashbin flow: delete in web UI → item appears in Deleted files view.
 
-### 9.4 File versions on overwrite (REQ §6.9)
+### 9.4 File versions on overwrite (REQ §6.9) — ✅ IMPLEMENTED
 > PHP source: `apps/files_versions/lib/Storage.php` (`store`, `VERSIONS_ROOT`), `apps/files_versions/lib/Versions/LegacyVersionsBackend.php` (`createVersion`), `apps/files_versions/lib/Listener/FileEventsListener.php` (write/rename/copy hooks).
+> Rust: [`../../core-rs/crates/nc-dav/src/versions.rs`](../../core-rs/crates/nc-dav/src/versions.rs) + wired into [`davfile.rs`](../../core-rs/crates/nc-dav/src/davfile.rs) (flush) and [`filesystem.rs`](../../core-rs/crates/nc-dav/src/filesystem.rs) (rename/copy).
 
-- [ ] **Design decision (blocking):** implement version copy natively in Rust (mirrors §9.3) **or** expose a synchronous internal hook the PHP shim implements. Preferred: native, to keep the write path off PHP-FPM. Record the decision here before implementing.
-- [ ] On `PUT` overwrite of an existing file: copy prior content to `files_versions/{relativePath}.v{mtime}`, where `mtime` is the **pre-overwrite** `$file->getMtime()` and the **full relative path is preserved** (unlike trash, which flattens to basename) — `LegacyVersionsBackend::createVersion` copies `files/{relativePath}` → `files_versions/{relativePath}.v{mtime}` (`apps/files_versions/lib/Versions/LegacyVersionsBackend.php:150-163`; `VERSIONS_ROOT = 'files_versions/'` at `Storage.php:52`)
-- [ ] Trigger = the write hook via `Storage::store()`, which **skips** `.part` files, directories, and **empty (size 0)** files, and dispatches `CreateVersionEvent` (a listener may veto) before creating the version (`apps/files_versions/lib/Storage.php:156-215`)
-- [ ] Auto-create parent folders under `files_versions/` and scan the new row so the versions PROPFIND (PHP-FPM) can enumerate it — `Storage::createMissingDirectories` (`LegacyVersionsBackend.php:155`) + `getFileInfo` rescan (`LegacyVersionsBackend.php:162`)
-- [ ] On `MOVE`/`COPY` of a file, relocate its `files_versions/{path}.v*` siblings alongside it — handled by the move/copy hooks in `apps/files_versions/lib/Listener/FileEventsListener.php` (`copy_hook` at `:355`, matching rename/move handlers)
-- [ ] Read-side (browse/restore via `/dav/versions/…`) remains delegated to PHP-FPM (unchanged, REQ §6.1)
+- [x] **Design decision:** native Rust. `CreateVersionEvent` has zero listeners outside `files_versions` itself.
+- [x] On `PUT` overwrite of an existing file: copy prior content to `files_versions/{relativePath}.v{mtime}`, where `mtime` is the **pre-overwrite** `$file->getMtime()` and the **full relative path is preserved** (unlike trash, which flattens to basename) — `LegacyVersionsBackend::createVersion` copies `files/{relativePath}` → `files_versions/{relativePath}.v{mtime}` (`apps/files_versions/lib/Versions/LegacyVersionsBackend.php:150-163`; `VERSIONS_ROOT = 'files_versions/'` at `Storage.php:52`). Done in `davfile.rs:flush()` before the temp→final rename.
+- [x] Trigger = the write hook via `Storage::store()`, which **skips** `.part` files, directories, and **empty (size 0)** files, and dispatches `CreateVersionEvent` (a listener may veto) before creating the version (`apps/files_versions/lib/Storage.php:156-215`). `CreateVersionEvent` not dispatched (zero external listeners).
+- [x] Auto-create parent folders under `files_versions/` and scan the new row so the versions PROPFIND (PHP-FPM) can enumerate it — `Storage::createMissingDirectories` (`LegacyVersionsBackend.php:155`) + `getFileInfo` rescan (`LegacyVersionsBackend.php:162`). Done via `ensure_version_parents` + `insert_version_row`.
+- [x] On `MOVE`/`COPY` of a file, relocate its `files_versions/{path}.v*` siblings alongside it — handled by the move/copy hooks in `apps/files_versions/lib/Listener/FileEventsListener.php` (`copy_hook` at `:355`, matching rename/move handlers). Done via `rename_versions()` / `copy_versions()`.
+- [x] Read-side (browse/restore via `/dav/versions/…`) remains delegated to PHP-FPM (unchanged, REQ §6.1)
 
 **Verify:** PUT new content over an existing file twice; PROPFIND `/dav/versions/{user}/versions/{fileid}` (PHP-FPM) lists the prior versions with correct sizes. Move the file; versions still resolve. `apps/files_versions` Behat/Cypress version-restore flow passes.
+
+> **Deviations from PHP:**
+> 1. **`CreateVersionEvent` not dispatched.** No Rust event system exists; verified zero external listeners.
+> 2. **Shared-mount owner resolution skipped.** PHP `Storage::store()` resolves shared-mount owners before versioning (`Storage.php:184-191`). Rust versions under the reque
+sting user's storage.
+> 3. **Version filecache rows use `lookup-before-insert`** instead of PHP's scanner `getFileInfo`. The outcome is identical — a filecache row exists for the version under `
+files_versions/`.
+> 4. **`scheduleExpire` not called.** PHP schedules background expiration of old versions. Rust does not — the PHP-FPM `files_versions` background job still handles expiry
+independently.
 
 ### 9.5 Favorites & personal tags properties (REQ §6.5.1)
 > PHP source: `apps/dav/lib/Connector/Sabre/TagsPlugin.php` (registered unconditionally for logged-in users at `apps/dav/lib/Server.php:328`).
