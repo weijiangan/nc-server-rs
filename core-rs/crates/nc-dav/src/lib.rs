@@ -14,6 +14,7 @@ pub mod propagator;
 pub mod props;
 pub mod quota;
 pub mod row;
+pub(crate) mod tags;
 pub mod upload;
 pub mod upload_handler;
 pub(crate) mod versions;

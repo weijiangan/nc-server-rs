@@ -16,6 +16,7 @@
 use dav_server::fs::DavProp;
 
 use crate::metadata::NcMetaData;
+use crate::tags;
 
 // ─── Namespaces ───────────────────────────────────────────────────────────────
 
@@ -49,6 +50,8 @@ pub const OCS_NS: &str = "http://open-collaboration-services.org/ns";
 ///   `{oc:}permissions` (PHASE-5, REQ §6.5).
 /// - `note`: most-recent non-empty `oc_share.note` for this file (PHASE-7.6).
 /// - `has_preview`: computed from mimetype + preview config (§10.12).
+/// - `tags`: list of non-favorite tag names for `{oc:}tags` (§9.5).
+/// - `favorite`: whether the file is favorited for `{oc:}favorite` (§9.5).
 pub fn build_props(
     meta: &NcMetaData,
     instance_id: &str,
@@ -64,6 +67,8 @@ pub fn build_props(
     download_url: &str,
     note: &str,
     has_preview: bool,
+    tags: &[String],
+    favorite: bool,
 ) -> Vec<DavProp> {
     if !do_content {
         return prop_names();
@@ -111,8 +116,16 @@ pub fn build_props(
         make_prop("checksums", "oc", OC_NS, &checksums_val),
         make_prop("data-fingerprint", "oc", OC_NS, data_fingerprint),
         make_prop("downloadURL", "oc", OC_NS, download_url),
-        make_prop("tags", "oc", OC_NS, ""),
-        make_prop("favorite", "oc", OC_NS, "0"),
+        // §9.5: tags / favorite are populated from oc_vcategory / oc_vcategory_to_object.
+        // Tags are serialized as <oc:tags><oc:tag>...</oc:tag>...</oc:tags>.
+        // Favorite is "1" or "0".
+        make_prop("tags", "oc", OC_NS, &tags::format_tags_xml(tags)),
+        make_prop(
+            "favorite",
+            "oc",
+            OC_NS,
+            if favorite { "1" } else { "0" },
+        ),
         // {ocs:}share-permissions — per-share MAX permissions from oc_share;
         // defaults to 31 (all permissions) for the owner's own unshared file
         // (REQ §6.5 / §4.8, PHASE-7.6).
@@ -371,6 +384,7 @@ mod tests {
     /// Call `build_props` with sensible defaults.  Extra params added in §4.8,
     /// §4.11, and §7.6: `owner_display_name` as `"Alice Test"`; `sync_token = None`;
     /// `is_mounted = false`; `is_shared = false`; `share_permissions = 31`; `download_url = ""`; `note = ""`.
+    /// §9.5: `tags` = empty, `favorite` = false.
     fn build(meta: &NcMetaData) -> Vec<DavProp> {
         build_props(
             meta,
@@ -386,6 +400,8 @@ mod tests {
             31,
             "",
             "",
+            false,
+            &[],
             false,
         )
     }
@@ -542,6 +558,8 @@ mod tests {
             31,
             "",
             "",            false,
+            &[],
+            false,
         );
         let p = props
             .iter()
@@ -584,6 +602,8 @@ mod tests {
             31,
             url,
             "",            false,
+            &[],
+            false,
         );
         let p = props
             .iter()
@@ -615,6 +635,8 @@ mod tests {
             1,
             "",
             "",            false,
+            &[],
+            false,
         );
         let p = props
             .iter()
@@ -656,6 +678,8 @@ mod tests {
             31,
             "",
             "hello share note",            false,
+            &[],
+            false,
         );
         let p = props.iter().find(|p| p.name == "note").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -710,6 +734,8 @@ mod tests {
             31,
             "",
             "",            false,
+            &[],
+            false,
         );
         let p = props.iter().find(|p| p.name == "checksums").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -733,6 +759,8 @@ mod tests {
             31,
             "",
             "",            false,
+            &[],
+            false,
         );
         let p = props.iter().find(|p| p.name == "checksums").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -761,6 +789,8 @@ mod tests {
             31,
             "",
             "",            false,
+            &[],
+            false,
         );
         let oc_pv = props
             .iter()
@@ -801,6 +831,8 @@ mod tests {
         let meta = test_meta_with_path(Some("files"));
         let props = build_props(
             &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",            false,
+            &[],
+            false,
         );
         let p = props.iter().find(|p| p.name == "is-mount-root").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -815,6 +847,8 @@ mod tests {
         let meta = test_meta_with_path(Some(""));
         let props = build_props(
             &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",            false,
+            &[],
+            false,
         );
         let p = props.iter().find(|p| p.name == "is-mount-root").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -829,6 +863,8 @@ mod tests {
         let meta = test_meta_with_path(Some("files/Photos"));
         let props = build_props(
             &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",            false,
+            &[],
+            false,
         );
         let p = props.iter().find(|p| p.name == "is-mount-root").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -859,6 +895,8 @@ mod tests {
         let meta = test_meta(None);
         let names = build_props(
             &meta, "inst", "u", "U", false, "", 0, 0, false, false, 31, "", "",            false,
+            &[],
+            false,
         );
         let found = names
             .iter()
@@ -885,6 +923,8 @@ mod tests {
             31,
             "",
             "",            false,
+            &[],
+            false,
         );
         let p = props.iter().find(|p| p.name == "data-fingerprint").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -907,6 +947,8 @@ mod tests {
             31,
             "",
             "",            false,
+            &[],
+            false,
         );
         let p = props.iter().find(|p| p.name == "mount-type").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -929,6 +971,8 @@ mod tests {
             31,
             "",
             "",            false,
+            &[],
+            false,
         );
         let dirs = props
             .iter()
@@ -965,6 +1009,8 @@ mod tests {
             31,
             "",
             "",            false,
+            &[],
+            false,
         );
         let p = props
             .iter()
@@ -994,6 +1040,8 @@ mod tests {
             31,
             "",
             "",            false,
+            &[],
+            false,
         );
         for p in &props {
             if p.name == "quota-available-bytes" {

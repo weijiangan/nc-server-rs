@@ -58,6 +58,9 @@ pub struct NcFileSystem {
     /// `X-NC-Skip-Trashbin: true` header from the request.  When set, DELETE
     /// operations hard-delete instead of moving to trash (§9.3 critique #7).
     pub(crate) skip_trashbin: bool,
+    /// Per-request tag cache (§9.5).  Prefetched during `read_dir` for depth-1
+    /// PROPFIND, then read by `get_props` for each node.
+    pub(crate) tag_cache: crate::tags::TagCache,
 }
 
 impl NcFileSystem {
@@ -76,6 +79,7 @@ impl NcFileSystem {
             state.table_prefix.clone(),
             storage_id,
         );
+        let tag_cache = crate::tags::new_tag_cache();
         NcFileSystem {
             state,
             uid,
@@ -86,6 +90,7 @@ impl NcFileSystem {
             put_error,
             propagator,
             skip_trashbin,
+            tag_cache,
         }
     }
 
@@ -901,6 +906,20 @@ impl DavFileSystem for NcFileSystem {
                 &self.state.pool,
                 &self.state.table_prefix,
                 &child_fileids,
+            )
+            .await;
+
+            // §9.5: prefetch tags for the directory + all children so that
+            // depth-1 PROPFIND has {oc:}favorite and {oc:}tags ready without
+            // N+1 DB queries.  Include the directory itself.
+            let mut prefetch_ids = child_fileids.clone();
+            prefetch_ids.push(dir_row.fileid);
+            crate::tags::prefetch_tags(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.uid,
+                &prefetch_ids,
+                &self.tag_cache,
             )
             .await;
 
@@ -1841,6 +1860,16 @@ impl DavFileSystem for NcFileSystem {
                 self.state.preview_libreoffice_path.as_deref(),
             );
 
+            // §9.5: resolve tags / favorite from oc_vcategory / oc_vcategory_to_object.
+            let tag_info = crate::tags::get_tag_info(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.uid,
+                meta.fileid,
+                &self.tag_cache,
+            )
+            .await;
+
             let mut props = crate::props::build_props(
                 &meta,
                 instance_id,
@@ -1856,6 +1885,8 @@ impl DavFileSystem for NcFileSystem {
                 &download_url,
                 &note,
                 has_preview,
+                &tag_info.tags,
+                tag_info.is_favorite,
             );
 
             // ── Append custom properties from oc_properties (task §10.11) ─────
@@ -2067,6 +2098,77 @@ impl DavFileSystem for NcFileSystem {
                             }
                         }
 
+                        // §9.5: {oc:}favorite — truthy test: (int)1 || 'true' → tagAs,
+                        //                   falsy → unTag.  Returns 200.
+                        ("http://owncloud.org/ns", "favorite") => {
+                            let state = prop.xml.as_ref().and_then(|xml| {
+                                std::str::from_utf8(xml).ok().map(|s| s.to_string())
+                            });
+                            let is_fav = state.as_deref().map_or(false, |s| {
+                                s.parse::<i64>().ok() == Some(1) || s == "true"
+                            });
+                            let fileid = crate::row::lookup_by_path(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                self.storage_id,
+                                &fc_path,
+                            ).await.map(|r| r.fileid).unwrap_or(0);
+                            if fileid != 0 {
+                                let _ = crate::tags::set_favorite(
+                                    &self.state.pool,
+                                    &self.state.table_prefix,
+                                    &self.uid,
+                                    fileid,
+                                    is_fav,
+                                ).await;
+                                // Invalidate cached tags for this node.
+                                if let Ok(mut cache) = self.tag_cache.lock() {
+                                    cache.remove(&fileid);
+                                }
+                            }
+                            http::StatusCode::OK
+                        }
+
+                        // §9.5: {oc:}tags — diff current vs requested, skip favorite sentinel.
+                        ("http://owncloud.org/ns", "tags") => {
+                            let requested = prop.xml.as_ref()
+                                .map(|xml| crate::tags::parse_tags_xml(xml))
+                                .unwrap_or_default();
+                            if let Some(fc_row) = crate::row::lookup_by_path(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                self.storage_id,
+                                &fc_path,
+                            ).await {
+                                let fileid = fc_row.fileid;
+                                let tag_info = crate::tags::get_tag_info(
+                                    &self.state.pool,
+                                    &self.state.table_prefix,
+                                    &self.uid,
+                                    fileid,
+                                    &self.tag_cache,
+                                ).await;
+                                // Reconstruct the full tag list (including favorite sentinel if set).
+                                let mut current = tag_info.tags.clone();
+                                if tag_info.is_favorite {
+                                    current.push(crate::tags::TAG_FAVORITE.to_string());
+                                }
+                                crate::tags::update_tags(
+                                    &self.state.pool,
+                                    &self.state.table_prefix,
+                                    &self.uid,
+                                    fileid,
+                                    &current,
+                                    &requested,
+                                ).await;
+                                // Invalidate cached tags.
+                                if let Ok(mut cache) = self.tag_cache.lock() {
+                                    cache.remove(&fileid);
+                                }
+                            }
+                            http::StatusCode::OK
+                        }
+
                         _ => {
                             // Custom property → store in oc_properties (task §10.11).
                             let prop_name_full = format!("{{{ns}}}{name}");
@@ -2090,7 +2192,72 @@ impl DavFileSystem for NcFileSystem {
                 } else {
                     // DELETE — built-in props cannot be removed; custom props are
                     // deleted from oc_properties (task §10.11).
+                    // §9.5: {oc:}favorite and {oc:}tags are exceptions — PHP
+                    // handles these by clearing the tag/favorite state.
                     match (ns, name) {
+                        // §9.5: deleting {oc:}favorite → unTag TAG_FAVORITE → 204.
+                        ("http://owncloud.org/ns", "favorite") => {
+                            if let Some(fc_row) = crate::row::lookup_by_path(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                self.storage_id,
+                                &fc_path,
+                            ).await {
+                                let _ = crate::tags::un_tag(
+                                    &self.state.pool,
+                                    &self.state.table_prefix,
+                                    &self.uid,
+                                    fc_row.fileid,
+                                    crate::tags::TAG_FAVORITE,
+                                ).await;
+                                // Invalidate cached tags.
+                                if let Ok(mut cache) = self.tag_cache.lock() {
+                                    cache.remove(&fc_row.fileid);
+                                }
+                            }
+                            http::StatusCode::NO_CONTENT
+                        }
+                        // §9.5: deleting {oc:}tags → remove all non-favorite tags → 204.
+                        ("http://owncloud.org/ns", "tags") => {
+                            if let Some(fc_row) = crate::row::lookup_by_path(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                self.storage_id,
+                                &fc_path,
+                            ).await {
+                                let tag_info = crate::tags::get_tag_info(
+                                    &self.state.pool,
+                                    &self.state.table_prefix,
+                                    &self.uid,
+                                    fc_row.fileid,
+                                    &self.tag_cache,
+                                ).await;
+                                // Remove all non-favorite tags. Favorite status is preserved.
+                                let mut current = tag_info.tags.clone();
+                                if tag_info.is_favorite {
+                                    current.push(crate::tags::TAG_FAVORITE.to_string());
+                                }
+                                // Clear all tags (keep only favorite if present).
+                                let keep_fav: Vec<String> = if tag_info.is_favorite {
+                                    vec![crate::tags::TAG_FAVORITE.to_string()]
+                                } else {
+                                    vec![]
+                                };
+                                crate::tags::update_tags(
+                                    &self.state.pool,
+                                    &self.state.table_prefix,
+                                    &self.uid,
+                                    fc_row.fileid,
+                                    &current,
+                                    &keep_fav,
+                                ).await;
+                                // Invalidate cached tags.
+                                if let Ok(mut cache) = self.tag_cache.lock() {
+                                    cache.remove(&fc_row.fileid);
+                                }
+                            }
+                            http::StatusCode::NO_CONTENT
+                        }
                         ("DAV:", _)
                         | ("http://nextcloud.org/ns", _)
                         | ("http://owncloud.org/ns", _)
