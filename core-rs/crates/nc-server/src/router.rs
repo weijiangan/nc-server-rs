@@ -1,5 +1,6 @@
 use axum::{
     body::Body,
+    extract::{FromRef, State},
     http::{Method, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -55,6 +56,26 @@ async fn try_static_files(
         }
     }
     next.run(req).await
+}
+
+/// DAV arbiter-root handler — intercepts SEARCH and forwards to PHP-FPM.
+///
+/// PHP's `SearchDAV` + `FileSearchBackend` handle the full DASL protocol:
+/// XML parsing, operator translation, SQL generation, DB query, and
+/// `207 Multi-Status` formatting.  All other methods use the native
+/// Rust DAV handler.
+async fn dav_arbiter_handler(
+    State(state): State<AppState>,
+    req: Request<Body>,
+) -> Response {
+    if req.method().as_str() == "SEARCH" {
+        if let Some(ref fpm) = state.fastcgi {
+            return nc_fastcgi::proxy_handler(fpm, req).await;
+        }
+        // No PHP-FPM configured → fall through; the native handler
+        // will return 405 Method Not Allowed.
+    }
+    nc_dav::dav_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await
 }
 
 /// Fallback handler for PHP-FPM-bound routes.
@@ -121,8 +142,9 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
             "/remote.php/webdav/{*path}",
             axum::routing::any(nc_dav::dav_handler),
         )
-        .route("/remote.php/dav", axum::routing::any(nc_dav::dav_handler))
-        .route("/remote.php/dav/", axum::routing::any(nc_dav::dav_handler))
+        // §4.12 SEARCH at arbiter root — forwarded to PHP-FPM
+        .route("/remote.php/dav", axum::routing::any(dav_arbiter_handler))
+        .route("/remote.php/dav/", axum::routing::any(dav_arbiter_handler))
         // Non-files DAV sub-trees are served by PHP/SabreDAV.  These more-specific
         // routes must come before the generic `/remote.php/dav/{*path}` wildcard so
         // that axum matches them first.
@@ -143,8 +165,8 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
             "/remote.php/dav/{*path}",
             axum::routing::any(nc_dav::dav_handler),
         )
-        .route("/dav", axum::routing::any(nc_dav::dav_handler))
-        .route("/dav/", axum::routing::any(nc_dav::dav_handler))
+        .route("/dav", axum::routing::any(dav_arbiter_handler))
+        .route("/dav/", axum::routing::any(dav_arbiter_handler))
         .route("/dav/versions/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/dav/comments/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/dav/trashbin/{*path}", axum::routing::any(php_fpm_fallback))
