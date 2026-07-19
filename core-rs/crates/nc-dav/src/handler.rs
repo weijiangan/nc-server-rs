@@ -190,30 +190,79 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         )
         .await
         {
-            let body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-                        <d:error xmlns:d=\"DAV:\" xmlns:s=\"http://sabredav.org/ns\">\n  \
-                        <s:exception>OCA\\DAV\\Connector\\Sabre\\Exception\\InsufficientStorage\
-</s:exception>\n  \
-                        <s:message>Quota exceeded: insufficient free space to upload.</s:message>\n\
-                        </d:error>\n";
-            let mut resp = http::Response::builder()
-                .status(StatusCode::INSUFFICIENT_STORAGE)
-                .header(
-                    H_CSP.clone(),
-                    HeaderValue::from_static("default-src 'none';"),
-                )
-                .header(
-                    http::header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/xml; charset=utf-8"),
-                )
-                .body(Body::from(body))
-                .unwrap();
-            if let Ok(v) = HeaderValue::from_str(&request_id) {
-                resp.headers_mut().insert(H_X_REQUEST_ID.clone(), v);
-            }
-            return resp;
+            return insufficient_storage_response(
+                "Quota exceeded: insufficient free space to upload.",
+                &request_id,
+            );
         }
     }
+
+    // ── §10.6 Quota enforcement for MKCOL ────────────────────────────────
+    //
+    // PHP's QuotaPlugin::onCreateCollection checks a fixed 4096-byte
+    // assumption since MKCOL carries no Content-Length header.
+    if req_method.as_str() == "MKCOL" {
+        if let Err(()) = crate::quota::check_quota(
+            &state.pool,
+            &state.table_prefix,
+            &state.appconfig_cache,
+            &uid,
+            storage_id,
+            4096,
+        )
+        .await
+        {
+            return insufficient_storage_response(
+                "Quota exceeded: insufficient free space to create directory.",
+                &request_id,
+            );
+        }
+    }
+
+    // ── §10.6 Quota enforcement for COPY ─────────────────────────────────
+    //
+    // PHP's QuotaPlugin::beforeCopy checks the source node's size against
+    // the destination parent's free space.  For home-storage copies both
+    // source and destination share the same storage / free-space pool.
+    if req_method.as_str() == "COPY" {
+        let dav_path = req_path
+            .strip_prefix(strip_prefix.as_str())
+            .unwrap_or(&req_path);
+        let decoded = percent_decode_path(dav_path.trim_end_matches('/'));
+        let source_fc = crate::row::dav_to_fc_path(&decoded);
+        if let Some(src) =
+            crate::row::lookup_by_path(&state.pool, &state.table_prefix, storage_id, &source_fc)
+                .await
+        {
+            if src.size > 0 {
+                if let Err(()) = crate::quota::check_quota(
+                    &state.pool,
+                    &state.table_prefix,
+                    &state.appconfig_cache,
+                    &uid,
+                    storage_id,
+                    src.size,
+                )
+                .await
+                {
+                    return insufficient_storage_response(
+                        "Quota exceeded: insufficient free space to copy.",
+                        &request_id,
+                    );
+                }
+            }
+        }
+    }
+
+    // ── §10.6 MOVE — home-to-home rename consumes no new space ───────────
+    //
+    // PHP's QuotaPlugin::beforeMove checks ALL moves (including home-to-home
+    // renames), incorrectly blocking renames of files larger than free space
+    // when the operation uses no additional storage.  Rust skips the quota
+    // check for moves within the same home storage — chunked-upload assembly
+    // (MOVE from upload temp to files/) is already enforced by
+    // upload_handler.rs.  Cross-storage moves would need a check against the
+    // destination storage's free space but are not yet implemented.
 
     // ── §5.4 OC-Chunked v1: return 501 ────────────────────────────────────
     //
@@ -693,6 +742,35 @@ fn hex_nibble(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         _ => None,
     }
+}
+
+/// Build a `507 Insufficient Storage` XML error response matching PHP's
+/// `OCA\DAV\Connector\Sabre\Exception\InsufficientStorage`.
+fn insufficient_storage_response(message: &str, request_id: &str) -> Response {
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+         <d:error xmlns:d=\"DAV:\" xmlns:s=\"http://sabredav.org/ns\">\n  \
+         <s:exception>OCA\\DAV\\Connector\\Sabre\\Exception\\InsufficientStorage</s:exception>\n  \
+         <s:message>{}</s:message>\n\
+         </d:error>\n",
+        message
+    );
+    let mut resp = http::Response::builder()
+        .status(StatusCode::INSUFFICIENT_STORAGE)
+        .header(
+            H_CSP.clone(),
+            HeaderValue::from_static("default-src 'none';"),
+        )
+        .header(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/xml; charset=utf-8"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    if let Ok(v) = HeaderValue::from_str(request_id) {
+        resp.headers_mut().insert(H_X_REQUEST_ID.clone(), v);
+    }
+    resp
 }
 
 /// Extract the path component from a `Destination` header value.

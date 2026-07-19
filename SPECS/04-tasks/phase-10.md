@@ -56,13 +56,15 @@ Goal: fix behaviours in **already-implemented** Phase 4/5 tasks that were found 
 ### 10.6 Quota enforcement on MKCOL / MOVE / COPY (from §5.2) — MISSING coverage
 > PHP source: `apps/dav/lib/Connector/Sabre/QuotaPlugin.php` registers `beforeWriteContent`, `beforeCreateFile`, `beforeMove`, `beforeCopy` (`:61-65`) **and** `onCreateCollection` for MKCOL (`:114-128`). MKCOL uses a fixed **4096-byte** assumption (`:124`); `beforeMove`/`beforeCopy` check the **source node's size** against the destination parent's free space (`:154-190`). `getLength()` = largest of `X-Expected-Entity-Length` / `Content-Length` / `OC-Total-Length` (`:270`); negative/unknown free space → allowed; over → `InsufficientStorage` (`507`).
 
-- [ ] Rust enforces quota **only** for `PUT` (`nc-dav/src/handler.rs:162` `if req_method == Method::PUT`). Extend the check to:
+- [x] Rust enforces quota **only** for `PUT` (`nc-dav/src/handler.rs:162` `if req_method == Method::PUT`). Extend the check to:
   - **COPY** — source size vs destination-parent free space (the clearest gap: a `COPY` of a large file into a near-full folder must `507`)
   - **MOVE** — same, for cross-storage / chunk-assembly (`FutureFile`) moves (home-to-home rename consumes no new space, so only cross-storage matters)
   - **MKCOL** — fixed `4096`-byte check
-- [ ] Preserve the §5.2 semantics already correct for PUT (largest length header; negative free space skips; `507` on exceed)
+- [x] Preserve the §5.2 semantics already correct for PUT (largest length header; negative free space skips; `507` on exceed)
 
 **Verify:** `COPY` a file larger than remaining quota into a quota-limited folder → `507` (matching PHP); `MKCOL` at exactly-full quota → `507`; normal MOVE within home → unaffected.
+
+> **Deviations:** MOVE (home-to-home) intentionally skips quota enforcement. PHP's `QuotaPlugin::beforeMove` checks ALL moves, comparing the source file's full size against the destination parent's free space — but a home-to-home rename within the same storage consumes no new space, so PHP incorrectly blocks renames of files larger than the current free space. Rust skips the check for home-storage moves (the common case); chunked-upload assembly MOVE (from temp upload storage to files/) is already enforced by `upload_handler.rs`. Cross-storage moves are not yet implemented and would need a separate check against the destination storage's free space. The `InsufficientStorage` XML error response was extracted into a shared `insufficient_storage_response()` helper, replacing the inline XML body that was previously duplicated only for PUT. Message text varies by operation (`"…to upload"`, `"…to create directory"`, `"…to copy"`), matching the spirit of PHP's bifurcated messages for files vs. directories.
 
 ### 10.7 `downloadStartSecret` → `ocDownloadStarted` cookie (from §4.3) — MISSING behaviour
 > PHP source: `apps/dav/lib/Connector/Sabre/FilesPlugin.php:225-239` (`httpGet`) — when a GET carries a `downloadStartSecret` query parameter that is `<= 32` alphanumeric chars, PHP sets a short-lived cookie `ocDownloadStarted={token}` (`time() + 20`, path `/`).
