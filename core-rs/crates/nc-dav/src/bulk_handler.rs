@@ -127,11 +127,24 @@ pub async fn bulk_handler(
             }
         };
 
-        let mtime = part
-            .headers
-            .get("x-oc-mtime")
-            .or_else(|| part.headers.get("x-file-mtime"))
-            .and_then(|v| v.parse::<i64>().ok());
+        let mtime = match crate::mtime::sanitize_mtime(
+            part.headers
+                .get("x-oc-mtime")
+                .or_else(|| part.headers.get("x-file-mtime"))
+                .map(|s| s.as_str()),
+        ) {
+            Ok(v) => v,
+            Err(msg) => {
+                results.insert(
+                    file_path.clone(),
+                    serde_json::json!({
+                        "error": true,
+                        "message": msg,
+                    }),
+                );
+                continue;
+            }
+        };
 
         // ── §10.4 Per-part Content-Length and hash validation ─────────────────
         // Matches PHP MultipartRequestParser::parseNextPart() →

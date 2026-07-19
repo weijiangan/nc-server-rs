@@ -43,16 +43,35 @@ static H_X_USER_ID: HeaderName = HeaderName::from_static("x-user-id");
 /// Axum handler function for all DAV endpoints.
 pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Response {
     // ── Extract NC-specific headers before consuming the request ──────────
-    let x_oc_mtime: Option<i64> = req
-        .headers()
-        .get("x-oc-mtime")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok());
-    let x_oc_ctime: Option<i64> = req
-        .headers()
-        .get("x-oc-ctime")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok());
+    // §10.5: validate X-OC-MTime / X-OC-CTime against PHP MtimeSanitizer
+    let x_oc_mtime: Option<i64> = match crate::mtime::sanitize_mtime(
+        req.headers()
+            .get("x-oc-mtime")
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        Ok(v) => v,
+        Err(msg) => {
+            return http::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+                .body(Body::from(msg))
+                .unwrap();
+        }
+    };
+    let x_oc_ctime: Option<i64> = match crate::mtime::sanitize_mtime(
+        req.headers()
+            .get("x-oc-ctime")
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        Ok(v) => v,
+        Err(msg) => {
+            return http::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+                .body(Body::from(msg))
+                .unwrap();
+        }
+    };
 
     // 4.14.7 RequestIdHeaderPlugin: use incoming X-Request-Id or generate a UUID.
     let request_id: String = req

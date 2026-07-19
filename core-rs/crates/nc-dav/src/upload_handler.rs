@@ -552,11 +552,22 @@ async fn handle_move(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // Handle X-OC-MTime header
-    let mtime = parse_time_header(req.headers().get("x-oc-mtime"), now);
+    // Handle X-OC-MTime header (§10.5: validate with PHP MtimeSanitizer)
+    let mtime = match crate::mtime::sanitize_mtime(
+        req.headers().get("x-oc-mtime").and_then(|v| v.to_str().ok()),
+    ) {
+        Ok(Some(t)) => t,
+        Ok(None) => now,
+        Err(msg) => return bad_request_response(&msg),
+    };
 
-    // Handle X-OC-CTime header
-    let ctime = parse_time_header_opt(req.headers().get("x-oc-ctime"));
+    // Handle X-OC-CTime header (§10.5: validate with PHP MtimeSanitizer)
+    let ctime = match crate::mtime::sanitize_mtime(
+        req.headers().get("x-oc-ctime").and_then(|v| v.to_str().ok()),
+    ) {
+        Ok(v) => v,
+        Err(msg) => return bad_request_response(&msg),
+    };
 
     // Set file mtime using filetime
     let t = filetime::FileTime::from_unix_time(mtime, 0);
@@ -821,21 +832,6 @@ fn quota_exceeded_response() -> Response {
         )
         .body(Body::from(body))
         .unwrap()
-}
-
-// ─── Header parsing helpers ──────────────────────────────────────────────────────
-
-fn parse_time_header(header: Option<&http::HeaderValue>, default: i64) -> i64 {
-    header
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(default)
-}
-
-fn parse_time_header_opt(header: Option<&http::HeaderValue>) -> Option<i64> {
-    header
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<i64>().ok())
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────────
