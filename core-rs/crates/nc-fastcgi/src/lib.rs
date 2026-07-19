@@ -160,6 +160,44 @@ pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> R
     let content_type = header_str(&parts.headers, header::CONTENT_TYPE);
     let content_length = header_str(&parts.headers, header::CONTENT_LENGTH);
 
+    // Extract client IP (honouring X-Forwarded-For).
+    let remote_addr = parts
+        .headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(str::trim)
+        .unwrap_or("127.0.0.1")
+        .to_string();
+
+    // Parse Host header for SERVER_NAME / SERVER_PORT.
+    // Honour X-Forwarded-Host / X-Forwarded-Port when behind a reverse proxy.
+    let host_str = parts
+        .headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| parts.headers.get("host").and_then(|v| v.to_str().ok()))
+        .unwrap_or("localhost")
+        .to_owned();
+
+    let (server_name, server_port) = split_host_port(&host_str);
+    // Honour X-Forwarded-Port (takes priority over Host header port).
+    let server_port: u16 = parts
+        .headers
+        .get("x-forwarded-port")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(server_port);
+    // Honour X-Forwarded-Proto to set HTTPS flag.
+    let is_https = parts
+        .headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|p| p.eq_ignore_ascii_case("https"))
+        .unwrap_or(false);
+
+    let server_name = server_name.to_owned();
+
     // ── 5. Build FastCGI params ───────────────────────────────────────────────
     let document_root = fpm.nc_root.to_string_lossy().to_string();
     let mut params: fastcgi_client::Params<'static> = fastcgi_client::Params::default()
@@ -168,6 +206,11 @@ pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> R
         .server_protocol("HTTP/1.1")
         .request_method(method)
         .script_filename(shim_path_str)
+        // Standard CGI params (§RFC 3875) that PHP uses for URL construction.
+        .server_name(server_name)
+        .server_port(server_port)
+        .remote_addr(remote_addr)
+        .custom("HTTPS", if is_https { "on" } else { "" })
         .custom("NC_ORIGINAL_SCRIPT", nc_original_script)
         .custom("NC_ROOT", document_root)
         .custom("SCRIPT_NAME", script_rel_owned)
@@ -497,6 +540,23 @@ pub(crate) fn derive_script_info(uri_path: &str) -> (&str, &str) {
         (&uri_path[..script_end], &uri_path[script_end..])
     } else {
         ("/index.php", uri_path)
+    }
+}
+
+/// Split a `Host` header value into `(server_name, server_port)`.
+///
+/// `host:port` → `("host", port)`.  Bare hostname → `("host", 80)`.
+fn split_host_port(host: &str) -> (&str, u16) {
+    match host.rsplit_once(':') {
+        Some((name, port_str)) => {
+            if let Ok(port) = port_str.parse::<u16>() {
+                (name, port)
+            } else {
+                // Trailing colon segment isn't a port (e.g. IPv6 without brackets).
+                (host, 80)
+            }
+        }
+        None => (host, 80),
     }
 }
 
