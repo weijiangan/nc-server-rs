@@ -73,6 +73,15 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         }
     };
 
+    // §9.3: X-NC-Skip-Trashbin header — when "true", DELETE operations
+    // bypass the trashbin and hard-delete (PHP Storage.php:128).
+    let skip_trashbin: bool = req
+        .headers()
+        .get("x-nc-skip-trashbin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     // 4.14.7 RequestIdHeaderPlugin: use incoming X-Request-Id or generate a UUID.
     let request_id: String = req
         .headers()
@@ -456,7 +465,10 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
                     }
                 };
 
-                if trash_enabled {
+                // §9.3: skip the early trash-directory interception when
+                // X-NC-Skip-Trashbin is set — let dav-server call remove_dir,
+                // which checks should_move_to_trash and will hard-delete.
+                if trash_enabled && !skip_trashbin {
                     let write_result: crate::SharedWriteResult =
                         Arc::new(std::sync::Mutex::new(None));
                     let put_error: crate::SharedPutError = Arc::new(std::sync::Mutex::new(None));
@@ -468,9 +480,10 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
                         x_oc_ctime,
                         write_result,
                         put_error,
+                        skip_trashbin,
                     );
 
-                    match fs.trash_directory(&fc_path).await {
+                    match fs.delete_dir(&fc_path).await {
                         Ok(()) => {
                             return http::Response::builder()
                                 .status(StatusCode::NO_CONTENT)
@@ -514,6 +527,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         x_oc_ctime,
         write_result.clone(),
         put_error.clone(),
+        skip_trashbin,
     );
 
     let handler = DavConfig::new()

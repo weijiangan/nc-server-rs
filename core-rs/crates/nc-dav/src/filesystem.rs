@@ -55,6 +55,9 @@ pub struct NcFileSystem {
     /// Cache propagator — created once per request, shared by all mutations
     /// within the request.  Cheap to clone.
     pub(crate) propagator: Propagator,
+    /// `X-NC-Skip-Trashbin: true` header from the request.  When set, DELETE
+    /// operations hard-delete instead of moving to trash (§9.3 critique #7).
+    pub(crate) skip_trashbin: bool,
 }
 
 impl NcFileSystem {
@@ -66,6 +69,7 @@ impl NcFileSystem {
         x_oc_ctime: Option<i64>,
         write_result: crate::SharedWriteResult,
         put_error: crate::SharedPutError,
+        skip_trashbin: bool,
     ) -> Self {
         let propagator = Propagator::new(
             state.pool.clone(),
@@ -81,6 +85,7 @@ impl NcFileSystem {
             write_result,
             put_error,
             propagator,
+            skip_trashbin,
         }
     }
 
@@ -304,11 +309,44 @@ impl NcFileSystem {
         last_existing_row.ok_or_else(|| "Failed to ensure parent directory".to_string())
     }
 
+    /// Full PHP `Storage::doDelete` gating logic (`Storage.php:125-146`).
+    ///
+    /// A delete is a trash (not hard) only when **all** of these hold:
+    /// - `files_trashbin` app is enabled for the user
+    /// - The path is NOT a `.part` file (partial upload)
+    /// - `X-NC-Skip-Trashbin: true` header is NOT set
+    /// - The path is under the `files/` subtree
+    ///
+    /// Deviations from PHP:
+    /// - `MoveToTrashEvent` dispatch is skipped (no event system in Rust).
+    /// - Encryption-exception fallback is skipped (no server-side encryption).
+    /// - Cross-storage `disableTrash` is skipped (single-storage context).
+    async fn should_move_to_trash(&self, fc_path: &str) -> bool {
+        // App must be enabled.
+        if !self.is_trashbin_app_enabled().await {
+            return false;
+        }
+        // .part files are always hard-deleted (PHP line 127).
+        if fc_path.ends_with(".part") {
+            return false;
+        }
+        // X-NC-Skip-Trashbin: true → hard delete (PHP line 128).
+        if self.skip_trashbin {
+            return false;
+        }
+        // Only paths under "files/" are trashed (PHP shouldMoveToTrash:100).
+        // This also implicitly rejects paths under appdata_, files_trashbin, etc.
+        if !fc_path.starts_with("files/") {
+            return false;
+        }
+        true
+    }
+
     /// Check whether the `files_trashbin` app is enabled for the current user.
     ///
     /// Matches PHP `Trashbin::isEnabled()` which calls
     /// `AppManager::isEnabledForUser('files_trashbin')`.
-    async fn is_trashbin_enabled(&self) -> bool {
+    async fn is_trashbin_app_enabled(&self) -> bool {
         let sql = format!(
             "SELECT configvalue FROM {prefix}appconfig \
              WHERE appid = 'files_trashbin' AND configkey = 'enabled'",
@@ -335,14 +373,179 @@ impl NcFileSystem {
         }
     }
 
-    /// Delete a directory by moving it to the trash bin as a single unit,
-    /// matching PHP's `View::rmdir()` → `Trashbin::move2trash()` behaviour.
+    // ── delete_dir (centralized) ──────────────────────────────────────────
+
+    /// Delete a directory — the single entry point for all directory deletion.
     ///
-    /// Unlike dav-server-rs's recursive walk (which would call `remove_file`
-    /// for each child individually), this moves the entire directory tree
-    /// atomically — the directory is renamed on disk and its children's
-    /// filecache paths are updated to point inside the trashed directory.
-    /// Only ONE `oc_files_trash` row is inserted (for the directory itself).
+    /// Matching PHP's `View::rmdir()` pattern:
+    /// 1. Look up the directory and capture its size.
+    /// 2. Perform the operation (trash or hard-delete).
+    /// 3. Always propagate the size change to the parent chain.
+    ///
+    /// Called by both the handler's DELETE intercept and [`remove_dir`].
+    pub(crate) async fn delete_dir(&self, fc_path: &str) -> Result<(), FsError> {
+        // Capture the directory size before mutation (for propagation).
+        let dir_row = row::lookup_by_path(
+            &self.state.pool,
+            &self.state.table_prefix,
+            self.storage_id,
+            fc_path,
+        )
+        .await
+        .ok_or(FsError::NotFound)?;
+        let deleted_size = dir_row.size;
+
+        if self.should_move_to_trash(fc_path).await {
+            self.trash_directory(fc_path).await?;
+        } else {
+            // Trashbin app not enabled — hard delete.
+            let disk = self.disk_path(fc_path);
+            let d = disk.clone();
+            blocking(move || std::fs::remove_dir_all(&d))
+                .await
+                .map_err(io_to_fs)?;
+
+            let prefix = &self.state.table_prefix;
+            let like_pat = format!("{fc_path}/%");
+
+            // Clean up custom DAV properties before deleting filecache rows.
+            let _ = crate::row::delete_custom_properties_for_dir(
+                &self.state.pool,
+                prefix,
+                &self.uid,
+                self.storage_id,
+                fc_path,
+            )
+            .await;
+
+            let sql_ext = format!(
+                "DELETE FROM {prefix}filecache_extended \
+                 WHERE fileid IN (\
+                     SELECT fileid FROM {prefix}filecache \
+                     WHERE storage = $1 AND (path = $2 OR path LIKE $3)\
+                 )"
+            );
+            let _ = sqlx::query(&sql_ext)
+                .bind(self.storage_id)
+                .bind(fc_path)
+                .bind(&like_pat)
+                .execute(&self.state.pool)
+                .await;
+
+            let sql_subtree = format!(
+                "DELETE FROM {prefix}filecache WHERE storage = $1 AND (path = $2 OR path LIKE $3)"
+            );
+            sqlx::query(&sql_subtree)
+                .bind(self.storage_id)
+                .bind(fc_path)
+                .bind(&like_pat)
+                .execute(&self.state.pool)
+                .await
+                .map_err(|_| FsError::GeneralFailure)?;
+        }
+
+        // §9.2: always propagate — matching PHP's View::rmdir() calling
+        // Updater::remove() regardless of whether the storage trashed or
+        // hard-deleted.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if deleted_size > 0 {
+            let _ = self
+                .propagator
+                .propagate_change(fc_path, now, -deleted_size)
+                .await;
+        } else {
+            let _ = self
+                .propagator
+                .propagate_change(fc_path, now, 0)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    /// Delete a file — the single entry point for all file deletion.
+    ///
+    /// Matching PHP's `View::unlink()` pattern:
+    /// 1. Look up the file and capture its size.
+    /// 2. Perform the operation (trash or hard-delete).
+    /// 3. Always propagate the size change to the parent chain.
+    pub(crate) async fn delete_file(&self, fc_path: &str) -> Result<(), FsError> {
+        let frow = row::lookup_by_path(
+            &self.state.pool,
+            &self.state.table_prefix,
+            self.storage_id,
+            fc_path,
+        )
+        .await
+        .ok_or(FsError::NotFound)?;
+
+        let deleted_size = frow.size;
+
+        if self.should_move_to_trash(fc_path).await {
+            self.move_to_trash(fc_path, &frow).await?;
+        } else {
+            let disk = self.disk_path(fc_path);
+            let d = disk.clone();
+            blocking(move || std::fs::remove_file(&d))
+                .await
+                .map_err(io_to_fs)?;
+
+            let sql = format!(
+                "DELETE FROM {prefix}filecache WHERE fileid = $1",
+                prefix = self.state.table_prefix
+            );
+            sqlx::query(&sql)
+                .bind(frow.fileid)
+                .execute(&self.state.pool)
+                .await
+                .map_err(|_| FsError::GeneralFailure)?;
+
+            let sql_ext = format!(
+                "DELETE FROM {prefix}filecache_extended WHERE fileid = $1",
+                prefix = self.state.table_prefix
+            );
+            let _ = sqlx::query(&sql_ext)
+                .bind(frow.fileid)
+                .execute(&self.state.pool)
+                .await;
+
+            let _ = crate::row::delete_custom_properties_for_path(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.uid,
+                fc_path,
+            )
+            .await;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if deleted_size > 0 {
+            let _ = self
+                .propagator
+                .propagate_change(fc_path, now, -deleted_size)
+                .await;
+        } else {
+            let _ = self
+                .propagator
+                .propagate_change(fc_path, now, 0)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    // ── trash_directory ───────────────────────────────────────────────────
+
+    /// Move a directory tree to the trashbin.
+    ///
+    /// Does NOT handle propagation — [`delete_dir`] does that centrally
+    /// (matching PHP's View → Updater separation).
     pub(crate) async fn trash_directory(&self, fc_path: &str) -> Result<(), FsError> {
         let row = row::lookup_by_path(
             &self.state.pool,
@@ -413,7 +616,7 @@ impl NcFileSystem {
 
         // PHP Trashbin::move2trash() uses pathinfo():
         //   $filename = pathinfo($ownerPath)['basename'];  // e.g. "test.txt"
-        //   $location = pathinfo($ownerPath)['dirname'];   // e.g. "" or "Media"
+        //   $location = pathinfo($ownerPath)['dirname'];   // e.g. "." or "Media"
         //
         // The trash filename is built from the basename ONLY — directory
         // structure is NOT preserved.  A file at "Media/test.txt" becomes
@@ -516,7 +719,7 @@ impl NcFileSystem {
         //
         // PHP Trashbin::move2trash() uses pathinfo():
         //   $filename = pathinfo($ownerPath)['basename'];   // e.g. "test"
-        //   $location = pathinfo($ownerPath)['dirname'];    // e.g. "" or "Media"
+        //   $location = pathinfo($ownerPath)['dirname'];    // e.g. "." or "Media"
         //
         // The `id` column stores the basename so that
         // Trashbin::delete() can match it when stripping the
@@ -524,8 +727,8 @@ impl NcFileSystem {
         let trash_location = p
             .parent()
             .and_then(|d| d.to_str())
-            .unwrap_or("")
-            .trim_matches('.') // pathinfo returns "." for root → empty
+            .map(|s| if s.is_empty() { "." } else { s })
+            .unwrap_or(".")
             .to_string();
         // PHP `Trashbin::move2trash()` inserts ONLY these columns and leaves
         // `type` / `mime` NULL (migration Version1010Date20200630192639: `type`
@@ -1005,76 +1208,7 @@ impl DavFileSystem for NcFileSystem {
     fn remove_file<'a>(&'a self, path: &'a dav_server::davpath::DavPath) -> FsFuture<'a, ()> {
         async move {
             let fc_path = self.to_fc_path(path);
-            let frow = row::lookup_by_path(
-                &self.state.pool,
-                &self.state.table_prefix,
-                self.storage_id,
-                &fc_path,
-            )
-            .await
-            .ok_or(FsError::NotFound)?;
-
-            let deleted_size = frow.size; // Capture size before the row is mutated/deleted.
-
-            if self.is_trashbin_enabled().await {
-                // Move to trash instead of hard-deleting (REQ §6.7).
-                self.move_to_trash(&fc_path, &frow).await?;
-            } else {
-                // Trashbin app not enabled — hard delete.
-                let disk = self.disk_path(&fc_path);
-                blocking(move || std::fs::remove_file(&disk))
-                    .await
-                    .map_err(io_to_fs)?;
-
-                let sql = format!(
-                    "DELETE FROM {prefix}filecache WHERE fileid = $1",
-                    prefix = self.state.table_prefix
-                );
-                sqlx::query(&sql)
-                    .bind(frow.fileid)
-                    .execute(&self.state.pool)
-                    .await
-                    .map_err(|_| FsError::GeneralFailure)?;
-
-                let sql_ext = format!(
-                    "DELETE FROM {prefix}filecache_extended WHERE fileid = $1",
-                    prefix = self.state.table_prefix
-                );
-                let _ = sqlx::query(&sql_ext)
-                    .bind(frow.fileid)
-                    .execute(&self.state.pool)
-                    .await;
-
-                // Clean up custom DAV properties for this file (task §10.11).
-                let _ = crate::row::delete_custom_properties_for_path(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &self.uid,
-                    &fc_path,
-                )
-                .await;
-            }
-
-            // §9.2: propagate negative size to the parent chain.
-            // PHP Updater::remove passes -$entry->getSize() (Updater.php:112).
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            if deleted_size > 0 {
-                let _ = self
-                    .propagator
-                    .propagate_change(&fc_path, now, -deleted_size)
-                    .await;
-            } else {
-                // Even with zero size, still propagate etag/mtime.
-                let _ = self
-                    .propagator
-                    .propagate_change(&fc_path, now, 0)
-                    .await;
-            }
-
-            Ok(())
+            self.delete_file(&fc_path).await
         }
         .boxed()
     }
@@ -1084,89 +1218,7 @@ impl DavFileSystem for NcFileSystem {
     fn remove_dir<'a>(&'a self, path: &'a dav_server::davpath::DavPath) -> FsFuture<'a, ()> {
         async move {
             let fc_path = self.to_fc_path(path);
-
-            // Capture the directory size before mutation (for propagation).
-            let dir_row = row::lookup_by_path(
-                &self.state.pool,
-                &self.state.table_prefix,
-                self.storage_id,
-                &fc_path,
-            )
-            .await;
-            let deleted_size = dir_row.as_ref().map(|r| r.size).unwrap_or(0);
-
-            if self.is_trashbin_enabled().await {
-                // Delegate to trash_directory which moves the directory tree
-                // as a single unit.  This is only reached for subdirectories
-                // within a recursive delete — top-level DELETE for directories
-                // is intercepted in the handler.
-                self.trash_directory(&fc_path).await?;
-            } else {
-                // Trashbin app not enabled — hard delete.
-                let disk = self.disk_path(&fc_path);
-                blocking(move || std::fs::remove_dir_all(&disk))
-                    .await
-                    .map_err(io_to_fs)?;
-
-                let prefix = &self.state.table_prefix;
-                let like_pat = format!("{fc_path}/%");
-
-                // Clean up custom DAV properties before deleting filecache rows
-                // (delete_custom_properties_for_dir queries filecache for paths).
-                let _ = crate::row::delete_custom_properties_for_dir(
-                    &self.state.pool,
-                    prefix,
-                    &self.uid,
-                    self.storage_id,
-                    &fc_path,
-                )
-                .await;
-
-                let sql_ext = format!(
-                    "DELETE FROM {prefix}filecache_extended \
-                     WHERE fileid IN (\
-                         SELECT fileid FROM {prefix}filecache \
-                         WHERE storage = $1 AND (path = $2 OR path LIKE $3)\
-                     )"
-                );
-                let _ = sqlx::query(&sql_ext)
-                    .bind(self.storage_id)
-                    .bind(&fc_path)
-                    .bind(&like_pat)
-                    .execute(&self.state.pool)
-                    .await;
-
-                let sql_subtree = format!(
-                    "DELETE FROM {prefix}filecache WHERE storage = $1 AND (path = $2 OR path LIKE $3)"
-                );
-                sqlx::query(&sql_subtree)
-                    .bind(self.storage_id)
-                    .bind(&fc_path)
-                    .bind(&like_pat)
-                    .execute(&self.state.pool)
-                    .await
-                    .map_err(|_| FsError::GeneralFailure)?;
-            }
-
-            // §9.2: propagate negative size to the parent chain.
-            // PHP Updater::remove passes -$entry->getSize() (Updater.php:112).
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            if deleted_size > 0 {
-                let _ = self
-                    .propagator
-                    .propagate_change(&fc_path, now, -deleted_size)
-                    .await;
-            } else {
-                let _ = self
-                    .propagator
-                    .propagate_change(&fc_path, now, 0)
-                    .await;
-            }
-
-            Ok(())
+            self.delete_dir(&fc_path).await
         }
         .boxed()
     }
@@ -2181,8 +2233,8 @@ mod tests {
         let location = p
             .parent()
             .and_then(|d| d.to_str())
-            .unwrap_or("")
-            .trim_matches('.')
+            .map(|s| if s.is_empty() { "." } else { s })
+            .unwrap_or(".")
             .to_string();
 
         let trash_fc = trash_fc_name(&basename, now);
@@ -2266,10 +2318,10 @@ mod tests {
         // Trashbin::move2trash() line 263-268:
         //   $path_parts = pathinfo($ownerPath);
         //   $filename = $path_parts['basename'];  // "test"
-        //   $location = $path_parts['dirname'];   // "." → stored as ""
+        //   $location = $path_parts['dirname'];   // "." stored as "."
         let (basename, location, trash_fc) = trash_path_info("files/test", 1784065766);
         assert_eq!(basename, "test");
-        assert_eq!(location, ""); // "." trimmed to ""
+        assert_eq!(location, "."); // matches PHP pathinfo dirname for root-level items
         assert_eq!(trash_fc, "files_trashbin/files/test.d1784065766");
     }
 
@@ -2316,7 +2368,7 @@ mod tests {
         // Trashing a top-level directory like "files/Photos"
         let (basename, location, trash_fc) = trash_path_info("files/Photos", 1784000000);
         assert_eq!(basename, "Photos");
-        assert_eq!(location, "");
+        assert_eq!(location, "."); // matches PHP pathinfo dirname for root-level items
         assert_eq!(trash_fc, "files_trashbin/files/Photos.d1784000000");
     }
 
