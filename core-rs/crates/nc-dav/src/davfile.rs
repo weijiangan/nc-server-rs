@@ -27,6 +27,31 @@ use crate::propagator::Propagator;
 use nc_db::mime::SharedMimeCache;
 use nc_db::pool::DbPool;
 
+// ─── Preview cache path ─────────────────────────────────────────────────────
+
+/// Build the PHP preview cache directory path for a given fileid.
+///
+/// PHP `LocalPreviewStorage::constructPath()` generates the path from the
+/// MD5 of the fileid: 7 single-character subdirectories from the first 7
+/// hex digits of `md5(fileid)`, followed by the fileid itself.
+///
+/// Path: `{datadir}/appdata_{instanceid}/preview/{c0}/{c1}/.../{c6}/{fileid}/`
+pub(crate) fn preview_cache_dir(data_dir: &std::path::Path, instance_id: &str, fileid: i64) -> std::path::PathBuf {
+    use md5::Digest;
+    let digest = md5::Md5::digest(fileid.to_string().as_bytes());
+    let hash = format!("{:x}", digest);
+    let hash_dirs: String = hash
+        .chars()
+        .take(7)
+        .flat_map(|c| [std::path::MAIN_SEPARATOR, c])
+        .collect();
+    data_dir
+        .join(format!("appdata_{}", instance_id))
+        .join("preview")
+        .join(&hash_dirs[1..])
+        .join(fileid.to_string())
+}
+
 // ─── Running hash ─────────────────────────────────────────────────────────────
 
 /// Accumulates a hash over all bytes written during a PUT upload.
@@ -146,6 +171,8 @@ pub struct WriteCtx {
     pub data_dir:       std::path::PathBuf,
     /// MIME cache — needed for version filecache row (§9.4).
     pub mime_cache:     SharedMimeCache,
+    /// Nextcloud instance ID — needed to purge stale PHP preview caches.
+    pub instance_id:    std::sync::Arc<String>,
 }
 
 impl std::fmt::Debug for WriteCtx {
@@ -492,6 +519,43 @@ impl DavFile for NcDavFile {
                 .propagator
                 .propagate_change(&ctx.fc_path, use_mtime, size_diff)
                 .await;
+
+            // Invalidate stale previews so PHP-FPM regenerates from the new
+            // file content on next access.  Two layers must be cleared:
+            //
+            // 1. oc_previews DB rows (NC33+ preview metadata table).
+            //    PHP's Generator::generatePreviews() queries this table first.
+            //    If rows exist and the version matches PHP's cached file ETag
+            //    (which is stale — PHP-FPM never learns Rust updated the DB),
+            //    PHP serves the old preview.
+            //
+            // 2. Legacy preview files under appdata_/preview/.
+            //    If oc_previews returns empty, PHP's migrateOldPreviews()
+            //    re-imports files from this legacy cache right back into
+            //    oc_previews — creating an infinite stale-cache cycle.
+            //
+            // Both must be cleared simultaneously to force a clean generation.
+            // (Phase-11-compatible — oc_previews is the source of truth for Rust.)
+
+            // Layer 1: DB metadata.
+            let sql = format!(
+                "DELETE FROM {prefix}previews WHERE file_id = $1",
+                prefix = prefix
+            );
+            let _ = sqlx::query(&sql).bind(fileid).execute(pool).await;
+
+            // Layer 2: Legacy preview files on disk.
+            let preview_dir = preview_cache_dir(&ctx.data_dir, &ctx.instance_id, fileid);
+            if let Err(e) = tokio::fs::remove_dir_all(&preview_dir).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        fileid = fileid,
+                        preview_dir = %preview_dir.display(),
+                        error = %e,
+                        "Failed to purge legacy preview files"
+                    );
+                }
+            }
 
             // §9.4: insert oc_files_versions for the file's current mtime so
             // PHP-FPM's versions PROPFIND has nc:version-author.

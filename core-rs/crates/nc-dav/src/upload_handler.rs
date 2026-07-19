@@ -678,6 +678,33 @@ async fn handle_move(
         tracing::warn!(error = %e, "Failed to clean up chunk directory");
     }
 
+    // Invalidate stale previews (DB rows + legacy files) when overwriting.
+    if target_exists {
+        // Layer 1: oc_previews DB metadata.
+        let sql = format!(
+            "DELETE FROM {prefix}previews WHERE file_id = $1",
+            prefix = state.table_prefix
+        );
+        let _ = sqlx::query(&sql).bind(fid).execute(&state.pool).await;
+
+        // Layer 2: Legacy preview files on disk.
+        let preview_dir = crate::davfile::preview_cache_dir(
+            &state.data_directory,
+            &state.instance_id,
+            fid,
+        );
+        if let Err(e) = fs::remove_dir_all(&preview_dir).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    fileid = fid,
+                    preview_dir = %preview_dir.display(),
+                    error = %e,
+                    "Failed to purge legacy preview files"
+                );
+            }
+        }
+    }
+
     // Remove the upload session
     state.upload_state_store.remove_session(upload_id).await;
 

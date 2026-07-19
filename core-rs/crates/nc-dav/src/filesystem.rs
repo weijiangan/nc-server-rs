@@ -1113,6 +1113,7 @@ impl DavFileSystem for NcFileSystem {
                     propagator: self.propagator.clone(),
                     data_dir: self.state.data_directory.clone(),
                     mime_cache: self.state.mime_cache.clone(),
+                    instance_id: self.state.instance_id.clone(),
                 };
 
                 Ok(Box::new(NcDavFile {
