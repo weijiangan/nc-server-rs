@@ -62,6 +62,18 @@ pub struct NcConfig {
     #[serde(default = "default_true")]
     pub bulkupload_enabled: bool,
 
+    // ── Preview / thumbnail (§10.12) ──────────────────────────────────────────
+    /// Whether the preview system is enabled.
+    /// Key: `enable_previews` in `config.php`.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub enable_previews: bool,
+    /// Path to the ffmpeg binary for video previews.
+    /// Key: `preview_ffmpeg_path`.  When absent, video previews are unavailable.
+    pub preview_ffmpeg_path: Option<String>,
+    /// Path to the LibreOffice binary for office document previews.
+    /// Key: `preview_libreoffice_path`.  When absent, office previews are unavailable.
+    pub preview_libreoffice_path: Option<String>,
+
     // ── FastCGI / PHP-FPM dispatch (§7 Phase 7) ────────────────────────────────
     /// Unix socket path for PHP-FPM proxy dispatch (Phase 7).
     /// Key: `fastcgi_socket` in `config.php`, e.g. `/run/nc-fpm.sock`.

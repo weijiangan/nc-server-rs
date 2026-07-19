@@ -48,6 +48,7 @@ pub const OCS_NS: &str = "http://open-collaboration-services.org/ns";
 ///   share (i.e. is a recipient, not the owner). Adds the `S` flag to
 ///   `{oc:}permissions` (PHASE-5, REQ §6.5).
 /// - `note`: most-recent non-empty `oc_share.note` for this file (PHASE-7.6).
+/// - `has_preview`: computed from mimetype + preview config (§10.12).
 pub fn build_props(
     meta: &NcMetaData,
     instance_id: &str,
@@ -62,6 +63,7 @@ pub fn build_props(
     share_permissions: i32,
     download_url: &str,
     note: &str,
+    has_preview: bool,
 ) -> Vec<DavProp> {
     if !do_content {
         return prop_names();
@@ -122,7 +124,13 @@ pub fn build_props(
         ),
         // ── nc: ──────────────────────────────────────────────────────────
         // NOTE: nc:has-preview only — oc:has-preview does NOT exist (REQ §6.5)
-        make_prop("has-preview", "nc", NC_NS, "false"),
+        // §10.12: computed from mimetype + preview config, not hardcoded.
+        make_prop(
+            "has-preview",
+            "nc",
+            NC_NS,
+            if has_preview { "true" } else { "false" },
+        ),
         make_prop(
             "creation_time",
             "nc",
@@ -378,6 +386,7 @@ mod tests {
             31,
             "",
             "",
+            false,
         )
     }
 
@@ -532,7 +541,7 @@ mod tests {
             false,
             31,
             "",
-            "",
+            "",            false,
         );
         let p = props
             .iter()
@@ -574,7 +583,7 @@ mod tests {
             false,
             31,
             url,
-            "",
+            "",            false,
         );
         let p = props
             .iter()
@@ -605,7 +614,7 @@ mod tests {
             false,
             1,
             "",
-            "",
+            "",            false,
         );
         let p = props
             .iter()
@@ -646,7 +655,7 @@ mod tests {
             false,
             31,
             "",
-            "hello share note",
+            "hello share note",            false,
         );
         let p = props.iter().find(|p| p.name == "note").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -700,7 +709,7 @@ mod tests {
             false,
             31,
             "",
-            "",
+            "",            false,
         );
         let p = props.iter().find(|p| p.name == "checksums").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -723,7 +732,7 @@ mod tests {
             false,
             31,
             "",
-            "",
+            "",            false,
         );
         let p = props.iter().find(|p| p.name == "checksums").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -751,7 +760,7 @@ mod tests {
             false,
             31,
             "",
-            "",
+            "",            false,
         );
         let oc_pv = props
             .iter()
@@ -791,7 +800,7 @@ mod tests {
     fn is_mount_root_true_for_files_path() {
         let meta = test_meta_with_path(Some("files"));
         let props = build_props(
-            &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",
+            &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",            false,
         );
         let p = props.iter().find(|p| p.name == "is-mount-root").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -805,7 +814,7 @@ mod tests {
     fn is_mount_root_true_for_empty_path() {
         let meta = test_meta_with_path(Some(""));
         let props = build_props(
-            &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",
+            &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",            false,
         );
         let p = props.iter().find(|p| p.name == "is-mount-root").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -819,7 +828,7 @@ mod tests {
     fn is_mount_root_false_for_subdir() {
         let meta = test_meta_with_path(Some("files/Photos"));
         let props = build_props(
-            &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",
+            &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",            false,
         );
         let p = props.iter().find(|p| p.name == "is-mount-root").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -849,7 +858,7 @@ mod tests {
     fn hide_download_in_prop_names() {
         let meta = test_meta(None);
         let names = build_props(
-            &meta, "inst", "u", "U", false, "", 0, 0, false, false, 31, "", "",
+            &meta, "inst", "u", "U", false, "", 0, 0, false, false, 31, "", "",            false,
         );
         let found = names
             .iter()
@@ -875,7 +884,7 @@ mod tests {
             false,
             31,
             "",
-            "",
+            "",            false,
         );
         let p = props.iter().find(|p| p.name == "data-fingerprint").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -897,7 +906,7 @@ mod tests {
             false,
             31,
             "",
-            "",
+            "",            false,
         );
         let p = props.iter().find(|p| p.name == "mount-type").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
@@ -919,7 +928,7 @@ mod tests {
             false,
             31,
             "",
-            "",
+            "",            false,
         );
         let dirs = props
             .iter()
@@ -955,7 +964,7 @@ mod tests {
             false,
             31,
             "",
-            "",
+            "",            false,
         );
         let p = props
             .iter()
@@ -984,7 +993,7 @@ mod tests {
             false,
             31,
             "",
-            "",
+            "",            false,
         );
         for p in &props {
             if p.name == "quota-available-bytes" {

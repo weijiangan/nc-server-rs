@@ -9,6 +9,7 @@ pub mod handler;
 pub mod locksystem;
 pub mod metadata;
 pub(crate) mod mtime;
+pub(crate) mod preview;
 pub mod props;
 pub mod quota;
 pub mod row;
@@ -83,4 +84,11 @@ pub struct NcDavState {
     /// In-process store for chunked upload v2 metadata.
     /// Used when no distributed cache is configured (PHASE-5.5).
     pub upload_state_store: SharedUploadStateStore,
+    // ── Preview / thumbnail config (§10.12) ────────────────────────────────
+    /// Whether previews are enabled (system config `enable_previews`, default true).
+    pub enable_previews: bool,
+    /// Path to ffmpeg binary for video thumbnail generation.
+    pub preview_ffmpeg_path: Option<String>,
+    /// Path to LibreOffice binary for office document thumbnail generation.
+    pub preview_libreoffice_path: Option<String>,
 }

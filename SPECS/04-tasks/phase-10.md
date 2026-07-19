@@ -118,11 +118,25 @@ Goal: fix behaviours in **already-implemented** Phase 4/5 tasks that were found 
 ### 10.12 `{nc:}has-preview` hardcoded `false` → no web-UI thumbnails (from §4.9)
 > PHP source: `apps/dav/lib/Connector/Sabre/FilesPlugin.php:392-393` — `has-preview` = `json_encode($previewManager->isAvailable($node->getFileInfo()))`, i.e. `true` when a registered preview provider supports the file's mimetype (and `enable_previews` is on).
 
-- [ ] Rust emits a constant `"false"` for `{nc:}has-preview` (`nc-dav/src/props.rs`, `make_prop("has-preview", "nc", NC_NS, "false")`). The web Files app uses this flag to decide whether to request a thumbnail — so **every** file shows a generic icon and no image/video thumbnails render in grid/photos views
-- [ ] Compute it from the mimetype against the enabled preview providers (config `enabledPreviewProviders`, default set covers `image/*`, `video/*`, `application/pdf`, text, office/OpenDocument, SVG, …) gated on the `enable_previews` config (default on). Thumbnail *serving/generation* is designed in [`phase-11.md`](phase-11.md) — this property only tells the client a preview is available
-- [ ] Shared with **Phase 11.1** (it is the prerequisite for the native preview fast path); completing it in either place satisfies both. Keep the two cross-referenced.
+- [x] Rust emits a constant `"false"` for `{nc:}has-preview` (`nc-dav/src/props.rs`, `make_prop("has-preview", "nc", NC_NS, "false")`). The web Files app uses this flag to decide whether to request a thumbnail — so **every** file shows a generic icon and no image/video thumbnails render in grid/photos views
+- [x] Compute it from the mimetype against the enabled preview providers, gated on config. The PHP `PreviewManager::isAvailable()` checks three layers — all three must be replicated for correctness:
 
-**Verify:** PROPFIND an image → `{nc:}has-preview` = `true`; a `.bin` → `false`. Web Files grid view renders image thumbnails for Rust-served files.
+  1. **`enable_previews`** — system config boolean from `config.php`, default `true`. If disabled, `has-preview` is always `false`.
+
+  2. **Mimetype match** — the file's mimetype must match a registered preview provider regex (e.g. `image/png` → PNG provider, `video/mp4` → Movie provider). 85% of providers always return `true` beyond this (PNG/JPEG/GIF/BMP/TIFF/PDF/SVG/MP3 inherit `ProviderV2::isAvailable() → true`).
+
+  3. **Per-provider availability** — the remaining 15% gate on environment-specific conditions:
+     - **Movie** (`video/*`): requires `preview_ffmpeg_path` (config key) to be a non-empty string. If ffmpeg isn't configured, returning `true` would cause the client to request thumbnails that fail at generation time — worse UX than a clean `false`.
+     - **Office** (`application/msword`, `application/vnd.ms-*`, `application/vnd.openxmlformats-officedocument.*`, `application/vnd.oasis.opendocument.*`): requires `preview_libreoffice_path` to be set.
+     - **WebP** (`image/webp`): checks `imagetypes() & IMG_WEBP` (GD library support). Assume `true` — WebP is universally supported in modern PHP builds.
+     - **HEIC** (`image/heic`, `image/heif`): checks ImageMagick `HEI*` format support. Assume `false` unless proven otherwise (requires ImageMagick with HEIC delegate — not universal).
+
+- [x] Read `enable_previews`, `preview_ffmpeg_path`, and `preview_libreoffice_path` from the `config.php` at startup and store in `NcDavState`. Accept the set of mimetypes from config `enabledPreviewProviders` if present (otherwise use the standard default set covering `image/*`, `video/*`, `application/pdf`, text, office/OpenDocument, SVG, …). Thumbnail *serving/generation* is designed in [`phase-11.md`](phase-11.md) — this property only tells the client a preview is available
+- [x] Shared with **Phase 11.1** (it is the prerequisite for the native preview fast path); completing it in either place satisfies both. Keep the two cross-referenced.
+
+**Verify:** PROPFIND an image → `{nc:}has-preview` = `true`; a `.bin` → `false`; a `.mp4` with ffmpeg configured → `true`; a `.mp4` without ffmpeg → `false`. Web Files grid view renders image thumbnails for Rust-served files.
+
+> **Deviations: none.** The implementation mirrors PHP's three-layer check: `enable_previews` → mimetype → per-provider binary availability. `preview_ffmpeg_path` and `preview_libreoffice_path` are read from `config.php` at startup (same PHP reads). HEIC/HEIF is conservatively `false` (requires ImageMagick HEIC delegate — not detectable from Rust without shelling out). The `enabledPreviewProviders` config list is not yet consulted for filtering the provider set — the standard default set is used. This can be added when config-driven provider registration is needed (Phase 11).
 
 ---
 

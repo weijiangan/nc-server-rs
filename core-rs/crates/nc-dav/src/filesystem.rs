@@ -1479,6 +1479,15 @@ impl DavFileSystem for NcFileSystem {
             // Shared nodes (from oc_share) are detected via is_mounted/share_permissions.
             let is_shared = false;
 
+            // §10.12: compute {nc:}has-preview from mimetype + preview config.
+            let has_preview = crate::preview::has_preview(
+                &meta.mime_type,
+                self.state.enable_previews,
+                is_mounted,
+                self.state.preview_ffmpeg_path.as_deref(),
+                self.state.preview_libreoffice_path.as_deref(),
+            );
+
             let mut props = crate::props::build_props(
                 &meta,
                 instance_id,
@@ -1493,6 +1502,7 @@ impl DavFileSystem for NcFileSystem {
                 share_permissions,
                 &download_url,
                 &note,
+                has_preview,
             );
 
             // ── Append custom properties from oc_properties (task §10.11) ─────

@@ -95,6 +95,9 @@ impl FromRef<AppState> for nc_dav::NcDavState {
             filename_validator,
             base_url,
             upload_state_store: state.upload_state_store.clone(),
+            enable_previews: state.nc_config.enable_previews,
+            preview_ffmpeg_path: state.nc_config.preview_ffmpeg_path.clone(),
+            preview_libreoffice_path: state.nc_config.preview_libreoffice_path.clone(),
         }
     }
 }
