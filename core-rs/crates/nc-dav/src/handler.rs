@@ -88,6 +88,20 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // §10.7 — Extract downloadStartSecret query parameter for the
+    // ocDownloadStarted cookie (PHP FilesPlugin::httpGet, line 243).
+    // PHP uses SabreDAV's getQueryParameters() which calls parse_str()
+    // and URL-decodes the value; we match by percent-decoding.
+    let download_start_token: Option<String> = req
+        .uri()
+        .query()
+        .and_then(|q| {
+            q.split('&')
+                .find(|p| p.starts_with("downloadStartSecret="))
+                .map(|p| p.splitn(2, '=').nth(1).unwrap_or(""))
+        })
+        .map(|raw| percent_decode_path(raw));
+
     // §5.2 — Upload size for quota enforcement.
     // Take the maximum of all three size hints (REQ §7.1).
     let max_upload_bytes: i64 = [
@@ -564,6 +578,22 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         parts
             .headers
             .insert(H_X_ACCEL_BUFFERING.clone(), HeaderValue::from_static("no"));
+
+        // §10.7: downloadStartSecret → ocDownloadStarted cookie.
+        // PHP FilesPlugin::httpGet line 243-249: if the query string carries
+        // ?downloadStartSecret={token} and the token is ≤32 alphanumeric
+        // chars, set a short-lived cookie so the web UI knows the download
+        // has begun and can clear its "preparing download" spinner.
+        if let Some(ref token) = download_start_token {
+            if let Some(cookie_val) = build_download_started_cookie(token) {
+                if let Ok(v) = http::HeaderValue::from_str(&cookie_val) {
+                    parts.headers.insert(
+                        http::header::SET_COOKIE,
+                        v,
+                    );
+                }
+            }
+        }
     }
 
     // 3. Write-response headers: OC-FileId, ETag, OC-ETag, X-OC-MTime/CTime (REQ §6.4 / §7.1)
@@ -776,6 +806,25 @@ fn insufficient_storage_response(message: &str, request_id: &str) -> Response {
     resp
 }
 
+/// Build a `Set-Cookie` header value for the `ocDownloadStarted` cookie,
+/// matching PHP `FilesPlugin::httpGet()` (`apps/dav/lib/Connector/Sabre/FilesPlugin.php:243-249`).
+///
+/// Returns `None` when the token is invalid (too long or non-alphanumeric).
+/// PHP guards: `!isset($token[32]) && preg_match('!^[a-zA-Z0-9]+$!', $token) === 1`.
+fn build_download_started_cookie(token: &str) -> Option<String> {
+    // PHP: !isset($token[32]) && preg_match('!^[a-zA-Z0-9]+$!', $token)
+    // The `+` requires at least one character; an empty string is rejected.
+    if token.is_empty() || token.len() > 32 || !token.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    // PHP: setcookie('ocDownloadStarted', $token, time() + 20, '/')
+    // Max-Age=20, Path=/
+    Some(format!(
+        "ocDownloadStarted={}; Max-Age=20; Path=/",
+        token
+    ))
+}
+
 /// Extract the path component from a `Destination` header value.
 ///
 /// If the value is a full URL (`http://host/path`), strips the scheme and
@@ -886,8 +935,8 @@ fn determine_prefix(path: &str, uid: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        determine_prefix, percent_decode_path, percent_encode_filename, url_to_path,
-        write_target_name,
+        build_download_started_cookie, determine_prefix, percent_decode_path,
+        percent_encode_filename, url_to_path, write_target_name,
     };
     use http::Method;
 
@@ -1131,5 +1180,32 @@ mod tests {
             "/remote.php/dav/files/admin",
         );
         assert_eq!(fc, "files/café");
+    }
+
+    // ── §10.7 downloadStartSecret → ocDownloadStarted cookie ─────────────
+
+    #[test]
+    fn download_started_cookie_valid() {
+        let val = build_download_started_cookie("abc123").unwrap();
+        assert_eq!(val, "ocDownloadStarted=abc123; Max-Age=20; Path=/");
+    }
+
+    #[test]
+    fn download_started_cookie_exactly_32_chars() {
+        let token = "a".repeat(32);
+        assert!(build_download_started_cookie(&token).is_some());
+    }
+
+    #[test]
+    fn download_started_cookie_too_long() {
+        let token = "a".repeat(33);
+        assert!(build_download_started_cookie(&token).is_none());
+    }
+
+    #[test]
+    fn download_started_cookie_non_alphanumeric() {
+        assert!(build_download_started_cookie("ab cd").is_none());
+        assert!(build_download_started_cookie("ab;cd").is_none());
+        assert!(build_download_started_cookie("").is_none());
     }
 }

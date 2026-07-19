@@ -69,10 +69,12 @@ Goal: fix behaviours in **already-implemented** Phase 4/5 tasks that were found 
 ### 10.7 `downloadStartSecret` → `ocDownloadStarted` cookie (from §4.3) — MISSING behaviour
 > PHP source: `apps/dav/lib/Connector/Sabre/FilesPlugin.php:225-239` (`httpGet`) — when a GET carries a `downloadStartSecret` query parameter that is `<= 32` alphanumeric chars, PHP sets a short-lived cookie `ocDownloadStarted={token}` (`time() + 20`, path `/`).
 
-- [ ] On `GET /dav/files/{userId}/…?downloadStartSecret={token}`: if `token` is `<= 32` chars and matches `^[a-zA-Z0-9]+$`, set `Set-Cookie: ocDownloadStarted={token}; Max-Age=20; Path=/`. Rust GET has no handling for this (grep: none). Used by the web Files app to detect that a download has begun (clears the "preparing download" state)
-- [ ] Ignore silently when the parameter is absent or invalid (no cookie, no error)
+- [x] On `GET /dav/files/{userId}/…?downloadStartSecret={token}`: if `token` is `<= 32` chars and matches `^[a-zA-Z0-9]+$`, set `Set-Cookie: ocDownloadStarted={token}; Max-Age=20; Path=/`. Rust GET has no handling for this (grep: none). Used by the web Files app to detect that a download has begun (clears the "preparing download" state)
+- [x] Ignore silently when the parameter is absent or invalid (no cookie, no error)
 
 **Verify:** `GET …?downloadStartSecret=abc123` → response carries `Set-Cookie: ocDownloadStarted=abc123` (Max-Age 20); an over-long or non-alphanumeric token sets no cookie; the web UI download-progress indicator clears.
+
+> **Deviations: none.** Validation matches PHP exactly: `!isset($token[32])` (≤32 chars) + `preg_match('!^[a-zA-Z0-9]+$!', $token)` (non-empty alphanumeric only, `+` requires ≥1 char). The query parameter is URL-decoded before validation (PHP uses `parse_str()` which does the same). Cookie attributes match: `Max-Age=20; Path=/`. The cookie is set on all successful GET responses (2xx), matching PHP's placement in `httpGet()` which fires for every file GET.
 
 ### 10.8 Wrong `oc_filecache.mimepart` on every write (from §4.4/§4.5/§5.7/§5.9) — DB-interop bug
 > PHP source: `lib/private/Files/Cache/Cache.php:466` — `mimepart = mimetypeLoader->getId(substr($mimetype, 0, strpos($mimetype, '/')))`, i.e. the part is stored **without** a trailing slash (`image`, `httpd`, …). Mimetype filtering queries by it: `Cache.php:227` `WHERE mimepart = {id}`.
