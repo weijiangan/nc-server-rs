@@ -36,10 +36,12 @@ Goal: fix behaviours in **already-implemented** Phase 4/5 tasks that were found 
 ### 10.4 Bulk-upload per-part hash validation (from §5.9) — MISSING behaviour
 > PHP source: `apps/dav/lib/BulkUpload/MultipartRequestParser.php:141-146` — `parseNextPart()` reads `content-length` (required → `LengthRequired` if absent) and calls `validateHash($length, $headers['x-file-md5'] ?? '', $headers['oc-checksum'] ?? '')` before returning the part content.
 
-- [ ] Validate each bulk part against its `X-File-MD5` header (MD5 of the part content) and/or `OC-Checksum` header (standard `{ALG}:{hash}` format) — reject the part (or request) on mismatch, matching PHP `MultipartRequestParser::validateHash()`. Rust's bulk handler (`nc-dav/src/bulk_handler.rs`) currently performs **no** per-part hash check (grep: no `x-file-md5` handling)
-- [ ] Per-part `Content-Length` is **required**; a missing length is a `411 Length Required` (PHP `LengthRequired`)
+- [x] Validate each bulk part against its `X-File-MD5` header (MD5 of the part content) and/or `OC-Checksum` header (standard `{ALG}:{hash}` format) — reject the part (or request) on mismatch, matching PHP `MultipartRequestParser::validateHash()`. Rust's bulk handler (`nc-dav/src/bulk_handler.rs`) currently performs **no** per-part hash check (grep: no `x-file-md5` handling)
+- [x] Per-part `Content-Length` is **required**; a missing length is a `411 Length Required` (PHP `LengthRequired`)
 
 **Verify:** bulk POST with a part whose `X-File-MD5` mismatches the body → that part reports an error (and/or `400`), matching PHP; a part missing `Content-Length` → `411`.
+
+> **Deviations:** the implementation follows PHP's actual HTTP behavior, not the exception class name. PHP throws `Sabre\DAV\Exception\LengthRequired` (HTTP 411) for missing `Content-Length`, but `BulkUploadPlugin::httpPost()` catches all `\Exception` and sets status to `400` (not 411) with partial JSON results. Rust matches the observed HTTP status (400 for all parse/hash errors, partial results returned). Hash comparison is case-sensitive (`!=`) matching PHP's `!==`. Supported algorithms are `md5`, `sha1`/`sha-1`, `sha256`/`sha-256`, `sha384`/`sha-384`, `sha512`/`sha-512`, `adler32`/`adler-32` — PHP's `hash_init()` supports arbitrary registered algorithms, but these cover all checksums used by Nextcloud desktop/mobile clients.
 
 ### 10.5 `X-OC-MTime` / `X-OC-CTime` sanitization (from §5.3/§5.7/§5.9) — MISSING validation
 > PHP source: `apps/dav/lib/Connector/Sabre/MtimeSanitizer.php:12-38` — `sanitizeMtime()` throws `InvalidArgumentException` when the value is **non-numeric or hexadecimal**, or when the integer is **`<= 86400`** ("must be a valid positive unix timestamp greater than one day"). Called from `File.php:348,361`, `ChunkingV2Plugin.php:293`, and bulk (`MtimeSanitizer`).

@@ -1,11 +1,15 @@
 //! Handler for bulk upload endpoint (`POST /dav/bulk`).
 //!
 //! Parses `multipart/related` body; per-part headers `X-File-Path`,
-//! `X-OC-MTime` / `X-File-MTime`, `Content-Length`.
+//! `X-OC-MTime` / `X-File-MTime`, `Content-Length`, `X-File-MD5`,
+//! `OC-Checksum`.
 //!
 //! Response: JSON map of path → `{error, etag, fileid, permissions}`.
 //!
-//! Matches PHP behavior (`BulkUploadPlugin.php`):
+//! Matches PHP behavior (`BulkUploadPlugin.php` / `MultipartRequestParser.php`):
+//! - Per-part `Content-Length` is required; missing → parse error / 400.
+//! - Per-part hash (`X-File-MD5` / `OC-Checksum`) is required and validated
+//!   against the actual part content; mismatch → parse error / 400.
 //! - On parse error mid-stream: returns 400 with partial results written so far.
 //! - On per-file write error: records error for that file, continues processing.
 
@@ -128,6 +132,54 @@ pub async fn bulk_handler(
             .get("x-oc-mtime")
             .or_else(|| part.headers.get("x-file-mtime"))
             .and_then(|v| v.parse::<i64>().ok());
+
+        // ── §10.4 Per-part Content-Length and hash validation ─────────────────
+        // Matches PHP MultipartRequestParser::parseNextPart() →
+        // readPartHeaders() → validateHash().
+        let content_length: usize = match part.headers.get("content-length") {
+            Some(cl) => match cl.parse::<usize>() {
+                Ok(len) => len,
+                Err(_) => {
+                    results.insert(
+                        file_path.clone(),
+                        serde_json::json!({
+                            "error": true,
+                            "message": "Invalid Content-Length header",
+                        }),
+                    );
+                    parse_error = true;
+                    break;
+                }
+            },
+            None => {
+                results.insert(
+                    file_path.clone(),
+                    serde_json::json!({
+                        "error": true,
+                        "message": "The Content-Length header must not be null.",
+                    }),
+                );
+                parse_error = true;
+                break;
+            }
+        };
+
+        if let Err(msg) = validate_part_hash(
+            &part.data,
+            content_length,
+            part.headers.get("x-file-md5").map(|s| s.as_str()),
+            part.headers.get("oc-checksum").map(|s| s.as_str()),
+        ) {
+            results.insert(
+                file_path.clone(),
+                serde_json::json!({
+                    "error": true,
+                    "message": msg,
+                }),
+            );
+            parse_error = true;
+            break;
+        }
 
         match write_file(
             &state, &uid, &instance_id, storage_id, &file_path, &part.data, mtime,
@@ -504,6 +556,91 @@ fn bad_request_response(msg: &str) -> Response {
         .unwrap()
 }
 
+/// Compute the hex digest of `data` using the named `algorithm`.
+///
+/// Supported algorithms match those in [`crate::davfile::RunningHash`]:
+/// `md5`, `sha1` / `sha-1`, `sha256` / `sha-256`, `sha384` / `sha-384`,
+/// `sha512` / `sha-512`, `adler32` / `adler-32`.
+fn compute_hash(algorithm: &str, data: &[u8]) -> Result<String, String> {
+    use md5::Digest;
+    match algorithm.to_lowercase().as_str() {
+        "md5" => Ok(format!("{:x}", md5::Md5::digest(data))),
+        "sha1" | "sha-1" => Ok(format!("{:x}", sha1::Sha1::digest(data))),
+        "sha256" | "sha-256" => Ok(format!("{:x}", sha2::Sha256::digest(data))),
+        "sha384" | "sha-384" => Ok(format!("{:x}", sha2::Sha384::digest(data))),
+        "sha512" | "sha-512" => Ok(format!("{:x}", sha2::Sha512::digest(data))),
+        "adler32" | "adler-32" => {
+            let mut a = adler::Adler32::new();
+            a.write_slice(data);
+            Ok(format!("{:08x}", a.checksum()))
+        }
+        _ => Err(format!("Unknown hash algorithm: {}", algorithm)),
+    }
+}
+
+/// Validate a bulk-upload part's content against its hash headers.
+///
+/// Mirrors PHP `MultipartRequestParser::validateHash()`:
+/// 1. Verify `data.len()` matches the declared `content_length`.
+/// 2. If `oc_checksum` is non-empty: parse `{ALG}:{hash}`, compute,
+///    case‑sensitive compare.
+/// 3. Else if `x_file_md5` is non-empty: compute MD5, case‑sensitive compare.
+/// 4. Else: return `Err("No hash provided.")`.
+///
+/// Hash mismatch message matches PHP exactly:
+/// `"Computed {algorithm} hash is incorrect ({computed})."`
+fn validate_part_hash(
+    data: &[u8],
+    content_length: usize,
+    x_file_md5: Option<&str>,
+    oc_checksum: Option<&str>,
+) -> Result<(), String> {
+    if data.len() != content_length {
+        return Err(format!(
+            "Expected Content-Length {} but part body is {} bytes",
+            content_length,
+            data.len()
+        ));
+    }
+
+    let (algorithm, expected_hash): (&str, &str) = if let Some(cs) = oc_checksum {
+        if cs.is_empty() {
+            if let Some(md5) = x_file_md5 {
+                if md5.is_empty() {
+                    return Err("No hash provided.".to_string());
+                }
+                ("md5", md5)
+            } else {
+                return Err("No hash provided.".to_string());
+            }
+        } else {
+            match cs.split_once(':') {
+                Some((alg, hash)) => (alg, hash),
+                None => return Err("Invalid OC-Checksum format".to_string()),
+            }
+        }
+    } else if let Some(md5) = x_file_md5 {
+        if md5.is_empty() {
+            return Err("No hash provided.".to_string());
+        }
+        ("md5", md5)
+    } else {
+        return Err("The hash headers must not be null.".to_string());
+    };
+
+    let computed = compute_hash(algorithm, data)?;
+
+    // PHP does case‑sensitive comparison (`!==`); match it exactly.
+    if expected_hash != computed {
+        return Err(format!(
+            "Computed {} hash is incorrect ({}).",
+            algorithm, computed
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,5 +816,131 @@ mod tests {
         );
         // Correct: strip the DAV prefix first.
         assert_eq!(bulk_fc_path("test.txt"), "files/test.txt");
+    }
+
+    // ── §10.4 hash validation tests ─────────────────────────────────────────
+
+    #[test]
+    fn compute_hash_md5() {
+        let hash = compute_hash("md5", b"hello world").unwrap();
+        assert_eq!(hash, "5eb63bbbe01eeed093cb22bb8f5acdc3");
+    }
+
+    #[test]
+    fn compute_hash_sha1() {
+        let hash = compute_hash("sha1", b"hello world").unwrap();
+        assert_eq!(hash, "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed");
+    }
+
+    #[test]
+    fn compute_hash_sha256() {
+        let hash = compute_hash("sha256", b"hello world").unwrap();
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[test]
+    fn compute_hash_unknown_algorithm() {
+        let err = compute_hash("superhash", b"data").unwrap_err();
+        assert!(err.contains("Unknown hash algorithm"));
+    }
+
+    #[test]
+    fn validate_part_hash_oc_checksum_ok() {
+        let data = b"hello world";
+        let hash = compute_hash("md5", data).unwrap();
+        let header = format!("md5:{}", hash);
+        assert!(validate_part_hash(data, data.len(), None, Some(&header)).is_ok());
+    }
+
+    #[test]
+    fn validate_part_hash_x_file_md5_ok() {
+        let data = b"hello world";
+        let hash = compute_hash("md5", data).unwrap();
+        assert!(validate_part_hash(data, data.len(), Some(&hash), None).is_ok());
+    }
+
+    #[test]
+    fn validate_part_hash_mismatch() {
+        let data = b"hello world";
+        let err = validate_part_hash(data, data.len(), Some("deadbeef"), None).unwrap_err();
+        assert!(err.contains("Computed md5 hash is incorrect"));
+        assert!(err.contains(&compute_hash("md5", data).unwrap()));
+    }
+
+    #[test]
+    fn validate_part_hash_content_length_mismatch() {
+        let data = b"hello world";
+        let err = validate_part_hash(data, 999, Some("ignored"), None).unwrap_err();
+        assert!(err.contains("Content-Length"));
+        assert!(err.contains("999"));
+    }
+
+    #[test]
+    fn validate_part_hash_missing_both_headers() {
+        let data = b"hello world";
+        let err = validate_part_hash(data, data.len(), None, None).unwrap_err();
+        assert_eq!(err, "The hash headers must not be null.");
+    }
+
+    #[test]
+    fn validate_part_hash_oc_checksum_empty_falls_back_to_md5() {
+        let data = b"hello world";
+        let hash = compute_hash("md5", data).unwrap();
+        // OC-Checksum empty, X-File-MD5 present → use MD5
+        assert!(validate_part_hash(data, data.len(), Some(&hash), Some("")).is_ok());
+    }
+
+    #[test]
+    fn validate_part_hash_both_empty_is_error() {
+        let data = b"hello world";
+        let err = validate_part_hash(data, data.len(), Some(""), Some("")).unwrap_err();
+        assert_eq!(err, "No hash provided.");
+    }
+
+    #[test]
+    fn validate_part_hash_oc_checksum_sha1() {
+        let data = b"hello world";
+        let hash = compute_hash("sha1", data).unwrap();
+        let header = format!("SHA1:{}", hash);
+        assert!(validate_part_hash(data, data.len(), None, Some(&header)).is_ok());
+    }
+
+    #[test]
+    fn validate_part_hash_oc_checksum_sha256() {
+        let data = b"hello world";
+        let hash = compute_hash("sha256", data).unwrap();
+        let header = format!("sha256:{}", hash);
+        assert!(validate_part_hash(data, data.len(), None, Some(&header)).is_ok());
+    }
+
+    #[test]
+    fn validate_part_hash_adler32() {
+        let data = b"hello world";
+        let hash = compute_hash("adler32", data).unwrap();
+        let header = format!("adler32:{}", hash);
+        assert!(validate_part_hash(data, data.len(), None, Some(&header)).is_ok());
+    }
+
+    #[test]
+    fn validate_part_hash_case_sensitive_mismatch() {
+        // PHP uses strict !== comparison; uppercase hash must NOT match
+        // lowercase computed hash.
+        let data = b"hello world";
+        let hash = compute_hash("md5", data).unwrap(); // lowercase
+        let upper = hash.to_uppercase();
+        assert_ne!(hash, upper, "sanity: uppercased hash differs from lower");
+        let err = validate_part_hash(data, data.len(), Some(&upper), None).unwrap_err();
+        assert!(err.contains("Computed md5 hash is incorrect"));
+    }
+
+    #[test]
+    fn validate_part_hash_empty_content_ok() {
+        // Content-Length 0 → empty data, hash of empty string matches.
+        let empty: &[u8] = b"";
+        let hash = compute_hash("md5", empty).unwrap(); // d41d8cd98f00b204e9800998ecf8427e
+        assert!(validate_part_hash(empty, 0, Some(&hash), None).is_ok());
     }
 }
