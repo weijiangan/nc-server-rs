@@ -1153,6 +1153,17 @@ impl DavFileSystem for NcFileSystem {
             let new_hash = row::path_hash(&to_fc);
             let prefix = &self.state.table_prefix;
 
+            // Resolve directory mimetype ID early — used both for the
+            // directory-guard in the mimetype recomputation below and the
+            // subtree-rename check further down.
+            let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.state.mime_cache,
+                "httpd/unix-directory",
+            )
+            .await;
+
             // Update the node itself.
             let sql_node = format!(
                 "UPDATE {prefix}filecache \
@@ -1171,6 +1182,46 @@ impl DavFileSystem for NcFileSystem {
                 .await
                 .map_err(|_| FsError::GeneralFailure)?;
 
+            // §10.10: recompute mimetype + mimepart on extension change.
+            // Matches PHP Updater::copyOrRenameFromStorage() — when the
+            // source and target extensions differ, the target is not a
+            // directory, and the target is not a trashbin file, update
+            // the mimetype from the new name.
+            let source_name = from_row.name.as_deref().unwrap_or("");
+            let source_ext = extension(source_name);
+            let target_ext = extension(&new_name);
+            let is_dir = from_row.mimetype == dir_mime_id;
+            if source_ext != target_ext && !is_dir && !is_trash_extension(target_ext) {
+                let new_mime = mime_guess::from_ext(target_ext)
+                    .first_raw()
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                let new_part = new_mime.split('/').next().unwrap_or("application").to_string();
+                let new_mid = nc_db::mime::get_or_insert_mime_id(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    &self.state.mime_cache,
+                    &new_mime,
+                )
+                .await;
+                let new_pid = nc_db::mime::get_or_insert_mime_id(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    &self.state.mime_cache,
+                    &new_part,
+                )
+                .await;
+                let sql_mime = format!(
+                    "UPDATE {prefix}filecache SET mimetype=$1, mimepart=$2 WHERE fileid=$3"
+                );
+                let _ = sqlx::query(&sql_mime)
+                    .bind(new_mid)
+                    .bind(new_pid)
+                    .bind(from_row.fileid)
+                    .execute(&self.state.pool)
+                    .await;
+            }
+
             // Update custom DAV property paths for the renamed node (task §10.11).
             let _ = crate::row::update_custom_properties_path(
                 &self.state.pool,
@@ -1182,13 +1233,6 @@ impl DavFileSystem for NcFileSystem {
             .await;
 
             // Update all descendants (directory move).
-            let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
-                &self.state.pool,
-                &self.state.table_prefix,
-                &self.state.mime_cache,
-                "httpd/unix-directory",
-            )
-            .await;
             if from_row.mimetype == dir_mime_id {
                 // Bulk-rename all paths under the old prefix using a Rust-side
                 // loop (avoids relying on DB-side MD5 dialect differences).
@@ -1273,6 +1317,47 @@ impl DavFileSystem for NcFileSystem {
                     let hash = row::path_hash(&to_fc);
                     let prefix = &self.state.table_prefix;
 
+                    // §10.10: recompute mimetype on extension change for COPY.
+                    // Matches PHP Updater::copyOrRenameFromStorage() —
+                    // skip for directories and trash targets.
+                    let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
+                        &self.state.pool,
+                        &self.state.table_prefix,
+                        &self.state.mime_cache,
+                        "httpd/unix-directory",
+                    )
+                    .await;
+                    let source_name = from_row.name.as_deref().unwrap_or("");
+                    let source_ext = extension(source_name);
+                    let target_ext = extension(&name);
+                    let is_dir = from_row.mimetype == dir_mime_id;
+                    let (copy_mid, copy_pid) =
+                        if source_ext != target_ext && !is_dir && !is_trash_extension(target_ext) {
+                            let new_mime = mime_guess::from_ext(target_ext)
+                                .first_raw()
+                                .unwrap_or("application/octet-stream")
+                                .to_string();
+                            let new_part =
+                                new_mime.split('/').next().unwrap_or("application").to_string();
+                            let mid = nc_db::mime::get_or_insert_mime_id(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                &self.state.mime_cache,
+                                &new_mime,
+                            )
+                            .await;
+                            let pid = nc_db::mime::get_or_insert_mime_id(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                &self.state.mime_cache,
+                                &new_part,
+                            )
+                            .await;
+                            (mid, pid)
+                        } else {
+                            (from_row.mimetype, from_row.mimepart)
+                        };
+
                     let sql = format!(
                         "INSERT INTO {prefix}filecache \
                          (storage, path, path_hash, parent, name, mimetype, mimepart, \
@@ -1286,8 +1371,8 @@ impl DavFileSystem for NcFileSystem {
                         .bind(&hash)
                         .bind(parent_row.fileid)
                         .bind(&name)
-                        .bind(from_row.mimetype)
-                        .bind(from_row.mimepart)
+                        .bind(copy_mid)
+                        .bind(copy_pid)
                         .bind(from_row.size)
                         .bind(now)
                         .bind(now)
@@ -1762,6 +1847,25 @@ impl DavFileSystem for NcFileSystem {
 
 // ─── Helper methods ────────────────────────────────────────────────────────────
 
+/// Extract the file extension from a filename (the part after the last `.`).
+/// Returns empty string for extensionless names.
+fn extension(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or("")
+}
+
+/// Check whether an extension matches the PHP trashbin naming convention
+/// (`$targetIsTrash = preg_match("/^d\d+$/", $targetExtension)`).
+///
+/// Trashbin files are named `original.txt.d{timestamp}` — the extension is
+/// `d` followed by digits.  PHP skips mimetype recomputation for trash
+/// targets because the original (pre‑trash) extension is still in the name.
+fn is_trash_extension(ext: &str) -> bool {
+    if ext.len() < 2 || !ext.starts_with('d') {
+        return false;
+    }
+    ext[1..].chars().all(|c| c.is_ascii_digit())
+}
+
 impl NcFileSystem {
     /// Rename all oc_filecache paths below `old_prefix` to `new_prefix`.
     ///
@@ -1910,7 +2014,7 @@ fn parse_iso8601(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_iso8601, trash_fc_name};
+    use super::{extension, is_trash_extension, parse_iso8601, trash_fc_name};
 
     #[test]
     fn iso8601_z_suffix() {
@@ -2261,5 +2365,39 @@ mod tests {
                 "files_trashbin/files/foo.d123/sub.txt",
             ]
         );
+    }
+
+    // ── §10.10 helper tests ──────────────────────────────────────────────
+
+    #[test]
+    fn extension_simple() {
+        assert_eq!(extension("photo.jpg"), "jpg");
+        assert_eq!(extension("note.txt"), "txt");
+        assert_eq!(extension("archive.tar.gz"), "gz");
+    }
+
+    #[test]
+    fn extension_no_dot() {
+        assert_eq!(extension("Makefile"), "Makefile");
+        assert_eq!(extension("noextension"), "noextension");
+    }
+
+    #[test]
+    fn extension_hidden_file() {
+        assert_eq!(extension(".bashrc"), "bashrc");
+    }
+
+    #[test]
+    fn is_trash_extension_valid() {
+        assert!(is_trash_extension("d1634567890"));
+        assert!(is_trash_extension("d0"));
+    }
+
+    #[test]
+    fn is_trash_extension_invalid() {
+        assert!(!is_trash_extension("txt"));
+        assert!(!is_trash_extension("d"));     // too short
+        assert!(!is_trash_extension("dx123"));  // has non-digit
+        assert!(!is_trash_extension(""));       // empty
     }
 }

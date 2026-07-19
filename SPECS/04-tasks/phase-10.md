@@ -99,10 +99,12 @@ Goal: fix behaviours in **already-implemented** Phase 4/5 tasks that were found 
 ### 10.10 `MOVE`/`COPY` does not update `mimetype` on extension change (from §4.x) — stale type
 > PHP source: `lib/private/Files/Cache/Updater.php:181-186` (`copyOrRenameFromStorage`) — when `sourceExtension !== targetExtension` and the node is a file (and not a trash move), PHP recomputes the mimetype (`storage->getMimeType(target)`) and `cache->update(fileId, ['mimetype' => …])`.
 
-- [ ] Rust's `rename` (`nc-dav/src/filesystem.rs:1105-1108`) updates `path/path_hash/name/parent/mtime/etag` but **not** `mimetype`/`mimepart`. Renaming across an extension change (e.g. `note.txt` → `photo.jpg`) leaves the old `text/plain` type in `oc_filecache`, so `{DAV:}getcontenttype`, the web icon/preview, and type filters stay wrong
-- [ ] On `MOVE`/`COPY` where the target extension differs from the source, recompute `mimetype`+`mimepart` from the target name and update the row (skip for directories and trash `.d{ts}` targets, matching PHP's `$targetIsTrash` guard)
+- [x] Rust's `rename` (`nc-dav/src/filesystem.rs:1105-1108`) updates `path/path_hash/name/parent/mtime/etag` but **not** `mimetype`/`mimepart`. Renaming across an extension change (e.g. `note.txt` → `photo.jpg`) leaves the old `text/plain` type in `oc_filecache`, so `{DAV:}getcontenttype`, the web icon/preview, and type filters stay wrong
+- [x] On `MOVE`/`COPY` where the target extension differs from the source, recompute `mimetype`+`mimepart` from the target name and update the row (skip for directories and trash `.d{ts}` targets, matching PHP's `$targetIsTrash` guard)
 
 **Verify:** `MOVE note.txt → photo.jpg`; PROPFIND `{DAV:}getcontenttype` on `photo.jpg` = `image/jpeg` and `oc_filecache.mimetype`/`mimepart` reflect the new type.
+
+> **Deviations:** PHP uses `$storage->getMimeType($target)` (`IMimeTypeDetector::detectPath()`) which is content-based; Rust uses `mime_guess::from_ext()` which is extension-based — same heuristic used everywhere else in the Rust codebase (see Phase 5 deviation). PHP's `Cache::update()` only passes `['mimetype' => $mimeType]` because the update handler automatically derives `mimepart` from `mimetype` in the same `foreach` loop; Rust explicitly computes both. The three guards match PHP exactly: `$sourceExtension !== $targetExtension`, `!$isDir`, `!$targetIsTrash` (regex `/^d\d+$/`).
 
 ### 10.11 Custom DAV property storage (`oc_properties`) — MISSING behaviour
 > PHP source: `Sabre\DAV\PropertyStorage\Plugin` backed by `apps/dav/lib/Connector/Sabre/CustomPropertiesBackend.php`, registered for logged-in users in `apps/dav/lib/Server.php`. Any PROPPATCH property not consumed by another plugin is persisted to `oc_properties` (`userid`, `propertypath`, `propertyname`, `propertyvalue`, `valuetype`) and returned on PROPFIND.
