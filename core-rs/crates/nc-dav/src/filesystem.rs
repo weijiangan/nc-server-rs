@@ -278,11 +278,14 @@ impl NcFileSystem {
                      ON CONFLICT(fileid) DO NOTHING",
                     prefix = self.state.table_prefix
                 );
-                let _ = sqlx::query(&sql)
+                if let Err(e) = sqlx::query(&sql)
                     .bind(fid)
                     .bind(now)
                     .execute(&self.state.pool)
-                    .await;
+                    .await
+                {
+                    tracing::warn!(fileid = fid, error = %e, "Failed to insert oc_filecache_extended for ancestor {built}");
+                }
             }
 
             let new_row = row::FileCacheRow {
@@ -409,7 +412,7 @@ impl NcFileSystem {
             let like_pat = format!("{fc_path}/%");
 
             // Clean up custom DAV properties before deleting filecache rows.
-            let _ = crate::row::delete_custom_properties_for_dir(
+            crate::row::delete_custom_properties_for_dir(
                 &self.state.pool,
                 prefix,
                 &self.uid,
@@ -425,12 +428,15 @@ impl NcFileSystem {
                      WHERE storage = $1 AND (path = $2 OR path LIKE $3)\
                  )"
             );
-            let _ = sqlx::query(&sql_ext)
+            if let Err(e) = sqlx::query(&sql_ext)
                 .bind(self.storage_id)
                 .bind(fc_path)
                 .bind(&like_pat)
                 .execute(&self.state.pool)
-                .await;
+                .await
+            {
+                tracing::warn!(fc_path = fc_path, error = %e, "Failed to delete filecache_extended rows for directory");
+            }
 
             let sql_subtree = format!(
                 "DELETE FROM {prefix}filecache WHERE storage = $1 AND (path = $2 OR path LIKE $3)"
@@ -507,18 +513,24 @@ impl NcFileSystem {
                 "DELETE FROM {prefix}filecache_extended WHERE fileid = $1",
                 prefix = self.state.table_prefix
             );
-            let _ = sqlx::query(&sql_ext)
+            if let Err(e) = sqlx::query(&sql_ext)
                 .bind(frow.fileid)
                 .execute(&self.state.pool)
-                .await;
+                .await
+            {
+                tracing::warn!(fileid = frow.fileid, error = %e, "Failed to delete filecache_extended row");
+            }
 
-            let _ = crate::row::delete_custom_properties_for_path(
+            if let Err(e) = crate::row::delete_custom_properties_for_path(
                 &self.state.pool,
                 &self.state.table_prefix,
                 &self.uid,
                 fc_path,
             )
-            .await;
+            .await
+            {
+                tracing::warn!(fileid = frow.fileid, fc_path = fc_path, error = %e, "Failed to delete custom properties");
+            }
         }
 
         let now = std::time::SystemTime::now()
@@ -586,12 +598,15 @@ impl NcFileSystem {
                 "UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3",
                 prefix = self.state.table_prefix
             );
-            let _ = sqlx::query(&sql_upd)
+            if let Err(e) = sqlx::query(&sql_upd)
                 .bind(&new_path)
                 .bind(&new_hash)
                 .bind(fid)
                 .execute(&self.state.pool)
-                .await;
+                .await
+            {
+                tracing::warn!(fileid = fid, error = %e, "Failed to update descendant path in trash");
+            }
         }
 
         Ok(())
@@ -1360,35 +1375,41 @@ impl DavFileSystem for NcFileSystem {
                 let sql_mime = format!(
                     "UPDATE {prefix}filecache SET mimetype=$1, mimepart=$2 WHERE fileid=$3"
                 );
-                let _ = sqlx::query(&sql_mime)
+                if let Err(e) = sqlx::query(&sql_mime)
                     .bind(new_mid)
                     .bind(new_pid)
                     .bind(from_row.fileid)
                     .execute(&self.state.pool)
-                    .await;
+                    .await
+                {
+                    tracing::warn!(fileid = from_row.fileid, error = %e, "Failed to update mimetype on rename");
+                }
             }
 
             // Update custom DAV property paths for the renamed node (task §10.11).
-            let _ = crate::row::update_custom_properties_path(
+            if let Err(e) = crate::row::update_custom_properties_path(
                 &self.state.pool,
                 prefix,
                 &self.uid,
                 &from_fc,
                 &to_fc,
             )
-            .await;
+            .await
+            {
+                tracing::warn!(from_fc = from_fc, to_fc = to_fc, error = %e, "Failed to update custom property paths on rename");
+            }
 
             // Update all descendants (directory move).
             if from_row.mimetype == dir_mime_id {
                 // Bulk-rename all paths under the old prefix using a Rust-side
                 // loop (avoids relying on DB-side MD5 dialect differences).
-                let _ = self
+                self
                     .rename_subtree_paths(&from_fc, &to_fc, from_row.fileid, prefix)
                     .await;
 
                 // Update custom DAV property paths for the directory subtree
                 // (task §10.11).
-                let _ = crate::row::update_custom_properties_path_subtree(
+                crate::row::update_custom_properties_path_subtree(
                     &self.state.pool,
                     prefix,
                     &self.uid,
@@ -1461,7 +1482,7 @@ impl DavFileSystem for NcFileSystem {
 
             // For simplicity: remove old DB row for destination if exists,
             // then insert new row by re-reading disk metadata.
-            let _ = sqlx::query(&format!(
+            if let Err(e) = sqlx::query(&format!(
                 "DELETE FROM {prefix}filecache \
                  WHERE storage = $1 AND path_hash = $2",
                 prefix = self.state.table_prefix
@@ -1469,7 +1490,10 @@ impl DavFileSystem for NcFileSystem {
             .bind(self.storage_id)
             .bind(row::path_hash(&to_fc))
             .execute(&self.state.pool)
-            .await;
+            .await
+            {
+                tracing::warn!(to_fc = to_fc, error = %e, "Failed to delete old filecache row on copy");
+            }
 
             if let Some(from_row) = row::lookup_by_path(
                 &self.state.pool,
@@ -1928,12 +1952,15 @@ impl DavFileSystem for NcFileSystem {
                                          WHERE storage=$3 AND path_hash=$4",
                                         prefix = self.state.table_prefix
                                     );
-                                    let _ = sqlx::query(&sql)
+                                    if let Err(e) = sqlx::query(&sql)
                                         .bind(ts).bind(ts)
                                         .bind(self.storage_id)
                                         .bind(&hash)
                                         .execute(&self.state.pool)
-                                        .await;
+                                        .await
+                                    {
+                                        tracing::warn!(path_hash = hash, error = %e, "PROPPATCH: failed to update mtime");
+                                    }
                                     http::StatusCode::OK
                                 } else {
                                     http::StatusCode::BAD_REQUEST
@@ -1959,12 +1986,15 @@ impl DavFileSystem for NcFileSystem {
                                          ON CONFLICT(fileid) DO UPDATE SET creation_time=excluded.creation_time",
                                         prefix = self.state.table_prefix
                                     );
-                                    let _ = sqlx::query(&sql)
+                                    if let Err(e) = sqlx::query(&sql)
                                         .bind(ts)
                                         .bind(self.storage_id)
                                         .bind(&hash)
                                         .execute(&self.state.pool)
-                                        .await;
+                                        .await
+                                    {
+                                        tracing::warn!(path_hash = hash, error = %e, "PROPPATCH: failed to update creationdate");
+                                    }
                                     http::StatusCode::OK
                                 } else {
                                     http::StatusCode::BAD_REQUEST

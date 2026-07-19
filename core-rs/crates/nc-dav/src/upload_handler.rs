@@ -298,7 +298,9 @@ async fn handle_put(
 
     if let Err(e) = file.write_all(&bytes).await {
         tracing::error!(error = %e, "Failed to write chunk");
-        let _ = fs::remove_file(&chunk_path).await;
+        if let Err(rm_err) = fs::remove_file(&chunk_path).await {
+            tracing::debug!(path = %chunk_path.display(), error = %rm_err, "Failed to clean up chunk file after write error");
+        }
         return internal_error_response();
     }
 
@@ -378,7 +380,7 @@ async fn handle_move(
             .await
             .unwrap_or(0);
         if actual_size != expected_size {
-            let _ = cleanup_chunks(&state, upload_id, path).await;
+            cleanup_chunks(&state, upload_id, path).await;
             return bad_request_response(&format!(
                 "OC-Total-Length mismatch: expected {}, got {}",
                 expected_size, actual_size
@@ -462,7 +464,7 @@ async fn handle_move(
     )
     .await
     {
-        let _ = cleanup_chunks(&state, upload_id, path).await;
+        cleanup_chunks(&state, upload_id, path).await;
         return quota_exceeded_response();
     }
 
@@ -572,7 +574,9 @@ async fn handle_move(
 
     // Set file mtime using filetime
     let t = filetime::FileTime::from_unix_time(mtime, 0);
-    let _ = filetime::set_file_times(&final_disk_path, t, t);
+    if let Err(e) = filetime::set_file_times(&final_disk_path, t, t) {
+        tracing::warn!(path = %final_disk_path.display(), error = %e, "Failed to set file mtime on chunked upload");
+    }
 
     // Generate ETag (format: quoted 32-char hex UUID)
     let etag_raw = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
@@ -650,13 +654,16 @@ async fn handle_move(
         );
         let creation_time_val = ctime.unwrap_or(now);
         let upload_time_val = now; // always set upload_time for new/uploads
-        let _ = sqlx::query(&sql)
+        if let Err(e) = sqlx::query(&sql)
             .bind(fid)
             .bind("") // metadata_etag
             .bind(creation_time_val)
             .bind(upload_time_val)
             .execute(&state.pool)
-            .await;
+            .await
+        {
+            tracing::warn!(fileid = fid, error = %e, "Chunked upload: failed to upsert oc_filecache_extended");
+        }
     }
 
     // §9.2: propagate size/etag/mtime to the parent chain for chunked upload assembly.
@@ -685,7 +692,9 @@ async fn handle_move(
             "DELETE FROM {prefix}previews WHERE file_id = $1",
             prefix = state.table_prefix
         );
-        let _ = sqlx::query(&sql).bind(fid).execute(&state.pool).await;
+        if let Err(e) = sqlx::query(&sql).bind(fid).execute(&state.pool).await {
+            tracing::warn!(fileid = fid, error = %e, "Chunked upload: failed to delete stale oc_previews rows");
+        }
 
         // Layer 2: Legacy preview files on disk.
         let preview_dir = crate::davfile::preview_cache_dir(
@@ -753,7 +762,11 @@ async fn cleanup_chunks(state: &NcDavState, upload_id: &str, path: &str) {
         .join(user_id)
         .join(upload_id);
 
-    let _ = fs::remove_dir_all(&chunk_dir).await;
+    if let Err(e) = fs::remove_dir_all(&chunk_dir).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(chunk_dir = %chunk_dir.display(), error = %e, "Failed to clean up chunk directory");
+        }
+    }
 }
 
 /// Handle DELETE - abort upload (PHASE-5.8)

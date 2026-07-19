@@ -336,7 +336,10 @@ impl DavFile for NcDavFile {
                     if !computed_hex.eq_ignore_ascii_case(expected_hash) {
                         // Remove the temp file before returning the error.
                         let temp = ctx.temp_path.clone();
-                        let _ = blocking(move || std::fs::remove_file(&temp)).await;
+                        let temp_display = temp.clone();
+                        if let Err(e) = blocking(move || std::fs::remove_file(&temp)).await {
+                            tracing::warn!(path = %temp_display.display(), error = %e, "Failed to remove temp file after checksum mismatch");
+                        }
                         // Signal 400 Bad Request via the shared error channel.
                         // dav-server has no BadRequest FsError variant; we use
                         // GeneralFailure (→ 500) here and dav_handler rewrites
@@ -504,12 +507,15 @@ impl DavFile for NcDavFile {
                  ON CONFLICT(fileid) DO UPDATE SET upload_time = excluded.upload_time",
                 prefix = prefix
             );
-            let _ = sqlx::query(&extended_sql)
+            if let Err(e) = sqlx::query(&extended_sql)
                 .bind(fileid)
                 .bind(use_creation_time)
                 .bind(use_mtime)
                 .execute(pool)
-                .await;
+                .await
+            {
+                tracing::warn!(fileid = fileid, error = %e, "PUT: failed to upsert oc_filecache_extended");
+            }
 
             // §9.2: propagate size/etag/mtime to the parent chain.
             // PHP Updater::update computes sizeDifference = newSize - oldSize
@@ -542,7 +548,9 @@ impl DavFile for NcDavFile {
                 "DELETE FROM {prefix}previews WHERE file_id = $1",
                 prefix = prefix
             );
-            let _ = sqlx::query(&sql).bind(fileid).execute(pool).await;
+            if let Err(e) = sqlx::query(&sql).bind(fileid).execute(pool).await {
+                tracing::warn!(fileid = fileid, error = %e, "PUT: failed to delete stale oc_previews rows");
+            }
 
             // Layer 2: Legacy preview files on disk.
             let preview_dir = preview_cache_dir(&ctx.data_dir, &ctx.instance_id, fileid);

@@ -145,7 +145,9 @@ pub async fn rename_versions(
     if old_versions_dir.is_dir() {
         // Directory: move the whole versions subdirectory.
         if let Some(parent) = new_versions_dir.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                debug!(parent = %parent.display(), error = %e, "Failed to create version parent dir");
+            }
         }
         if let Err(e) = tokio::fs::rename(&old_versions_dir, &new_versions_dir).await {
             warn!("rename_versions: directory rename failed {old_versions_dir:?} → {new_versions_dir:?}: {e}");
@@ -351,11 +353,14 @@ async fn ensure_version_parents(
              VALUES ($1, '', $2, $2) \
              ON CONFLICT(fileid) DO NOTHING"
         );
-        let _ = sqlx::query(&sql_ext)
+        if let Err(e) = sqlx::query(&sql_ext)
             .bind(fid)
             .bind(now)
             .execute(pool)
-            .await;
+            .await
+        {
+            warn!(fileid = fid, error = %e, "Failed to insert version filecache_extended row");
+        }
     }
 
     Ok(())

@@ -17,6 +17,7 @@ use axum::{body::Body, extract::State, response::Response};
 use http::{HeaderName, HeaderValue, StatusCode};
 use nc_auth::AuthInfo;
 use tokio::fs;
+use tracing::warn;
 
 use crate::{propagator::Propagator, row, versions, NcDavState};
 
@@ -374,7 +375,9 @@ async fn write_file(
     let file_mtime = mtime.unwrap_or(now);
 
     let t = filetime::FileTime::from_unix_time(file_mtime, 0);
-    let _ = filetime::set_file_times(&final_disk_path, t, t);
+    if let Err(e) = filetime::set_file_times(&final_disk_path, t, t) {
+        warn!(path = %final_disk_path.display(), error = %e, "Failed to set file mtime on bulk upload");
+    }
 
     let etag_raw = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
     // PHP getETag() returns quoted etag; JSON-encode doubles the quotes.
@@ -388,7 +391,7 @@ async fn write_file(
             "UPDATE {prefix}filecache SET size=$1, mtime=$2, storage_mtime=$3, etag=$4, mimetype=$5, mimepart=$6 WHERE fileid=$7",
             prefix = state.table_prefix
         );
-        let _ = sqlx::query(&sql)
+        if let Err(e) = sqlx::query(&sql)
             .bind(data.len() as i64)
             .bind(file_mtime)
             .bind(file_mtime)
@@ -397,7 +400,10 @@ async fn write_file(
             .bind(mimepart_id)
             .bind(fid)
             .execute(&state.pool)
-            .await;
+            .await
+        {
+            warn!(fileid = fid, error = %e, "Bulk upload: failed to update filecache row");
+        }
     } else {
         let sql = format!(
             "INSERT INTO {prefix}filecache \
@@ -435,13 +441,16 @@ async fn write_file(
                 upload_time = COALESCE(EXCLUDED.upload_time, {prefix}filecache_extended.upload_time)",
             prefix = state.table_prefix
         );
-        let _ = sqlx::query(&sql)
+        if let Err(e) = sqlx::query(&sql)
             .bind(fid)
             .bind("") // metadata_etag
             .bind(file_mtime) // creation_time
             .bind(now) // upload_time
             .execute(&state.pool)
-            .await;
+            .await
+        {
+            warn!(fileid = fid, error = %e, "Bulk upload: failed to upsert filecache_extended");
+        }
     }
 
     // §9.2: propagate size/etag/mtime to the parent chain.
