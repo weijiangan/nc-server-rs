@@ -10,6 +10,7 @@ pub mod locksystem;
 pub mod metadata;
 pub(crate) mod mtime;
 pub(crate) mod preview;
+pub mod propagator;
 pub mod props;
 pub mod quota;
 pub mod row;

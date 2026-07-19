@@ -15,7 +15,7 @@ use nc_auth::AuthInfo;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-use crate::{row, NcDavState};
+use crate::{propagator::Propagator, row, NcDavState};
 
 static H_CSP: HeaderName = HeaderName::from_static("content-security-policy");
 
@@ -656,6 +656,20 @@ async fn handle_move(
             .bind(creation_time_val)
             .bind(upload_time_val)
             .execute(&state.pool)
+            .await;
+    }
+
+    // §9.2: propagate size/etag/mtime to the parent chain for chunked upload assembly.
+    {
+        let old_size = existing_row.as_ref().map(|r| r.size).unwrap_or(0);
+        let size_diff = (total_size as i64) - old_size;
+        let propagator = Propagator::new(
+            state.pool.clone(),
+            state.table_prefix.clone(),
+            storage_id,
+        );
+        let _ = propagator
+            .propagate_change(&fc_path_full, mtime, size_diff)
             .await;
     }
 

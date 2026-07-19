@@ -18,7 +18,7 @@ use http::{HeaderName, HeaderValue, StatusCode};
 use nc_auth::AuthInfo;
 use tokio::fs;
 
-use crate::{row, NcDavState};
+use crate::{propagator::Propagator, row, NcDavState};
 
 static H_CSP: HeaderName = HeaderName::from_static("content-security-policy");
 static H_JSON: HeaderName = HeaderName::from_static("content-type");
@@ -414,6 +414,20 @@ async fn write_file(
             .bind(file_mtime) // creation_time
             .bind(now) // upload_time
             .execute(&state.pool)
+            .await;
+    }
+
+    // §9.2: propagate size/etag/mtime to the parent chain.
+    {
+        let old_size = existing.as_ref().map(|r| r.size).unwrap_or(0);
+        let size_diff = (data.len() as i64) - old_size;
+        let propagator = Propagator::new(
+            state.pool.clone(),
+            state.table_prefix.clone(),
+            storage_id,
+        );
+        let _ = propagator
+            .propagate_change(&fc_path, file_mtime, size_diff)
             .await;
     }
 

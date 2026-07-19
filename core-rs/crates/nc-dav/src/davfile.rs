@@ -23,6 +23,7 @@ use futures::{FutureExt, future};
 use tokio::task;
 
 use crate::metadata::NcMetaData;
+use crate::propagator::Propagator;
 use nc_db::pool::DbPool;
 
 // ─── Running hash ─────────────────────────────────────────────────────────────
@@ -103,6 +104,9 @@ pub struct WriteCtx {
     pub mimepart_id:    i64,
     /// `Some(fid)` when overwriting an existing entry; `None` for new files.
     pub initial_fileid: Option<i64>,
+    /// Size of the existing file before overwrite (0 for new files).
+    /// Used to compute `sizeDifference` for cache propagation (§9.2).
+    pub old_size: i64,
     /// Expected file size from `OpenOptions.size` (for validation).
     pub expected_size:  Option<u64>,
     /// Checksum from `OC-Checksum` header (e.g. `"SHA1:abc…"`).
@@ -119,6 +123,9 @@ pub struct WriteCtx {
     /// to a known client error.  `dav_handler` reads this to rewrite the HTTP
     /// status (e.g. `GeneralFailure` 500 → `BadRequest` 400 for checksum mismatch).
     pub put_error:      crate::SharedPutError,
+    /// Cache propagator — used in `flush()` to update parent ETag/mtime/size
+    /// after the file is committed (§9.2).
+    pub propagator:     Propagator,
 }
 
 impl std::fmt::Debug for WriteCtx {
@@ -432,6 +439,15 @@ impl DavFile for NcDavFile {
                 .bind(use_creation_time)
                 .bind(use_mtime)
                 .execute(pool)
+                .await;
+
+            // §9.2: propagate size/etag/mtime to the parent chain.
+            // PHP Updater::update computes sizeDifference = newSize - oldSize
+            // from a shallow scan (Updater.php:76-80).
+            let size_diff = (size as i64) - ctx.old_size;
+            let _ = ctx
+                .propagator
+                .propagate_change(&ctx.fc_path, use_mtime, size_diff)
                 .await;
 
             Ok(())

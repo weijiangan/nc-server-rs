@@ -30,6 +30,7 @@ use tracing::warn;
 use crate::{
     davfile::{NcDavFile, WriteCtx},
     metadata::{NcDirEntry, NcMetaData},
+    propagator::Propagator,
     row::{self, dav_to_fc_path, disk_path},
     NcDavState,
 };
@@ -51,6 +52,9 @@ pub struct NcFileSystem {
     /// Channel through which `flush()` signals known PUT errors (checksum
     /// mismatch, etc.) so `dav_handler` can rewrite the HTTP status code.
     pub(crate) put_error: crate::SharedPutError,
+    /// Cache propagator — created once per request, shared by all mutations
+    /// within the request.  Cheap to clone.
+    pub(crate) propagator: Propagator,
 }
 
 impl NcFileSystem {
@@ -63,6 +67,11 @@ impl NcFileSystem {
         write_result: crate::SharedWriteResult,
         put_error: crate::SharedPutError,
     ) -> Self {
+        let propagator = Propagator::new(
+            state.pool.clone(),
+            state.table_prefix.clone(),
+            storage_id,
+        );
         NcFileSystem {
             state,
             uid,
@@ -71,6 +80,7 @@ impl NcFileSystem {
             x_oc_ctime,
             write_result,
             put_error,
+            propagator,
         }
     }
 
@@ -852,6 +862,7 @@ impl DavFileSystem for NcFileSystem {
                 .await
                 .map_err(io_to_fs)?;
 
+                let old_size = existing.as_ref().map(|r| r.size).unwrap_or(0);
                 let write_ctx = WriteCtx {
                     temp_path,
                     final_path: disk,
@@ -864,6 +875,7 @@ impl DavFileSystem for NcFileSystem {
                     mime_type_id,
                     mimepart_id,
                     initial_fileid: existing.map(|r| r.fileid),
+                    old_size,
                     expected_size: options.size,
                     oc_checksum: options.checksum.clone(),
                     running_hash: crate::davfile::RunningHash::from_checksum_header(
@@ -873,6 +885,7 @@ impl DavFileSystem for NcFileSystem {
                     x_oc_ctime: self.x_oc_ctime,
                     write_result: self.write_result.clone(),
                     put_error: self.put_error.clone(),
+                    propagator: self.propagator.clone(),
                 };
 
                 Ok(Box::new(NcDavFile {
@@ -975,6 +988,13 @@ impl DavFileSystem for NcFileSystem {
                     FsError::GeneralFailure
                 })?;
 
+            // §9.2: MKCOL propagates etag/mtime to the parent chain.
+            // New directories have size 0, so sizeDifference=0.
+            let _ = self
+                .propagator
+                .propagate_change(&fc_path, now, 0)
+                .await;
+
             Ok(())
         }
         .boxed()
@@ -985,7 +1005,7 @@ impl DavFileSystem for NcFileSystem {
     fn remove_file<'a>(&'a self, path: &'a dav_server::davpath::DavPath) -> FsFuture<'a, ()> {
         async move {
             let fc_path = self.to_fc_path(path);
-            let row = row::lookup_by_path(
+            let frow = row::lookup_by_path(
                 &self.state.pool,
                 &self.state.table_prefix,
                 self.storage_id,
@@ -994,9 +1014,11 @@ impl DavFileSystem for NcFileSystem {
             .await
             .ok_or(FsError::NotFound)?;
 
+            let deleted_size = frow.size; // Capture size before the row is mutated/deleted.
+
             if self.is_trashbin_enabled().await {
                 // Move to trash instead of hard-deleting (REQ §6.7).
-                self.move_to_trash(&fc_path, &row).await?;
+                self.move_to_trash(&fc_path, &frow).await?;
             } else {
                 // Trashbin app not enabled — hard delete.
                 let disk = self.disk_path(&fc_path);
@@ -1009,7 +1031,7 @@ impl DavFileSystem for NcFileSystem {
                     prefix = self.state.table_prefix
                 );
                 sqlx::query(&sql)
-                    .bind(row.fileid)
+                    .bind(frow.fileid)
                     .execute(&self.state.pool)
                     .await
                     .map_err(|_| FsError::GeneralFailure)?;
@@ -1019,7 +1041,7 @@ impl DavFileSystem for NcFileSystem {
                     prefix = self.state.table_prefix
                 );
                 let _ = sqlx::query(&sql_ext)
-                    .bind(row.fileid)
+                    .bind(frow.fileid)
                     .execute(&self.state.pool)
                     .await;
 
@@ -1033,6 +1055,25 @@ impl DavFileSystem for NcFileSystem {
                 .await;
             }
 
+            // §9.2: propagate negative size to the parent chain.
+            // PHP Updater::remove passes -$entry->getSize() (Updater.php:112).
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if deleted_size > 0 {
+                let _ = self
+                    .propagator
+                    .propagate_change(&fc_path, now, -deleted_size)
+                    .await;
+            } else {
+                // Even with zero size, still propagate etag/mtime.
+                let _ = self
+                    .propagator
+                    .propagate_change(&fc_path, now, 0)
+                    .await;
+            }
+
             Ok(())
         }
         .boxed()
@@ -1044,12 +1085,22 @@ impl DavFileSystem for NcFileSystem {
         async move {
             let fc_path = self.to_fc_path(path);
 
+            // Capture the directory size before mutation (for propagation).
+            let dir_row = row::lookup_by_path(
+                &self.state.pool,
+                &self.state.table_prefix,
+                self.storage_id,
+                &fc_path,
+            )
+            .await;
+            let deleted_size = dir_row.as_ref().map(|r| r.size).unwrap_or(0);
+
             if self.is_trashbin_enabled().await {
                 // Delegate to trash_directory which moves the directory tree
                 // as a single unit.  This is only reached for subdirectories
                 // within a recursive delete — top-level DELETE for directories
                 // is intercepted in the handler.
-                self.trash_directory(&fc_path).await
+                self.trash_directory(&fc_path).await?;
             } else {
                 // Trashbin app not enabled — hard delete.
                 let disk = self.disk_path(&fc_path);
@@ -1095,9 +1146,27 @@ impl DavFileSystem for NcFileSystem {
                     .execute(&self.state.pool)
                     .await
                     .map_err(|_| FsError::GeneralFailure)?;
-
-                Ok(())
             }
+
+            // §9.2: propagate negative size to the parent chain.
+            // PHP Updater::remove passes -$entry->getSize() (Updater.php:112).
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if deleted_size > 0 {
+                let _ = self
+                    .propagator
+                    .propagate_change(&fc_path, now, -deleted_size)
+                    .await;
+            } else {
+                let _ = self
+                    .propagator
+                    .propagate_change(&fc_path, now, 0)
+                    .await;
+            }
+
+            Ok(())
         }
         .boxed()
     }
@@ -1253,6 +1322,33 @@ impl DavFileSystem for NcFileSystem {
                 .await;
             }
 
+            // §9.2: MOVE propagates both source and target chains with
+            // sizeDifference=0 (etag/mtime only).  The immediate source/target
+            // parents' sizes are fixed by correctFolderSize (PHP
+            // Updater.php:195-204).
+            let from_parent_fc = {
+                let mut parts: Vec<&str> = from_fc.split('/').collect();
+                parts.pop();
+                parts.join("/")
+            };
+            let _ = self
+                .propagator
+                .propagate_change(&from_fc, now, 0)
+                .await;
+            let _ = self
+                .propagator
+                .propagate_change(&to_fc, now, 0)
+                .await;
+            // Recalculate immediate parent sizes (size change can't be expressed
+            // as a simple signed delta when subtrees move).
+            if from_parent_fc != to_parent_fc {
+                let _ = self.propagator.correct_folder_size(&from_parent_fc).await;
+                let _ = self.propagator.correct_folder_size(&to_parent_fc).await;
+            } else {
+                // Same parent (rename within the same directory) — recalculate once.
+                let _ = self.propagator.correct_folder_size(&to_parent_fc).await;
+            }
+
             Ok(())
         }
         .boxed()
@@ -1383,6 +1479,25 @@ impl DavFileSystem for NcFileSystem {
                         .await;
                 }
             }
+
+            // §9.2: COPY propagates the target chain with
+            // sizeDifference=0 (etag/mtime only), then corrects the
+            // immediate target parent size (PHP Updater.php:195-204).
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let _ = self
+                .propagator
+                .propagate_change(&to_fc, now, 0)
+                .await;
+            let to_parent_fc = {
+                let mut parts: Vec<&str> = to_fc.split('/').collect();
+                parts.pop();
+                parts.join("/")
+            };
+            let _ = self.propagator.correct_folder_size(&to_parent_fc).await;
+
             Ok(())
         }
         .boxed()
@@ -1413,6 +1528,14 @@ impl DavFileSystem for NcFileSystem {
                 .execute(&self.state.pool)
                 .await
                 .map_err(|_| FsError::GeneralFailure)?;
+
+            // §9.2: mtime-changing PROPPATCH propagates etag/mtime to
+            // ancestors (sizeDifference=0).
+            let _ = self
+                .propagator
+                .propagate_change(&fc_path, mtime, 0)
+                .await;
+
             Ok(())
         }
         .boxed()
