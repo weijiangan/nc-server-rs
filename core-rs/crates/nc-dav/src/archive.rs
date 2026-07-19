@@ -75,10 +75,9 @@ pub async fn try_serve_archive(
 
     // 2. Confirm this is a directory.
     let fc_row = row::lookup_by_path(pool, prefix, storage_id, fc_path).await?;
-    let dir_mimetype_id = {
-        let cache = mime_cache.read().expect("mime cache lock");
-        cache.get_id("httpd/unix-directory").unwrap_or(0)
-    };
+    // §10.8: use get-or-insert for correctness even on reads
+    let dir_mimetype_id =
+        nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, "httpd/unix-directory").await;
     if fc_row.mimetype != dir_mimetype_id {
         return None;
     }

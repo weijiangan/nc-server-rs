@@ -190,10 +190,21 @@ impl NcFileSystem {
                 .as_secs() as i64;
             let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
 
-            let dir_mime_id = {
-                let cache = self.state.mime_cache.read().expect("mime cache lock");
-                cache.get_id("httpd/unix-directory").unwrap_or(2)
-            };
+            // §10.8: mimetype = httpd/unix-directory, mimepart = httpd
+            let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.state.mime_cache,
+                "httpd/unix-directory",
+            )
+            .await;
+            let dir_mimepart_id = nc_db::mime::get_or_insert_mime_id(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.state.mime_cache,
+                "httpd",
+            )
+            .await;
             let hash = row::path_hash(&built);
             let name = seg.to_string();
 
@@ -212,7 +223,7 @@ impl NcFileSystem {
                 .bind(parent_row.fileid)
                 .bind(&name)
                 .bind(dir_mime_id)
-                .bind(dir_mime_id)
+                .bind(dir_mimepart_id)
                 .bind(0i64)
                 .bind(now)
                 .bind(now)
@@ -267,7 +278,7 @@ impl NcFileSystem {
                 parent: parent_row.fileid,
                 name: Some(name),
                 mimetype: dir_mime_id,
-                mimepart: dir_mime_id,
+                mimepart: dir_mimepart_id,
                 size: 0,
                 mtime: now,
                 storage_mtime: now,
@@ -761,10 +772,22 @@ impl DavFileSystem for NcFileSystem {
                     .unwrap_or("application")
                     .to_string();
 
+                // §10.8: get-or-insert; mimepart without trailing slash
                 let (mime_type_id, mimepart_id) = {
-                    let cache = self.state.mime_cache.read().expect("mime cache lock");
-                    let mid = cache.get_id(&mime_str).unwrap_or(1);
-                    let pid = cache.get_id(&format!("{part_str}/")).unwrap_or(1);
+                    let mid = nc_db::mime::get_or_insert_mime_id(
+                        &self.state.pool,
+                        &self.state.table_prefix,
+                        &self.state.mime_cache,
+                        &mime_str,
+                    )
+                    .await;
+                    let pid = nc_db::mime::get_or_insert_mime_id(
+                        &self.state.pool,
+                        &self.state.table_prefix,
+                        &self.state.mime_cache,
+                        &part_str,
+                    )
+                    .await;
                     (mid, pid)
                 };
 
@@ -905,10 +928,21 @@ impl DavFileSystem for NcFileSystem {
                 .as_secs() as i64;
             let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
 
-            let dir_mime_id = {
-                let cache = self.state.mime_cache.read().expect("mime cache lock");
-                cache.get_id("httpd/unix-directory").unwrap_or(2)
-            };
+            // §10.8: mimetype = httpd/unix-directory, mimepart = httpd
+            let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.state.mime_cache,
+                "httpd/unix-directory",
+            )
+            .await;
+            let dir_mimepart_id = nc_db::mime::get_or_insert_mime_id(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.state.mime_cache,
+                "httpd",
+            )
+            .await;
             let hash = row::path_hash(&fc_path);
             let name = fc_path.rsplit('/').next().unwrap_or("").to_string();
 
@@ -927,7 +961,7 @@ impl DavFileSystem for NcFileSystem {
                 .bind(parent_row.fileid)
                 .bind(&name)
                 .bind(dir_mime_id)
-                .bind(dir_mime_id)
+                .bind(dir_mimepart_id)
                 .bind(0i64)
                 .bind(now)
                 .bind(now)
@@ -1148,10 +1182,14 @@ impl DavFileSystem for NcFileSystem {
             .await;
 
             // Update all descendants (directory move).
-            if from_row.mimetype == {
-                let cache = self.state.mime_cache.read().expect("mime cache lock");
-                cache.get_id("httpd/unix-directory").unwrap_or(0)
-            } {
+            let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.state.mime_cache,
+                "httpd/unix-directory",
+            )
+            .await;
+            if from_row.mimetype == dir_mime_id {
                 // Bulk-rename all paths under the old prefix using a Rust-side
                 // loop (avoids relying on DB-side MD5 dialect differences).
                 let _ = self
@@ -1360,10 +1398,13 @@ impl DavFileSystem for NcFileSystem {
 
             // Count direct children for directories (REQ §6.5 contained-*-count)
             let (child_dirs, child_files) = if meta.is_dir_flag && do_content {
-                let dir_mime_id = {
-                    let cache = self.state.mime_cache.read().expect("mime cache lock");
-                    cache.get_id("httpd/unix-directory").unwrap_or(0)
-                };
+                let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    &self.state.mime_cache,
+                    "httpd/unix-directory",
+                )
+                .await;
                 row::count_children(
                     &self.state.pool,
                     &self.state.table_prefix,

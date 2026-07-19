@@ -301,14 +301,13 @@ async fn write_file(
         .unwrap_or("application")
         .to_string();
 
-    let (mime_type_id, mimepart_id) = {
-        let cache = state.mime_cache.read().expect("mime cache lock");
-        let mid = cache.get_id(&mime_str).unwrap_or(1);
-        let pid = cache
-            .get_id(&format!("{}/", part_str))
-            .unwrap_or(1);
-        (mid, pid)
-    };
+    // §10.8: get-or-insert mimetype IDs; mimepart is the part BEFORE
+    // the '/' (e.g. "image"), NOT "image/" — matching PHP's
+    // getId(substr($mimetype, 0, strpos($mimetype, '/')))
+    let mime_type_id =
+        nc_db::mime::get_or_insert_mime_id(&state.pool, &state.table_prefix, &state.mime_cache, &mime_str).await;
+    let mimepart_id =
+        nc_db::mime::get_or_insert_mime_id(&state.pool, &state.table_prefix, &state.mime_cache, &part_str).await;
 
     let parent_path = {
         let mut parts: Vec<&str> = fc_path.split('/').collect();

@@ -28,6 +28,70 @@ impl MimeCache {
     pub fn get_name(&self, id: i64) -> Option<&str> {
         self.by_id.get(&id).map(String::as_str)
     }
+
+    /// Insert a mimetype → ID mapping into the in‑memory cache.
+    ///
+    /// Called after a successful DB insert so that future lookups hit
+    /// the cache without a DB round‑trip.
+    pub(crate) fn insert(&mut self, id: i64, mime: String) {
+        self.by_name.insert(mime.clone(), id);
+        self.by_id.insert(id, mime);
+    }
+}
+
+/// Resolve a mimetype string to its `oc_mimetypes` ID, inserting it into the
+/// database and updating the in‑memory cache if it isn't already present.
+///
+/// Mirrors PHP `IMimeTypeLoader::getId()` — loads the full table into memory
+/// on first use and auto‑inserts any unknown type.
+///
+/// Returns the mimetype ID, or `1` (`application/octet-stream`) as a last‑resort
+/// fallback when the DB is unreachable.
+pub async fn get_or_insert_mime_id(
+    pool: &AnyPool,
+    table_prefix: &str,
+    cache: &SharedMimeCache,
+    mime: &str,
+) -> i64 {
+    // ── Fast path: cache hit ──────────────────────────────────────────────
+    {
+        let guard = cache.read().expect("mime cache lock");
+        if let Some(id) = guard.get_id(mime) {
+            return id;
+        }
+    }
+
+    // ── Slow path: insert into DB + update cache ──────────────────────────
+    let table = format!("{table_prefix}mimetypes");
+
+    // Try INSERT first.  The unique index on `mimetype` ensures we never
+    // insert a duplicate; if a concurrent request already inserted it we
+    // just fall through to the SELECT below.
+    let _ = sqlx::query(&format!("INSERT INTO {table} (mimetype) VALUES ($1)"))
+        .bind(mime)
+        .execute(pool)
+        .await;
+
+    // Read back the ID (ours or the concurrent winner's).
+    let id: i64 = sqlx::query_scalar(&format!(
+        "SELECT id FROM {table} WHERE mimetype = $1"
+    ))
+    .bind(mime)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(1_i64);
+
+    // Update the in‑memory cache so future readers don't repeat the DB trip.
+    {
+        let mut guard = cache.write().expect("mime cache write lock");
+        if guard.get_id(mime).is_none() {
+            guard.insert(id, mime.to_string());
+        }
+    }
+
+    id
 }
 
 /// Load `oc_mimetypes` from the DB and return a shared, writable cache.
