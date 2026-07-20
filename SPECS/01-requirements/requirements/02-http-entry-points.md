@@ -10,6 +10,8 @@
 | `/ocs/v1.php/…` | OCS v1 |
 | `/ocs/v2.php/…` | OCS v2 |
 | `GET /ocs-provider/index.php` | OCS provider discovery (JSON list of available providers) |
+| `GET /core/preview` | Preview image by `fileId` (`PreviewController::getPreviewByFileId`) — native fast-path, Phase 11 |
+| `GET /core/preview.png` | Preview image by path (`PreviewController::getPreview`) — native fast-path, Phase 11 |
 | `/remote.php/{service}/…` | DAV service dispatch |
 | `/public.php/{service}/…` | Public DAV dispatch |
 | `/apps/files/…` | Files app (mix: REST native + PHP-FPM) |

@@ -95,3 +95,43 @@ Option 1 is recommended. Tracked as a future task because it requires rewriting 
 **Impact:** none today. The inflation is a PHP *runtime* behavior, not a persisted value — the filecache row holds the share's real granted mask — so Rust reading the persisted permissions most likely already emits the correct `W`. Also `{oc:}permissions` is only a web-client UI hint (show/hide the edit affordance); the actual write is permission-checked server-side regardless.
 
 **Fix (only if needed):** revisit **if** Rust ever gains full **native** mounting of shares that replicates PHP's movability-permission inflation on mount roots. At that point Rust would need the same underlying-cache re-derivation for the `W` flag on single-file-share roots. Until native share mounts with inflation exist, there is nothing to fix.
+
+---
+
+## I.10 TTL'd in-process cache of preview rows
+
+**Context:** Phase 11's hit path does one indexed `SELECT … FROM oc_previews WHERE file_id = $1` per thumbnail request. For hot gallery tiles (re-scrolls, multiple devices) this query is repeated constantly even though rows change rarely.
+
+**Impact:** performance only — the SELECT is a point lookup on an index and is cheap; this is an optimization, not a fix.
+
+**Fix:** a small `file_id → rows` LRU in `nc-preview` with a short TTL (≤ 2–3 s) and an explicit eviction in the Phase 11.5 overwrite-invalidation hook. The TTL must stay short because PHP-side writes (PUT via PHP-FPM, version restore) cannot notify the Rust cache — a long TTL would resurrect exactly the stale-preview bug Watcher-parity invalidation exists to prevent. Profile the hit path before building this; the added invalidation surface may not be worth the saved round-trip.
+
+---
+
+## I.11 Stale-while-revalidate on overwrite
+
+**Context:** Phase 11.5 (Watcher parity) deletes all of a file's preview rows + bytes on content overwrite, so the first request after an overwrite pays a cold generation — the user sees a spinner on the just-edited photo.
+
+**Impact:** UX only — a brief regeneration delay after overwrites, identical to PHP's behaviour (PHP also deletes and regenerates synchronously).
+
+**Fix:** instead of deleting on overwrite, mark rows stale, keep serving them, and queue a background regeneration that atomically swaps rows when done. Better UX for overwrite-heavy workflows (photo editing). This is a deliberate deviation from PHP (hence opt-in behind a config key) and must keep the delete-on-write path as the default until proven: the stale row's ETag keeps matching clients' cached copies, so revalidation semantics need care.
+
+---
+
+## I.12 `Accept`-header preview format negotiation
+
+**Context:** PHP's preview output format is fixed by the `preview_format` config (`jpeg` default, one-way `webp` override); the client's `Accept` header is ignored. Phase 11 replicates that.
+
+**Impact:** clients that prefer WebP/AVIF still receive JPEG previews — more bandwidth per gallery load on constrained links.
+
+**Fix:** when a client signals `Accept: image/webp` (or avif) and a row in that output format exists (or the backend can produce it), serve it. Interop caveat: output mimetype is part of PHP's row-match key, so negotiated-format rows are Rust-only — PHP never looks for them, which is harmless duplication but means the feature must stay opt-in. Requires `nc-preview` to write rows for both the config format and the negotiated format, or to accept the duplicate storage.
+
+---
+
+## I.13 Global generation cap shared with PHP-FPM (SysV semaphore participation)
+
+**Context:** Phase 11.3 replaces PHP's system-wide SysV semaphore (`SEMAPHORE_ID_NEW`, `preview_concurrency_new`) with an in-process tokio semaphore. While any generation still falls back to PHP-FPM (Phase 11.2/11.4 fallback matrix), the two limiters share no state, so total concurrent generations = Rust cap + PHP cap.
+
+**Impact:** on CPU-starved hosts running mixed Rust + PHP generation, the effective generation concurrency can exceed the operator's intended `preview_concurrency_new` budget.
+
+**Fix:** optional config flag under which Rust also acquires the SysV semaphore around backend calls (`sem_get(0x07ea, n)` — system-wide, coordinates with FPM workers by design; no-op when the kernel lacks SysV IPC). Only worthwhile while the PHP fallback path still generates; once generation is fully native, the tokio semaphore alone is exact.

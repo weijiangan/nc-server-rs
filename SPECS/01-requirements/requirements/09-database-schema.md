@@ -195,6 +195,42 @@ These tables back the `{oc:}favorite` and `{oc:}tags` DAV properties (§6.5.1), 
 
 This table is read during DAV authentication (§4.5) to check if the user has a pending 2FA challenge. The Rust server must query it even though the 2FA apps themselves are managed by PHP-FPM.
 
+### 9.10 Previews (shared with PHP-FPM)
+
+Created by the PHP Doctrine migrations `core/Migrations/Version33000Date20250819110529.php` (tables), `Version33000Date20251023110529.php` (autoincrement **removed** from all three `id` columns — ids are **client-side snowflakes** via `ISnowflakeGenerator` (`lib/private/Snowflake/SnowflakeGenerator.php`), never a DB sequence), and `Version33000Date20251023120529.php` (unique index). The Phase 11 preview fast path reads and writes these tables and must stay PHP-compatible in both directions; Rust migrations create them only on fresh installs (additive-only no-op otherwise, §9.7).
+
+**`oc_previews`**
+- `id` BIGINT UNSIGNED PK — snowflake-assigned (`SnowflakeAwareEntity`)
+- `file_id` BIGINT UNSIGNED NOT NULL — `oc_filecache.fileid`; indexed
+- `storage_id` BIGINT UNSIGNED NOT NULL — `oc_storages.numeric_id`
+- `old_file_id` BIGINT UNSIGNED NULL — legacy filecache id (set only by the legacy-layout migration)
+- `location_id` BIGINT UNSIGNED NULL — → `oc_preview_locations.id` (object store only; NULL on local disk)
+- `width` INTEGER UNSIGNED NOT NULL
+- `height` INTEGER UNSIGNED NOT NULL
+- `mimetype_id` INTEGER NOT NULL — **output** image mimetype (`oc_mimetypes.id`)
+- `source_mimetype_id` INTEGER NOT NULL — source file mimetype
+- `max` BOOLEAN NOT NULL DEFAULT false — the single max preview per file/version
+- `cropped` BOOLEAN NOT NULL DEFAULT false
+- `encrypted` BOOLEAN NOT NULL DEFAULT false
+- `etag` CHAR(40) NOT NULL — the **source file's etag at generation time** (served as the preview response `ETag`)
+- `mtime` INTEGER UNSIGNED NOT NULL — **generation timestamp** (not the file's mtime; used only for TTL expiry cleanup)
+- `size` INTEGER UNSIGNED NOT NULL — byte size
+- `version_id` BIGINT NOT NULL DEFAULT -1 — → `oc_preview_versions.id`; `-1` = un-versioned (local disk)
+- Indexes: PK `id`; `(file_id)`; UNIQUE `previews_file_uniq_idx (file_id, width, height, mimetype_id, cropped, version_id)`
+
+Preview bytes live at `{datadirectory}/appdata_{instanceid}/preview/{md5(file_id)[0..7], each char a nested dir}/{file_id}/{version-}{w}-{h}[-crop][-max].{ext}` on local disk (PHP `LocalPreviewStorage::constructPath`). Staleness is maintained by deleting a file's rows on content write (PHP `Preview\Watcher`), never by comparing `mtime`/`etag` at read.
+
+**`oc_preview_locations`** (object store only)
+- `id` BIGINT UNSIGNED PK — snowflake-assigned
+- `bucket_name` VARCHAR(40) NOT NULL
+- `object_store_name` VARCHAR(40) NOT NULL
+- UNIQUE `(bucket_name, object_store_name)`
+
+**`oc_preview_versions`** (versioned/object-store files only)
+- `id` BIGINT UNSIGNED PK — the same snowflake as the preview row it belongs to
+- `file_id` BIGINT UNSIGNED NOT NULL
+- `version` VARCHAR(1024) NOT NULL DEFAULT ''
+
 ### 9.7 Migration strategy
 
 - Use `sqlx::migrate!()` with versioned SQL files (one file per schema change, named with timestamp).

@@ -6,61 +6,126 @@ Goal: make gallery and grid-view loading fast on low-powered hosts by serving **
 
 ---
 
+## Starting state
+
+- `{nc:}has-preview` is already computed and wired into PROPFIND (done in §10.12: `nc-dav/src/preview.rs::has_preview()`, emitted from `nc-dav/src/props.rs`). Known residual gap carried here: the `enabledPreviewProviders` config is not consulted and the provider matrix diverges from PHP's default provider set (see 11.1).
+- The preview/thumbnail routes (`/core/preview`, `/core/preview.png`, `/apps/files/api/v1/thumbnail/{x}/{y}/{file+}`) currently fall through to the Phase 7 PHP-FPM catch-all (see the route note in `phase-6.md`). No native handlers exist.
+- Rust has no `oc_previews` access, no Imaginary client, and no snowflake id generator (nothing in `core-rs/` implements `ISnowflakeGenerator`).
+- The Rust PUT-overwrite path does not touch previews. PHP invalidates a file's previews on every write (`Watcher::postWrite` — see 11.5); without a Rust equivalent, overwrites would serve stale thumbnails forever.
+
+| Deferred item | From |
+|---|---|
+| `enabledPreviewProviders` filtering of the provider set | §10.12 deviation note |
+| Native serving of the thumbnail/preview routes | `phase-6.md` route table note |
+
+---
+
 ## Governing decisions (grounded)
 
 - **Do not reimplement an image codec.** Imaginary is a thin HTTP wrapper around **libvips** (`lib/private/Preview/Imaginary.php` posts to `{url}/pipeline`). The Rust `image` crate would be slower and more memory-hungry than libvips, and matching libvips means binding to libvips anyway. The win from Rust is the **system around** the pixels (caching, concurrency, avoiding PHP bootstrap), not the resize kernel.
 - **Keep generation out-of-process.** Image decoders are one of the most CVE-dense areas in software (e.g. libwebp `CVE-2023-4863`). Binding libvips **in-process via FFI** means one crafted upload can crash or corrupt the whole Rust server. Generation therefore runs behind an isolation boundary. The value Imaginary adds over raw libvips is exactly that isolation + ops maturity — **not** speed.
 - **Pluggable generator backend.** The default backend is **Imaginary** (already a first-class Nextcloud provider, `preview_imaginary_url` / `preview_imaginary_key`). Keep it behind a trait so a self-hoster who does not want a second always-on service can later swap in a supervised pool of short-lived libvips subprocesses (`vipsthumbnail`) with the same isolation. Do **not** bind libvips in-process.
-- **Storage model is DB-backed (Nextcloud 33).** Previews are **no longer** just files under `appdata_*/preview/<fileid>/<w>-<h>.<ext>`. They are rows in **`oc_previews`** (with bytes located via the file-cache appdata or, for object stores, **`oc_preview_locations`**), managed by `PreviewMapper` / `PreviewService` (`lib/private/Preview/Db/Preview.php`, `PreviewService.php`; table created in `core/Migrations/Version33000Date20250819110529.php`). A legacy folder-path layout still exists and is migrated on demand (`PreviewMigrationService::getInternalFolder`, config `enabledPreviewProviders` / `previewMovedDone`). **Any Rust cache-serve path must read `oc_previews`, not stat the appdata folder.**
-- **Scope of generation in Rust:** raster images only (the Imaginary-supported set: `bmp, png, jpeg, gif, heic, heif, svg+xml, tiff, webp, illustrator` — `Imaginary::supportedMimeTypes()`). Video (ffmpeg), PDF/office/OpenDocument, and other delegate-heavy providers stay on PHP-FPM (Phase 7). Rust only fast-paths what libvips/Imaginary handles.
+- **Storage model is DB-backed (Nextcloud 33).** Previews are rows in **`oc_previews`** (REQ §9.10), with bytes located at `{datadirectory}/appdata_{instanceid}/preview/{md5(file_id)[0..7], each char a nested dir}/{file_id}/{version-}{w}-{h}[-crop][-max].{ext}` on local disk (PHP `LocalPreviewStorage::constructPath`, `lib/private/Preview/Storage/LocalPreviewStorage.php:81-83`), or via **`oc_preview_locations`** on object stores. Rows + bytes are managed by `PreviewMapper` / `PreviewService` (`lib/private/Preview/Db/Preview.php`, `PreviewService.php`; tables created in `core/Migrations/Version33000Date20250819110529.php`). A legacy flat folder-path layout still exists and is migrated on demand (`PreviewMigrationService::getInternalFolder`, appconfig `core.previewMovedDone` / `core.on_demand_preview_migration`). **Any Rust cache-serve path must read `oc_previews`, not stat the appdata folder.**
+- **Scope of generation in Rust:** raster images only (the Imaginary-supported set: `bmp, x-bitmap, png, jpeg, gif, heic, heif, svg+xml, tiff, webp, illustrator` — `Imaginary::supportedMimeTypes()`). Video (ffmpeg), office/OpenDocument, and other delegate-heavy providers stay on PHP-FPM (Phase 7); PDF stays on PHP-FPM unless the separate `ImaginaryPDF` provider is relevant (out of scope). Rust only fast-paths what libvips/Imaginary handles.
 
 ---
 
-### 11.1 Compute `{nc:}has-preview` (prerequisite — shared with §10.12)
-> PHP source: `apps/dav/lib/Connector/Sabre/FilesPlugin.php:392-393` — `has-preview` = `json_encode($previewManager->isAvailable($node))`.
+### 11.1 `enabledPreviewProviders` + provider-matrix parity (residual of §10.12)
+> PHP source: `lib/private/PreviewManager.php:260-290` (`getEnabledDefaultProvider`) and `:305-400` (`registerCoreProviders` / `registerCoreProvidersOffice`). The base `has-preview` property is implemented (§10.12 — `nc-dav/src/preview.rs`, wired into `props.rs`); what remains is the config-driven provider gating that §10.12's deviation note deferred here. Completing it here satisfies the §10.12 residual — keep the two cross-referenced.
 
-- [ ] Replace the hardcoded `"false"` in `nc-dav/src/props.rs` with a value computed from the file mimetype against the enabled preview providers, gated on `enable_previews` (default on). Without this the web Files app never requests a thumbnail, so nothing else in this phase is observable.
-- [ ] This item is tracked in both places; completing it here satisfies §10.12. Keep the two cross-referenced.
+- [ ] Consult `enabledPreviewProviders` (system array) when computing `{nc:}has-preview`. PHP's **default** list — used when the key is unset — is exactly: `MarkDown`, `TXT`, `OpenDocument`, `PNG`, `JPEG`, `GIF`, `BMP`, `XBitmap`, `Krita`, `WebP` (`PreviewManager.php:275-280`). Every other provider — `Movie` (video), `MP3`, `SVG`, `TIFF`, `PDF`, `Illustrator`, `Photoshop`, `Postscript`, `Font`, `HEIC`, `TGA`, `SGI`, the MSOffice/StarOffice family, and `Imaginary` itself — is registered **only if its class is listed** in the config (`registerCoreProvider` gates on the list), subject to binary/imagick availability.
+- [ ] Fix the current divergences in `nc-dav/src/preview.rs` against that default: it returns `true` for `video/*` (with `preview_ffmpeg_path`), `application/pdf`, `image/svg+xml`, `image/tiff`, `font/*`, `application/postscript`, `application/illustrator`, and `audio/mpeg` — all `false` under PHP defaults unless the provider class is in `enabledPreviewProviders`. Gate each of those categories on the configured list (default = off).
+- [ ] When the Imaginary backend is available (11.4 — URL configured **and** `OC\Preview\Imaginary` listed in `enabledPreviewProviders`), `image/heic` / `image/heif` become `true`: Imaginary's supported set includes them without imagick (`Imaginary.php:45,78`). Today Rust hardcodes them `false`.
+- [ ] ffmpeg/LibreOffice binary detection: when `preview_ffmpeg_path` / `preview_libreoffice_path` are unset, PHP falls back to a PATH search (`binaryFinder->findBinaryPath('ffmpeg' | 'libreoffice' | 'openoffice')`, `PreviewManager.php:356-397`). Rust reads only the config key today — either replicate the PATH search or record a `> **Deviation:**` (config-only gating under-reports availability; acceptable if documented).
+- [ ] The gated provider set is also what decides what Rust may *generate* natively in 11.4 — keep one source of truth shared between the property and the generator. `has-preview = true` followed by a generation 404 is the failure mode this prevents.
 
-**Verify:** PROPFIND an image → `{nc:}has-preview` = `true`; a `.bin` → `false`. Web grid view begins issuing thumbnail requests for Rust-served files.
+**Unit tests:** `cargo test -p nc-dav` — extend `preview::tests`:
+- `default_provider_set_matches_php`: unset config → `image/png|jpeg|gif|bmp|webp`, `image/x-xbitmap`, `text/plain`, `text/markdown`, `application/vnd.oasis.opendocument.*`, `application/x-krita` → `true`; `video/mp4`, `application/pdf`, `image/svg+xml`, `image/tiff`, `audio/mpeg`, `font/ttf`, `image/heic` → `false`.
+- `enabled_providers_config_extends_set`: config including `OC\Preview\Movie` + ffmpeg configured → `video/mp4` `true`; including `OC\Preview\Imaginary` + URL configured → its mime set (incl. heic/heif) `true`.
+- Existing `enable_previews` / charset-stripping tests keep passing.
+
+**Verify:** PROPFIND an image → `{nc:}has-preview` = `true`; a `.bin` → `false`; a `.mp4` under **default** config → `false` (parity fix — was `true`); after adding `OC\Preview\Movie` to `enabledPreviewProviders` with `preview_ffmpeg_path` set → `true`. Web grid view requests thumbnails only for types the configured providers actually handle.
 
 ### 11.2 Serve cache **hits** natively (the primary win)
-> PHP path served today: `/core/preview`, `/core/preview.png`, `/apps/files/api/v1/thumbnail/{x}/{y}/{file+}` (REQ §8, §12), backed by `Generator::getPreview()` → `PreviewService`/`PreviewMapper` lookup in `oc_previews`.
+> PHP paths served today: `/core/preview` (by fileId) and `/core/preview.png` (by path) — `core/Controller/PreviewController.php` (`#[FrontpageRoute]` at `:63` and `:107`); `/apps/files/api/v1/thumbnail/{x}/{y}/{file+}` — `apps/files/lib/Controller/ApiController.php::getThumbnail` (`apps/files/appinfo/routes.php:25-30`), **deprecated since 32.0.0** in favour of `/core/preview`, hardcodes `crop=true`. REQ §2.1, §8.1, §6.5.
 
-- [ ] Add a native handler for the thumbnail/preview routes that, for a requested `(fileid, width, height, crop, mode)`, looks up an existing preview via `oc_previews` (match on `file_id`, `width`, `height`, `cropped`, `mimetype`, `version` — mirroring `Generator::generatePreviews` `array_find`), reads the bytes from the resolved storage location (appdata for local, `oc_preview_locations` for object store — object store may be deferred, see out-of-scope), and streams them.
-- [ ] Emit correct HTTP caching: strong `ETag` from the preview row's etag, `Cache-Control`, and `304 Not Modified` on `If-None-Match`; use async/zero-copy file streaming. This is the path that must avoid PHP-FPM entirely.
-- [ ] On a cache **miss** (no matching row), hand off to 11.3/11.4 rather than blocking the serve path.
+- [ ] Add native handlers for the three routes. Resolve the node **with authorization first**: `/core/preview` resolves `fileId` within the requesting user's folder (PHP `getUserFolder($userId)->getFirstNodeById($fileId)`); `/core/preview.png` and the files route resolve a user-relative path. A file the user cannot read → `403` on the core routes; the files route maps the same check to `404`. Honour the hide-download share obfuscation: a node on shared storage whose share has `canSeeContent() === false` → `403` unless the request carries the header `x-nc-preview: true` (`PreviewController.php:155-163`).
+- [ ] Parameter parity: `x=32`, `y=32`, `a=false` (preserve aspect ratio → generator `crop = !a`), `forceIcon=true`, `mode=fill|cover` (default `fill`), `mimeFallback=false`. `fileId=-1` / empty path / `x=0` / `y=0` → `400`; the files route rejects `x<1|y<1` with a JSON 400.
+- [ ] **Size bucketing before lookup** — replicate `Generator::calculateSize` (`Generator.php:420-496`): skip aspect folding when cropping; resolve `-1` dimensions against the source ratio; fold `fill`/`cover` mode into width/height (fill = max dimension, cover = min); snap each dimension **up to the nearest power of 4, minimum 64** (`4 ** ceil(log4(dim))`, `:457-478`) scaling the other axis proportionally; clamp to the max-preview dimensions (`preview_max_x`/`preview_max_y`, default 4096). Without byte-identical bucketing, Rust requests miss PHP-generated rows and vice versa — hit rate collapses in both directions during coexistence.
+- [ ] Cache-hit lookup: fetch rows `WHERE file_id = $1` (PHP `PreviewMapper::getAvailablePreviews` filters on `file_id` only), then match in memory on `(width, height, cropped, mimetype_id, version_id)` — exactly PHP's `array_find` (`Generator.php:168-170`), where `mimetype` is the preview **output** mimetype compared against the max preview's output mimetype (not the source mimetype), and `version_id = -1` for un-versioned (local-disk) files. `mtime`/`etag` are **not** consulted at lookup — staleness is enforced by deletion-on-write (11.5). Stream the bytes from the resolved local path, async/zero-copy.
+- [ ] Response parity per route:
+  - `/core/preview*` success: `Content-Type` = preview mimetype; `Cache-Control: private, max-age=86400, immutable` + `Expires` (+24 h) (PHP `cacheFor(3600*24, false, true)`); strong `ETag` from the `oc_previews.etag` column (the **source file's etag at generation** — `PreviewFile::getETag`, `Storage/PreviewFile.php:35-38`); `Last-Modified` from `oc_previews.mtime` (the **generation** timestamp, not the file's mtime); `Content-Disposition: inline; filename="…"`; `X-Robots-Tag: noindex, nofollow`; `304` on `If-None-Match` **and** `If-Modified-Since` (PHP `NotModifiedMiddleware`).
+  - files thumbnail route: same body/`ETag`/`Last-Modified`, but PHP's default `Cache-Control: no-cache, no-store, must-revalidate` (no `cacheFor`), and JSON error bodies: `404 {"message":"File not found."}`, `400 {"message":"Requested size must be numeric and a positive value."}`.
+  - Errors: file not found / no provider / previews disabled → `404` (empty body on the core routes); generation failure (`InvalidArgumentException` class) → `400`; `mimeFallback=true` with no preview → `303` to the PHP `/core/mimeicon` URL (proxying the whole request to PHP-FPM is the simplest correct interim option).
+- [ ] **Incremental fallback:** until 11.4/11.5 land, a cache **miss** proxies to PHP-FPM (Phase 7) — the route only fast-paths hits (matches the `phase-6.md` note). After 11.4: miss → native generation for the Imaginary-supported raster set when the Imaginary backend is available, else PHP-FPM proxy. `enable_previews=false` → `404` (PHP throws `NotFoundException('Previews disabled')`).
 
-**Verify:** second load of a gallery (previews already generated) issues zero PHP-FPM requests for thumbnails; repeat requests return `304`; wall-clock gallery load on a 2-core host drops materially versus the PHP path.
+**Unit tests:** `cargo test -p nc-dav` —
+- `calculate_size_matches_php`: vectors of `(w, h, crop, mode, maxW, maxH)` → bucketed `(w, h)`; cover fill vs cover results, the power-of-4 snap (e.g. 100 → 256), the 64 minimum, the 4096 clamp, and `-1` dimension resolution.
+- `preview_row_match`: rows differing only in `source_mimetype_id` / `mtime` / `etag` still match; output-mimetype + w/h/cropped/`version_id=-1` semantics.
+- `preview_response_headers`: `ETag`/`Last-Modified` sourced from the row's `etag`/`mtime` columns, not the source file; per-route `Cache-Control` distinction.
+
+**Verify:** second load of a gallery (previews already generated) issues zero PHP-FPM requests for thumbnails (access log); repeat request with `If-None-Match: "<row etag>"` → `304`; byte-identical body + headers versus the PHP path for the same `(file, x, y, a, mode)` on a PHP-generated row; requesting another user's fileId → 403 (core) / 404 (files); hide-download share without `x-nc-preview` → 403; wall-clock gallery load on a 2-core host drops materially versus the PHP path.
 
 ### 11.3 Concurrency control + request coalescing
-> PHP source: `lib/private/Preview/Generator.php` — `getNumConcurrentPreviews()` (`preview_concurrency_new`, default = hardware concurrency / fallback **4**; `preview_concurrency_all`, default = 2× / fallback **8**) guarded by SysV semaphores (`guardWithSemaphore` / `SEMAPHORE_ID_NEW` / `SEMAPHORE_ID_ALL`).
+> PHP source: `Generator::getNumConcurrentPreviews()` (`Generator.php:295-317`) and `guardWithSemaphore()` (`:230-242`). **Two** system-wide SysV semaphores (they coordinate across all PHP-FPM workers by design; silently skipped only when the `sysvsem` extension is absent): `SEMAPHORE_ID_ALL = 0x0a11` with `preview_concurrency_all` (default 2× hardware concurrency / fallback **8**, clamped ≥ new) wraps the **entire** preview request including lookup (`PreviewManager.php:176-177`); `SEMAPHORE_ID_NEW = 0x07ea` with `preview_concurrency_new` (default hardware concurrency / fallback **4**) wraps only the provider call and the resize work (`Generator.php:374-375, 518-519`).
 
-- [ ] Cap concurrent generations with a semaphore sized from the same config keys (`preview_concurrency_new` / `preview_concurrency_all`, same defaults), so a burst of misses on a 2-core box does not thrash the CPU. This replaces the per-worker SysV semaphore (which cannot coordinate across independent PHP-FPM workers) with a single in-process limiter — a strict improvement on low-core hosts.
-- [ ] Coalesce duplicate in-flight requests: concurrent requests for the **same** `(fileid, size, crop)` await a single generation instead of each spawning one.
+- [ ] Cap concurrent generations with a tokio semaphore sized from `preview_concurrency_new` (same defaults: CPU count, fallback 4). This is the inner (NEW) gate. The outer ALL gate is deliberately **not** replicated — in Rust a cache hit is one indexed lookup + a file stream and needs no admission control (this is itself part of the win: PHP's ALL semaphore admits hits too because hits still pay the bootstrap).
+- [ ] Coalesce duplicate in-flight requests: concurrent requests for the **same** post-bucketing `(fileid, width, height, crop, version)` await a single generation (e.g. a map of `Shared<…>` in-flight futures keyed on that tuple) instead of each spawning one. PHP cannot do this across workers — mark as an intentional improvement.
 
-**Verify:** firing N ≫ ncores simultaneous cold thumbnail requests never runs more than the configured number of generations at once; duplicate concurrent requests for one preview trigger exactly one backend call.
+> **Deviation:** the Rust limiter is not fixing a PHP deficiency — the SysV semaphore does coordinate across FPM workers; the gains are removing per-request `sem_get`/`sem_acquire` syscalls and adding cross-task coalescing. Honest tradeoff: while generation can still fall back to PHP-FPM (11.2/11.4), total concurrency = Rust cap + PHP cap, because the two limiters share no state. On CPU-starved hosts either size `preview_concurrency_new` to ~half the desired global cap, or (future work) have Rust also acquire the SysV semaphore.
+
+**Unit tests:** `cargo test -p nc-dav` —
+- `semaphore_size_from_config`: unset with known CPU count → CPU count; fallback → 4; `all` fallback 8; clamp `all ≥ new`.
+- `coalescing_single_backend_call`: N concurrent requests for one key → exactly 1 backend invocation, N identical results.
+- `semaphore_bounds_concurrency`: 2N concurrent generations with cap N → observed in-flight never exceeds N.
+
+**Verify:** firing N ≫ ncores simultaneous cold thumbnail requests never runs more than the configured number of generations at once (backend-side counter); duplicate concurrent requests for one preview trigger exactly one backend call.
 
 ### 11.4 Generate cache **misses** via a pluggable, isolated backend
-> PHP source: `lib/private/Preview/Imaginary.php` — posts the source stream to `{preview_imaginary_url}/pipeline` with an `operations` array (`autorotate` / `convert` / `fit` or `smartcrop`, `width`/`height`/`quality`/`stripmeta`/`norotation`), `key = preview_imaginary_key`; honours `preview_format` (jpeg default, `webp` option), `preview_max_filesize_image` (default 50 MB), and quality from appconfig `preview.jpeg_quality` / `preview.webp_quality` (default 80).
+> PHP source: `lib/private/Preview/Imaginary.php` (request build `:44-155`), `Generator::getMaxPreview` (`:323-349`; `preview_max_x`/`preview_max_y` default **4096**), `Generator::generatePreview` (derived sizes, `:502-571`).
 
-- [ ] Define a `PreviewBackend` trait (`generate(source_stream, width, height, crop, mode, out_format) -> bytes`). Default impl = **Imaginary** HTTP client matching the PHP pipeline (same operations, format, quality, filesize cap, and `allow_local_address` semantics). Keep it out-of-process; do **not** link libvips into the server.
-- [ ] Reuse PHP's **max-preview model**: generate/lookup the single "max" preview first, then derive smaller sizes from it (`Generator::getMaxPreview` + `calculateSize`), rather than re-decoding the original for each size.
-- [ ] Fall back to PHP-FPM (Phase 7) for any mimetype outside the Imaginary-supported raster set (video/PDF/office/etc.), so behaviour is never worse than today.
+- [ ] Define a `PreviewBackend` trait (`generate(source_stream, width, height, crop) -> (bytes, output_mimetype)`). Default impl = **Imaginary** HTTP client matching the PHP pipeline. Keep it out-of-process; do **not** link libvips into the server.
+- [ ] Imaginary backend parity checklist (`Imaginary.php:44-155`):
+  - Supported set, exactly: `image/bmp`, `image/x-bitmap`, `image/png`, `image/jpeg`, `image/gif`, `image/heic`, `image/heif`, `image/svg+xml`, `image/tiff`, `image/webp`, `application/illustrator` (`supportedMimeTypes():44-46`).
+  - Available only when `preview_imaginary_url` is configured (PHP default `'invalid'` → provider returns null and logs an error) **and** `OC\Preview\Imaginary` is listed in `enabledPreviewProviders` (core providers are gated on that list — `PreviewManager.php:322`). Most installs have **no** Imaginary — the PHP-FPM fallback of 11.2 must be first-class, not an afterthought.
+  - Pipeline: op1 = `autorotate` (default) **or** `convert` with `params.type` = output mime (for `svg+xml` / `pdf` / `illustrator`, output png) **or** *neither* (`heic` — autorotate disabled). Op2, always: `smartcrop` when crop else `fit`, params `{width, height, stripmeta: "true", type: <output mime>, norotation: "true", quality: <q>}`. No `position`, no `fail_on`.
+  - Request: `POST {url}/pipeline?operations=<json>&key=<preview_imaginary_key>` — the key is a **query parameter**, not a header; body = raw source stream; `Content-Type` = the **source** file's mimetype; timeout 120 s, connect timeout 3 s. Allow local/loopback addresses for this client (PHP passes `allow_local_address: true` — Imaginary normally runs on localhost). `preview_imaginary_url`/`_key` are marked sensitive in PHP (`SystemConfig.php:42-43`) — never log them (REQ §17).
+  - Output format: source-mime map — gif/png/svg/pdf/illustrator → `png`; jpeg/bmp/x-bitmap/tiff/webp/heif/heic → `jpeg` — then `preview_format` (system string, default `jpeg`) overrides **one-way to `webp` only**. Quality from appconfig `preview/jpeg_quality` / `preview/webp_quality` (default `80`; png output falls into the `jpeg_quality` branch).
+  - `preview_max_filesize_image` (system int, default **50 MiB**, `-1` = unlimited): reject before POST when the source exceeds it → 404 (PHP `NotFoundException`).
+- [ ] **Max-preview model:** generate/lookup the single max preview first (clamped to `preview_max_x/y`; row gets `max=true`), then derive the requested smaller size from it. PHP derives in-process (GD `resizeCopy`/`cropCopy` on the decoded max image, `Generator.php:502-571`); Rust does it by re-submitting the **max preview's bytes** (already-decoded, safe libvips output) to Imaginary with a fit/crop op — never re-decode the original per size, and never add an in-process codec.
+- [ ] Fall back to PHP-FPM (Phase 7) for any mimetype outside the Imaginary-supported raster set (video/PDF/office/etc. — note PHP has a separate `ImaginaryPDF` provider for `application/pdf`; out of scope here), so behaviour is never worse than today.
 
-**Verify:** a cold thumbnail for a JPEG/PNG/HEIC/WebP is generated through the backend and matches the PHP output size/format for the same request; an unsupported type (e.g. video) still yields a preview via the PHP fallback.
+> **Impl note:** the Imaginary `smartcrop` branch is effectively unreachable on PHP's Generator path — `generateProviderPreview` calls the provider with crop=false (`GeneratorHelper::getThumbnail` default); the files route's `crop=true` is realised by the Generator cropping the *max preview image* in `generatePreview`, not via the provider. Replicate that crop-on-max semantics in the derived-size step; only send `smartcrop` if a real call site crops at the backend.
 
-### 11.5 Persist generated previews (DB write — mind the sequence)
-> PHP source: `PreviewMapper::insert` into `oc_previews` (`file_id`, `storage_id`, `width`, `height`, `cropped`, `mimetype_id`, `source_mimetype_id`, `mtime`, `size`, `max`, `etag`, …; `Db/Preview.php`), bytes stored via `StorageFactory`.
+**Unit tests:** `cargo test -p nc-dav` —
+- `imaginary_pipeline_per_mimetype`: table-driven, each source mime → expected operations JSON (autorotate vs `convert{type}` vs neither; output type jpeg/png; `webp` override when `preview_format=webp`; quality from the right appconfig key).
+- `filesize_cap`: source > 50 MiB → no HTTP call, NotFound; `-1` disables the cap.
+- `request_shape`: key + operations in the query string (not headers), `Content-Type` = source mime, 120 s/3 s timeouts, loopback URL allowed.
 
-- [ ] After generating, store the bytes and insert the `oc_previews` row so future requests are cache hits, matching the columns/types PHP writes (so a subsequent PHP request also finds it). Preserve the `max` flag on the max preview.
-- [ ] **Do not allocate the row id with `MAX(id)+1`** — same class of bug as §10.9. `oc_previews`/`oc_preview_locations` ids are DB-managed (`Version33000Date20251023110529` explicitly *removes* auto-increment from `preview_locations.id`, so match whatever scheme PHP uses per table); use the DB/`SnowflakeAwareEntity` id path so Rust- and PHP-written previews never collide.
-- [ ] Respect `enable_previews` / `enabledPreviewProviders` gating before writing.
+**Verify:** a cold thumbnail for a JPEG/PNG/HEIC/WebP is generated through the backend and matches the PHP output size/format for the same request; `preview_format=webp` on both sides → webp on both sides; an oversized source → 404 on both sides; an unsupported type (e.g. video) still yields a preview via the PHP fallback.
 
-**Verify:** a preview generated by Rust is found and served by a subsequent **PHP** request (row + bytes are PHP-compatible); ids do not collide with PHP-inserted previews under interleaved load.
+### 11.5 Persist generated previews (DB write — mind the sequence) + invalidate on overwrite
+> PHP source: `Generator::generateProviderPreview` (`Generator.php:392-405`) / `generatePreview` (`:550-563`), `PreviewMapper::insert` (`Db/PreviewMapper.php:49-68`), `lib/private/Snowflake/SnowflakeGenerator.php`. Invalidation: `lib/private/Preview/Watcher.php` + `WatcherConnector.php:38-48`. Schema: REQ §9.10.
+
+- [ ] **Fresh-install migration:** add a Rust migration creating `oc_previews`, `oc_preview_locations`, `oc_preview_versions` per REQ §9.10 — additive-only no-op where the PHP Doctrine migrations (`Version33000Date20250819110529`, `…20251023110529`, `…20251023120529`) already created them (REQ §9.7).
+- [ ] **Snowflake ids — never `MAX(id)+1`, never `INSERT … DEFAULT`.** Autoincrement was *removed* from all three tables (`Version33000Date20251023110529:24-42`) precisely because ids are **client-side snowflakes** (`Preview extends SnowflakeAwareEntity`, `Db/Preview.php:57`; `QBMapper::insert` calls `generateId()`); on Postgres there is no sequence to fall back to. Replicate `lib/private/Snowflake/SnowflakeGenerator.php`: `(seconds − TS_OFFSET) << 32 | ms(10 bits) << 22 | serverid(9 bits) << 13 | isCli(1 bit) << 12 | sequence(12 bits)`, with `TS_OFFSET = 1759276800` (`ISnowflakeGenerator:36`), `serverid` = system config `serverid` or `crc32(hostname)` when unset, `isCli = 0` for Rust, and a per-(millisecond, serverid) 12-bit sequence that spins to the next millisecond on overflow. Use for `oc_previews.id` and `oc_preview_locations.id`.
+- [ ] **Column parity** (so a subsequent **PHP** request finds and serves Rust-written rows): `file_id`; `storage_id` (mount's numeric storage id); `width`/`height` (actual produced pixels); `source_mimetype_id` (source file) / `mimetype_id` (output image), resolved via `oc_mimetypes`; `cropped`; `max` (true only on the max preview); `encrypted=false`; `etag` = **source file's etag at generation** (`Generator.php:404` — *not* the preview bytes' etag); `mtime` = **generation timestamp** (`Generator.php:405` — *not* the file's mtime; PHP uses it only for TTL expiry); `size` = byte size after the write; `version_id = -1` for un-versioned files (else the preview row's own snowflake id with a matching `oc_preview_versions` row — `PreviewMapper.php:60-65`; n/a on local disk); `old_file_id`/`location_id` NULL.
+- [ ] **Byte parity:** write to `{datadirectory}/appdata_{instanceid}/preview/{md5(file_id)[0..7], each char a nested dir}/{file_id}/{version-}{w}-{h}[-crop][-max].{ext}` (`LocalPreviewStorage::constructPath:81-83`; extension from output mimetype — png/gif/jpg/webp, `Db/Preview.php:140-162`).
+- [ ] **Unique-index collision:** `(file_id, width, height, mimetype_id, cropped, version_id)` is unique — on conflict (race with PHP or another Rust task), re-fetch and serve the existing row instead of failing (PHP `Generator::getMaxPreview:338-345`).
+- [ ] **Invalidate on overwrite (Watcher parity) — correctness-critical.** PHP's `Watcher::postWrite` deletes **all** preview rows + bytes for a file on any content write (`Watcher.php:36-61`; there is no mtime/etag comparison at read — deletion *is* the invalidation). Rust's PUT-overwrite is native, so PHP's hook never fires; without this, an overwritten file serves stale thumbnails forever (and the stale row's ETag keeps matching clients' cached copies). On the Rust PUT-overwrite path (including chunked-assembly overwrite), delete all `oc_previews` rows for the fileid plus their byte files — best-effort after the write with `warn!`/`error!` on failure (CLAUDE.md hygiene rule 1: a silent failure here is invisible to the caller). `MOVE`/`COPY` must **not** invalidate (same content; PHP doesn't either). Verify whether PHP fires `postWrite` for `X-OC-MTime`-only touches and match whatever it does.
+- [ ] No action on DELETE/trash: PHP defers orphan cleanup to the hourly `BackgroundCleanupJob` (LEFT JOIN `oc_filecache`), and trashed files keep their filecache row under PHP too. Document as parity, do not implement.
+- [ ] Gate generation writes on `enable_previews` + the 11.1 gated provider set.
+
+**Unit tests:** `cargo test -p nc-dav` / `nc-db` —
+- `snowflake_layout`: known `(seconds, ms, serverid, seq)` → expected 64-bit pattern (verify against a PHP-generated sample id); sequence overflow → next-millisecond spin.
+- `preview_path_construction`: fileid → md5-sharded nested path; name suffixes (`-crop`, `-max`, version prefix, ext mapping per output mime).
+- `row_fields_from_generation`: generated artifact → entity with `etag` = source etag, `mtime` = generation time, `version_id = -1`, `encrypted = false`.
+- `overwrite_invalidates`: PUT overwrite → delete issued for every row of the fileid; MOVE/COPY → no delete.
+
+**Verify:** a preview generated by Rust is found and served by a subsequent **PHP** request (row + bytes are PHP-compatible); ids do not collide with PHP-inserted previews under interleaved load; overwrite a file via Rust PUT → the next thumbnail request regenerates (stale row gone); the same holds after a PHP PUT overwrite.
 
 ### 11.6 (Stretch) Background pre-generation
-- [ ] Optionally warm the max preview for newly uploaded previewable files (on the Rust upload path or via a queue) so the first gallery view is mostly cache hits. Keep it bounded by the 11.3 concurrency limiter and off the request path.
+- [ ] Optionally warm the max preview for newly uploaded previewable files (on the Rust upload path or via a queue) so the first gallery view is mostly cache hits. Keep it bounded by the 11.3 concurrency limiter, off the request path, and cancellable within the 30 s graceful-shutdown drain (REQ §20). Uploads are new files, so 11.5's overwrite invalidation does not fight this.
 
 **Verify:** after uploading a batch of images, the first gallery load is predominantly cache hits (few/no cold generations).
 
@@ -69,6 +134,37 @@ Goal: make gallery and grid-view loading fast on low-powered hosts by serving **
 ### Out of scope (intentional)
 
 - **In-process libvips FFI** — rejected for crash-safety (a malformed image would take down the whole server). Generation stays out-of-process (Imaginary or a subprocess pool). Revisit only with hard sandboxing.
-- **Object-store preview locations** — `oc_preview_locations` / `StorageFactory` object-store path may be deferred initially; local-disk appdata is the first target (consistent with the Phase 10 local-disk storage assumption). Cache-serve for object-store-backed previews can fall back to PHP-FPM until implemented.
-- **Non-raster providers** — video (ffmpeg), PDF/office/OpenDocument, and other delegate-heavy providers stay on PHP-FPM. Rust only fast-paths the Imaginary-supported raster set.
-- **Legacy folder-path previews** — the on-demand migration from the old `appdata` layout to `oc_previews` (`PreviewMigrationService`) remains a PHP concern; Rust reads the migrated `oc_previews` rows.
+- **Object-store preview locations** — `oc_preview_locations` / `StorageFactory` object-store path is deferred initially; local-disk appdata is the first target (consistent with the Phase 10 local-disk storage assumption). Cache-serve for object-store-backed previews falls back to PHP-FPM until implemented.
+- **Non-raster providers** — video (ffmpeg), office/OpenDocument, and other delegate-heavy providers stay on PHP-FPM; `ImaginaryPDF` (PHP's separate PDF-via-Imaginary provider, `application/pdf` only) is not fast-pathed either. Rust only handles the `Imaginary::supportedMimeTypes()` raster set.
+- **Legacy folder-path previews** — the on-demand migration from the old flat `appdata` layout to `oc_previews` (`PreviewMigrationService`, appconfig `core.previewMovedDone` / `core.on_demand_preview_migration`) remains a PHP concern; Rust reads the migrated `oc_previews` rows.
+- **Public-share previews** — `files_sharing`'s `PublicPreviewController` (`/apps/files_sharing/publicpreview/{token}`, `/apps/files_sharing/s/{token}/preview`) stays on PHP-FPM with the rest of the sharing app (REQ §1, §10.5).
+- **`/core/mimeicon`** — stays PHP-FPM; `mimeFallback=true` requests are proxied or 303-redirected to the PHP URL.
+
+---
+
+## References
+
+**Requirements (REQ)**
+- [`../01-requirements/requirements/02-http-entry-points.md`](../01-requirements/requirements/02-http-entry-points.md) — §2.1: `/core/preview` + `/core/preview.png` native routes
+- [`../01-requirements/requirements/06-webdav-dav.md`](../01-requirements/requirements/06-webdav-dav.md) — §6.5: `{nc:}has-preview` computed property
+- [`../01-requirements/requirements/08-files-app-rest-endpoints.md`](../01-requirements/requirements/08-files-app-rest-endpoints.md) — §8.1: `/apps/files/api/v1/thumbnail/{x}/{y}/{file+}`
+- [`../01-requirements/requirements/09-database-schema.md`](../01-requirements/requirements/09-database-schema.md) — §9.10: `oc_previews` / `oc_preview_locations` / `oc_preview_versions` schema, snowflake ids, byte layout
+- [`../01-requirements/requirements/16-caching-strategy.md`](../01-requirements/requirements/16-caching-strategy.md) — §16.3: preview response caching contract (ETag/304/`max-age=86400`)
+- [`../01-requirements/requirements/17-logging-and-observability.md`](../01-requirements/requirements/17-logging-and-observability.md) — §17: log levels; `preview_imaginary_url`/`_key` are sensitive (never logged)
+- [`../01-requirements/requirements/18-configuration-file.md`](../01-requirements/requirements/18-configuration-file.md) — §18: preview config keys (`enable_previews`, `enabledPreviewProviders`, Imaginary URL/key, concurrency, format, size caps, `serverid`, quality appconfig)
+- [`../01-requirements/requirements/20-non-functional-requirements.md`](../01-requirements/requirements/20-non-functional-requirements.md) — §20: 30 s shutdown drain (11.6), memory/binary budgets (no in-process codec)
+
+**Specifications**
+- [`../02-specifications/api-compatibility/11-files-app-rest-api.md`](../02-specifications/api-compatibility/11-files-app-rest-api.md) — thumbnail endpoint wire spec
+- [`../02-specifications/api-compatibility/07-webdav-caldav-carddav.md`](../02-specifications/api-compatibility/07-webdav-caldav-carddav.md) — `{nc:}has-preview` in the DAV property list
+- [`../02-specifications/api-compatibility/12-public-sharing-endpoints.md`](../02-specifications/api-compatibility/12-public-sharing-endpoints.md) — public-share preview routes (out of scope, stay PHP-FPM)
+- [`../02-specifications/improvements.md`](../02-specifications/improvements.md) — §I.10–I.13: deferred preview improvements (row cache, stale-while-revalidate, `Accept` negotiation, shared semaphore)
+
+**Implementation plan**
+- [`../03-implementation-plan/plan/14-native-preview-thumbnail-fast-path.md`](../03-implementation-plan/plan/14-native-preview-thumbnail-fast-path.md) — architecture, component design, endpoint/SQL specs, milestones M0–M4, risks, alternatives considered
+
+**Related phases**
+- [`phase-10.md`](phase-10.md) — §10.12: `{nc:}has-preview` implementation (11.1 completes its residual)
+- [`phase-6.md`](phase-6.md) — thumbnail route currently on the PHP-FPM catch-all until this phase
+- [`phase-7.md`](phase-7.md) — PHP-FPM FastCGI dispatch (miss fallback target)
+- [`phase-8.md`](phase-8.md) — load validation harness (11.3 verify extends it)
