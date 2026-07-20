@@ -120,6 +120,29 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
         .route("/ocs/v1.php/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/ocs/v2.php/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/ocs-provider/index.php", get(php_fpm_fallback))
+        // Phase 11.2: native preview/thumbnail hit-serving.  Cache hits for the
+        // caller's own home-storage files are served with zero PHP; misses, shared
+        // files, and unauthenticated requests proxy to PHP-FPM (the handlers decide).
+        // More specific than the registry's `/apps/files/{*tail}` / `/core/{*tail}`
+        // wildcards, so axum prefers these.
+        .route("/core/preview", get(crate::preview::preview_by_file_id))
+        .route(
+            "/index.php/core/preview",
+            get(crate::preview::preview_by_file_id),
+        )
+        .route("/core/preview.png", get(crate::preview::preview_by_path))
+        .route(
+            "/index.php/core/preview.png",
+            get(crate::preview::preview_by_path),
+        )
+        .route(
+            "/apps/files/api/v1/thumbnail/{x}/{y}/{*file}",
+            get(crate::preview::files_thumbnail),
+        )
+        .route(
+            "/index.php/apps/files/api/v1/thumbnail/{x}/{y}/{*file}",
+            get(crate::preview::files_thumbnail),
+        )
         // DAV (Phase 4) — native handlers; all mount points share the same
         // handler which resolves the strip prefix from the request path.
         //

@@ -50,6 +50,10 @@ pub struct AppState {
     /// Created regardless of distributed cache configuration - serves as the
     /// fallback store when Redis/Memcached is not available.
     pub upload_state_store: nc_dav::SharedUploadStateStore,
+    /// Resolved preview-provider gating (§11.1), built once at startup from
+    /// `config.php`.  Shared with the DAV layer for `{nc:}has-preview` and (11.4)
+    /// native generation.
+    pub preview_registry: Arc<nc_dav::ProviderRegistry>,
 }
 
 /// Allow axum to extract `OcsState` from the top-level `AppState` using the
@@ -95,9 +99,7 @@ impl FromRef<AppState> for nc_dav::NcDavState {
             filename_validator,
             base_url,
             upload_state_store: state.upload_state_store.clone(),
-            enable_previews: state.nc_config.enable_previews,
-            preview_ffmpeg_path: state.nc_config.preview_ffmpeg_path.clone(),
-            preview_libreoffice_path: state.nc_config.preview_libreoffice_path.clone(),
+            preview_registry: state.preview_registry.clone(),
         }
     }
 }

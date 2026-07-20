@@ -1851,14 +1851,12 @@ impl DavFileSystem for NcFileSystem {
             // Shared nodes (from oc_share) are detected via is_mounted/share_permissions.
             let is_shared = false;
 
-            // §10.12: compute {nc:}has-preview from mimetype + preview config.
-            let has_preview = crate::preview::has_preview(
-                &meta.mime_type,
-                self.state.enable_previews,
-                is_mounted,
-                self.state.preview_ffmpeg_path.as_deref(),
-                self.state.preview_libreoffice_path.as_deref(),
-            );
+            // §10.12 / §11.1: compute {nc:}has-preview from mimetype + the resolved
+            // provider registry (enabledPreviewProviders gating, Imaginary, binaries).
+            let has_preview = self
+                .state
+                .preview_registry
+                .is_available(&meta.mime_type, is_mounted);
 
             // §9.5: resolve tags / favorite from oc_vcategory / oc_vcategory_to_object.
             let tag_info = crate::tags::get_tag_info(

@@ -7,6 +7,7 @@ members = [
     "crates/nc-ocs",
     "crates/nc-files",
     "crates/nc-fastcgi",
+    "crates/nc-preview",
 ]
 resolver = "2"
 
@@ -94,6 +95,7 @@ nc-dav = { path = "crates/nc-dav" }
 nc-ocs = { path = "crates/nc-ocs" }
 nc-files = { path = "crates/nc-files" }
 nc-fastcgi = { path = "crates/nc-fastcgi" }
+nc-preview = { path = "crates/nc-preview" }
 
 [profile.release]
 lto = "thin"

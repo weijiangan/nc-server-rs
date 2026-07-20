@@ -2,6 +2,7 @@
 
 mod handlers;
 mod middleware;
+mod preview;
 mod router;
 mod state;
 
@@ -174,6 +175,12 @@ async fn main() -> anyhow::Result<()> {
     let upload_state_store: nc_dav::SharedUploadStateStore =
         std::sync::Arc::new(nc_dav::UploadStateStore::new());
 
+    // ── Phase 11.1: preview provider registry ────────────────────────────────
+    // Resolve enabledPreviewProviders gating + binary/Imaginary availability once
+    // at startup (includes a one-time $PATH search for ffmpeg/LibreOffice).
+    let preview_registry =
+        std::sync::Arc::new(nc_dav::ProviderRegistry::from_config(&config));
+
     let state = AppState {
         pool,
         mime_cache,
@@ -187,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
         instanceid,
         session_cache,
         upload_state_store,
+        preview_registry,
     };
 
     // ── Phase 7.7: Background capability refresh ──────────────────────────────

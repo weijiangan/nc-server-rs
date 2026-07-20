@@ -35,3 +35,8 @@ nc-ocs.workspace = true
 nc-dav.workspace = true
 nc-files.workspace = true
 nc-fastcgi.workspace = true
+nc-preview.workspace = true
+# Preview body streaming (Phase 11.2).
+tokio-util.workspace = true
+# URL-decoding of preview query/path params (PHP urldecodes `file`).
+percent-encoding = "2"

@@ -9,7 +9,7 @@ pub mod handler;
 pub mod locksystem;
 pub mod metadata;
 pub(crate) mod mtime;
-pub(crate) mod preview;
+pub mod preview;
 pub mod propagator;
 pub mod props;
 pub mod quota;
@@ -24,6 +24,7 @@ pub use filesystem::NcFileSystem;
 pub use handler::dav_handler;
 pub use locksystem::NcLockSystem;
 pub use metadata::NcMetaData;
+pub use preview::ProviderRegistry;
 pub use upload::{SharedUploadStateStore, UploadMetadata, UploadStateStore};
 pub use upload_handler::upload_handler;
 
@@ -87,11 +88,10 @@ pub struct NcDavState {
     /// In-process store for chunked upload v2 metadata.
     /// Used when no distributed cache is configured (PHASE-5.5).
     pub upload_state_store: SharedUploadStateStore,
-    // ── Preview / thumbnail config (§10.12) ────────────────────────────────
-    /// Whether previews are enabled (system config `enable_previews`, default true).
-    pub enable_previews: bool,
-    /// Path to ffmpeg binary for video thumbnail generation.
-    pub preview_ffmpeg_path: Option<String>,
-    /// Path to LibreOffice binary for office document thumbnail generation.
-    pub preview_libreoffice_path: Option<String>,
+    // ── Preview / thumbnail (§10.12 / §11.1) ───────────────────────────────
+    /// Resolved preview-provider gating, built once at startup from system config.
+    /// Single source of truth for `{nc:}has-preview` and (11.4) native generation —
+    /// replaces the old `enable_previews` / `preview_ffmpeg_path` /
+    /// `preview_libreoffice_path` fields.
+    pub preview_registry: Arc<ProviderRegistry>,
 }

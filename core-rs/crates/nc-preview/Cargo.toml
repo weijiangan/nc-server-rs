@@ -1,0 +1,22 @@
+[package]
+name = "nc-preview"
+description = "Native preview/thumbnail fast path — provider registry, size bucketing, oc_previews store, isolated generation backend (Phase 11)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# size negotiation (size.rs) is dependency-free pure logic.
+# store.rs: md5-sharded byte-path construction + oc_previews read (LocalPreviewStorage
+# / PreviewMapper parity).
+md-5.workspace = true
+hex.workspace = true
+nc-db.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
+# RFC 7231 HTTP-date formatting for Last-Modified/Expires (matches nc-dav's dep).
+httpdate = "1"
+# Later modules add: tokio, bytes, reqwest, etc.
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

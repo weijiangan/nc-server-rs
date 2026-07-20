@@ -6,6 +6,29 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// A config value marked **sensitive** by PHP (`lib/private/SystemConfig.php`)
+/// whose `Debug` implementation redacts the contents, so it can never leak into
+/// logs or error responses even via a blanket `{:?}` (REQ §17).
+///
+/// Use for secrets such as `preview_imaginary_url` / `preview_imaginary_key`.
+/// The inner value is accessible through [`Sensitive::expose`].
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Sensitive(String);
+
+impl Sensitive {
+    /// Access the raw secret value.  Callers must take care never to log it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Sensitive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Sensitive(<redacted>)")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct NcConfig {
     // ── Database ────────────────────────────────────────────────────────────
@@ -73,6 +96,19 @@ pub struct NcConfig {
     /// Path to the LibreOffice binary for office document previews.
     /// Key: `preview_libreoffice_path`.  When absent, office previews are unavailable.
     pub preview_libreoffice_path: Option<String>,
+    /// Provider classes enabled for preview generation (§11.1).
+    /// Key: `enabledPreviewProviders`.  When absent (`None`), PHP's default set
+    /// applies — `MarkDown, TXT, OpenDocument, PNG, JPEG, GIF, BMP, XBitmap,
+    /// Krita, WebP` (`PreviewManager::getEnabledDefaultProvider`).  Values are
+    /// fully-qualified provider class names, e.g. `OC\Preview\Movie`.
+    #[serde(rename = "enabledPreviewProviders", default)]
+    pub enabled_preview_providers: Option<Vec<String>>,
+    /// Imaginary server URL for out-of-process image generation (§11.4).
+    /// Key: `preview_imaginary_url`.  **Sensitive** (`SystemConfig.php:42`) —
+    /// redacted from all logs/debug output (REQ §17).  PHP's default `'invalid'`
+    /// (and the empty string) mean "not configured".
+    #[serde(rename = "preview_imaginary_url", default)]
+    pub preview_imaginary_url: Option<Sensitive>,
 
     // ── FastCGI / PHP-FPM dispatch (§7 Phase 7) ────────────────────────────────
     /// Unix socket path for PHP-FPM proxy dispatch (Phase 7).
@@ -411,5 +447,36 @@ $CONFIG = [
         assert!(!cfg.maintenance);
         assert!(cfg.bruteforce_protection_enabled);
         assert_eq!(cfg.loglevel, 1);
+        // Preview provider gating absent → PHP default set applies downstream.
+        assert!(cfg.enabled_preview_providers.is_none());
+        assert!(cfg.preview_imaginary_url.is_none());
+    }
+
+    #[test]
+    fn preview_provider_config_parses() {
+        let src = r#"<?php
+$CONFIG = [
+  'dbtype' => 'pgsql',
+  'enabledPreviewProviders' => ['OC\Preview\PNG', 'OC\Preview\Movie', 'OC\Preview\Imaginary'],
+  'preview_imaginary_url' => 'http://localhost:9090',
+  'preview_ffmpeg_path' => '/usr/bin/ffmpeg',
+];
+"#;
+        let cfg = NcConfig::from_php_config(src).expect("parse failed");
+        let providers = cfg.enabled_preview_providers.as_ref().expect("providers");
+        assert_eq!(providers.len(), 3);
+        assert!(providers.contains(&"OC\\Preview\\PNG".to_string()));
+        assert!(providers.contains(&"OC\\Preview\\Movie".to_string()));
+        assert!(providers.contains(&"OC\\Preview\\Imaginary".to_string()));
+        assert_eq!(
+            cfg.preview_imaginary_url.as_ref().map(|s| s.expose()),
+            Some("http://localhost:9090")
+        );
+        assert_eq!(cfg.preview_ffmpeg_path.as_deref(), Some("/usr/bin/ffmpeg"));
+
+        // REQ §17: the sensitive URL must never appear in Debug output.
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("localhost:9090"), "URL leaked into Debug: {debug}");
+        assert!(debug.contains("Sensitive(<redacted>)"));
     }
 }
