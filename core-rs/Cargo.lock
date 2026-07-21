@@ -1619,6 +1619,7 @@ dependencies = [
 name = "nc-preview"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "hex",
  "httpdate",
  "md-5",

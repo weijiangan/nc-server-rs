@@ -548,6 +548,8 @@ mod tests {
             preview_libreoffice_path: None,
             enabled_preview_providers: None,
             preview_imaginary_url: None,
+            preview_concurrency_new: None,
+            preview_concurrency_all: None,
             fastcgi_socket: None,
             fastcgi_timeout_ms: 30_000,
             forbidden_filenames: vec![".htaccess".to_owned()],

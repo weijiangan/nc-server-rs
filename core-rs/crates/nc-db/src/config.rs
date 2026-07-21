@@ -109,6 +109,16 @@ pub struct NcConfig {
     /// (and the empty string) mean "not configured".
     #[serde(rename = "preview_imaginary_url", default)]
     pub preview_imaginary_url: Option<Sensitive>,
+    /// Max concurrent preview *generations* (`preview_concurrency_new`).  Default:
+    /// hardware concurrency, fallback `4` (PHP `Generator::getNumConcurrentPreviews`).
+    #[serde(rename = "preview_concurrency_new", default)]
+    pub preview_concurrency_new: Option<i64>,
+    /// Max concurrent preview requests overall (`preview_concurrency_all`).  Default:
+    /// 2× hardware concurrency, fallback `8`, clamped `≥ preview_concurrency_new`.
+    /// The Rust fast path does not replicate this outer gate (hits need no admission
+    /// control); it is read only for sizing parity / the deviation note.
+    #[serde(rename = "preview_concurrency_all", default)]
+    pub preview_concurrency_all: Option<i64>,
 
     // ── FastCGI / PHP-FPM dispatch (§7 Phase 7) ────────────────────────────────
     /// Unix socket path for PHP-FPM proxy dispatch (Phase 7).

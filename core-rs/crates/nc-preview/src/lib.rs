@@ -10,6 +10,7 @@
 //! - [`store`] — `oc_previews` row model, md5-sharded byte-path construction, the
 //!   in-memory max/match selection, and the row read query.
 //! - [`response`] — response metadata: header / ETag / 304 / Cache-Control parity.
+//! - [`concurrency`] — generation semaphore sizing + request coalescing.
 //! - *(forthcoming)* provider registry (lifted from `nc-dav`), snowflake ids, the
 //!   isolated generation backend, overwrite invalidation, and the HTTP handlers.
 //!
@@ -18,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod concurrency;
 pub mod response;
 pub mod size;
 pub mod store;
