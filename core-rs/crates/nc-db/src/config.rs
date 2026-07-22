@@ -109,6 +109,28 @@ pub struct NcConfig {
     /// (and the empty string) mean "not configured".
     #[serde(rename = "preview_imaginary_url", default)]
     pub preview_imaginary_url: Option<Sensitive>,
+    /// Imaginary API key (`preview_imaginary_key`) — sent as a **query parameter**
+    /// on the Imaginary `/pipeline` request (§11.4).  **Sensitive**
+    /// (`SystemConfig.php:43`) — redacted from all logs/debug output (REQ §17).
+    /// Default: empty string (an Imaginary server with no key).
+    #[serde(rename = "preview_imaginary_key", default)]
+    pub preview_imaginary_key: Option<Sensitive>,
+    /// Output format override (`preview_format`).  Only `webp` is honoured — a
+    /// one-way override of the source-mime-mapped output (§11.4); any other value
+    /// (default `jpeg`) leaves the per-source mapping in effect.
+    #[serde(rename = "preview_format", default)]
+    pub preview_format: Option<String>,
+    /// Max preview width (`preview_max_x`).  Default `4096` (applied downstream).
+    #[serde(rename = "preview_max_x", default)]
+    pub preview_max_x: Option<i64>,
+    /// Max preview height (`preview_max_y`).  Default `4096` (applied downstream).
+    #[serde(rename = "preview_max_y", default)]
+    pub preview_max_y: Option<i64>,
+    /// Source size cap for image generation, in MiB (`preview_max_filesize_image`).
+    /// Default `50`; `-1` disables the cap.  Sources larger than this are rejected
+    /// before the Imaginary POST (§11.4 → 404, PHP `NotFoundException`).
+    #[serde(rename = "preview_max_filesize_image", default)]
+    pub preview_max_filesize_image: Option<i64>,
     /// Max concurrent preview *generations* (`preview_concurrency_new`).  Default:
     /// hardware concurrency, fallback `4` (PHP `Generator::getNumConcurrentPreviews`).
     #[serde(rename = "preview_concurrency_new", default)]

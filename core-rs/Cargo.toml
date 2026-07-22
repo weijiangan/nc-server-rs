@@ -26,6 +26,14 @@ hyper = { version = "1", features = ["full"] }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# HTTP client — the Imaginary preview-generation backend (Phase 11.4).  Scoped to
+# that one client (loopback allowed there, nowhere global).  rustls keeps the build
+# free of a system OpenSSL dependency.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# Object-safe async trait — the pluggable PreviewBackend (Phase 11.4).
+async-trait = "0.1"
+
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "any", "macros", "migrate"] }
 

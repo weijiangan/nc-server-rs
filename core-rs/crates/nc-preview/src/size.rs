@@ -207,8 +207,10 @@ mod tests {
     // algorithm ever changes.
     #[test]
     fn golden_vectors_from_php() {
+        /// `(w, h, crop, mode, maxW, maxH)` → expected `(expW, expH)`.
+        type Case = (i64, i64, bool, Mode, i64, i64, u32, u32);
         #[rustfmt::skip]
-        let cases: &[(i64, i64, bool, Mode, i64, i64, u32, u32)] = &[
+        let cases: &[Case] = &[
             // (w, h, crop, mode, maxW, maxH) => (expW, expH)
             // crop=true (mode irrelevant), square max 4096 — power-of-4 snap + min 64 + clamp
             (100, 100, true,  Mode::Fill, 4096, 4096, 256, 256),

@@ -19,7 +19,17 @@ tracing.workspace = true
 httpdate = "1"
 # Shared futures for request coalescing (concurrency.rs).
 futures.workspace = true
-# Later modules add: bytes, reqwest, etc.
+# Generation backend (backend.rs): the Imaginary HTTP client + pluggable trait.
+reqwest.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+# Imaginary `operations` query-param JSON (format.rs) — must serialize byte-identical
+# to PHP's json_encode (field order preserved by serde derive).
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# Mock Imaginary server for the round-trip test (backend.rs).
+axum.workspace = true

@@ -11,15 +11,22 @@
 //!   in-memory max/match selection, and the row read query.
 //! - [`response`] — response metadata: header / ETag / 304 / Cache-Control parity.
 //! - [`concurrency`] — generation semaphore sizing + request coalescing.
+//! - [`format`] — Imaginary pipeline construction (output format, quality, the
+//!   byte-identical `operations` JSON).
+//! - [`backend`] — the pluggable [`backend::PreviewBackend`] trait + the Imaginary
+//!   HTTP client (isolated, out-of-process generation).
 //! - *(forthcoming)* provider registry (lifted from `nc-dav`), snowflake ids, the
-//!   isolated generation backend, overwrite invalidation, and the HTTP handlers.
+//!   persistence/orchestration of generation, overwrite invalidation, and the HTTP
+//!   handlers' miss path.
 //!
 //! Design: `SPECS/03-implementation-plan/plan/14-native-preview-thumbnail-fast-path.md`;
 //! tasks: `SPECS/04-tasks/phase-11.md`.
 
 #![forbid(unsafe_code)]
 
+pub mod backend;
 pub mod concurrency;
+pub mod format;
 pub mod response;
 pub mod size;
 pub mod store;
