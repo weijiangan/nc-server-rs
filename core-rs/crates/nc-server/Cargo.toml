@@ -40,3 +40,6 @@ nc-preview.workspace = true
 tokio-util.workspace = true
 # URL-decoding of preview query/path params (PHP urldecodes `file`).
 percent-encoding = "2"
+# Native generation orchestration (Phase 11.4/11.5): error type + source/preview bytes.
+thiserror.workspace = true
+bytes.workspace = true

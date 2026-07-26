@@ -531,6 +531,7 @@ mod tests {
             dbtableprefix: "oc_".to_owned(),
             datadirectory: None,
             instanceid: Some(instanceid.to_owned()),
+            serverid: None,
             installed: true,
             maintenance: false,
             version: None,

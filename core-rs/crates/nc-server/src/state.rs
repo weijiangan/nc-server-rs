@@ -54,6 +54,11 @@ pub struct AppState {
     /// `config.php`.  Shared with the DAV layer for `{nc:}has-preview` and (11.4)
     /// native generation.
     pub preview_registry: Arc<nc_dav::ProviderRegistry>,
+    /// Native preview-generation service (§11.4/11.5): the Imaginary backend +
+    /// snowflake generator + admission semaphore + in-flight coalescer.  Its backend
+    /// is `None` when Imaginary is not configured+gated, in which case generation
+    /// misses proxy to PHP-FPM (hit-serving stays on regardless).
+    pub preview_gen: Arc<crate::preview_gen::PreviewGen>,
 }
 
 /// Allow axum to extract `OcsState` from the top-level `AppState` using the

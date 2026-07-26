@@ -3,6 +3,7 @@
 mod handlers;
 mod middleware;
 mod preview;
+mod preview_gen;
 mod router;
 mod state;
 
@@ -181,6 +182,14 @@ async fn main() -> anyhow::Result<()> {
     let preview_registry =
         std::sync::Arc::new(nc_dav::ProviderRegistry::from_config(&config));
 
+    // ── Phase 11.4/11.5: native preview generation service ──────────────────
+    // Builds the (optional) Imaginary backend, snowflake generator, admission
+    // semaphore and in-flight coalescer once at startup.  When Imaginary is not
+    // configured+gated the backend is `None` and misses keep proxying to PHP-FPM
+    // (hit-serving stays on regardless).
+    let preview_gen =
+        preview_gen::PreviewGen::from_config(&config, &appconfig_cache, &preview_registry);
+
     let state = AppState {
         pool,
         mime_cache,
@@ -195,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
         session_cache,
         upload_state_store,
         preview_registry,
+        preview_gen,
     };
 
     // ── Phase 7.7: Background capability refresh ──────────────────────────────

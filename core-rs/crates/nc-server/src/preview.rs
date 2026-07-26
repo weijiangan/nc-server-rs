@@ -72,7 +72,7 @@ pub async fn preview_by_file_id(
         // (share mounts) and returns the correct 404/403.
         return proxy(&state, req).await;
     };
-    serve_preview(&state, RouteKind::Core, row, x, y, !a, mode, inm, ims, req).await
+    serve_preview(&state, RouteKind::Core, row, &uid, x, y, !a, mode, inm, ims, req).await
 }
 
 /// `GET /core/preview.png?file=…` — preview by path (`PreviewController::getPreview`).
@@ -103,7 +103,7 @@ pub async fn preview_by_path(
     let Some(row) = resolve_by_path(&state, &uid, &file).await else {
         return proxy(&state, req).await;
     };
-    serve_preview(&state, RouteKind::Core, row, x, y, !a, mode, inm, ims, req).await
+    serve_preview(&state, RouteKind::Core, row, &uid, x, y, !a, mode, inm, ims, req).await
 }
 
 /// `GET /apps/files/api/v1/thumbnail/{x}/{y}/{file}` — deprecated files thumbnail
@@ -131,7 +131,7 @@ pub async fn files_thumbnail(
         return proxy(&state, req).await;
     };
     // crop=true always; mode defaults to fill (PHP passes no mode here).
-    serve_preview(&state, RouteKind::FilesThumbnail, row, x, y, true, Mode::Fill, inm, ims, req)
+    serve_preview(&state, RouteKind::FilesThumbnail, row, &uid, x, y, true, Mode::Fill, inm, ims, req)
         .await
 }
 
@@ -142,6 +142,7 @@ async fn serve_preview(
     state: &AppState,
     kind: RouteKind,
     fc_row: FileCacheRow,
+    uid: &str,
     x: i64,
     y: i64,
     crop: bool,
@@ -158,21 +159,52 @@ async fn serve_preview(
     }
     let file_id = fc_row.fileid;
 
+    // Resolve the source mimetype string — it drives gating and native generation.
+    let source_mime = {
+        let cache = state.mime_cache.read().expect("mime cache lock");
+        cache.get_name(fc_row.mimetype).map(|s| s.to_string())
+    };
+    // Can Rust generate this natively? (Imaginary raster set ∩ gated ∩ backend up.)
+    let generatable = matches!(&source_mime, Some(m) if state.preview_registry.rust_generatable(m))
+        && state.preview_gen.backend_available();
+
     let rows = store::load_preview_rows(&state.pool, &state.table_prefix, file_id).await;
-    let Some(max) = store::find_max(&rows, -1) else {
-        // No max preview generated yet → PHP generates + serves.
-        return proxy(state, req).await;
+
+    // Ensure the max preview exists — generate it natively on a miss when we can,
+    // otherwise proxy to PHP (which generates via GD/imagick/Imaginary).
+    let max: store::PreviewRow = match store::find_max(&rows, -1) {
+        Some(m) => m.clone(),
+        None => match (generatable, source_mime.as_deref()) {
+            (true, Some(sm)) => match state.preview_gen.ensure_max(state, uid, &fc_row, sm).await {
+                Some(m) => m,
+                None => return proxy(state, req).await,
+            },
+            _ => return proxy(state, req).await,
+        },
     };
 
     // Bucket the requested size relative to the max preview's actual dimensions.
     let (bw, bh) = size::calculate_size(x, y, crop, mode, max.width as i64, max.height as i64);
-    let target = if bw == max.width && bh == max.height {
-        max
+    let target: store::PreviewRow = if bw == max.width && bh == max.height {
+        max.clone()
     } else {
+        // A just-generated max may have arrived with siblings; re-read before matching.
+        let rows = store::load_preview_rows(&state.pool, &state.table_prefix, file_id).await;
         match store::find_match(&rows, bw, bh, crop, max.mimetype_id, -1) {
-            Some(r) => r,
-            // Bucketed variant not generated yet → PHP derives it from the max.
-            None => return proxy(state, req).await,
+            Some(r) => r.clone(),
+            // Bucketed variant not present — derive it natively (from the max bytes)
+            // when we can, else PHP derives it in-process from the max image.
+            None => match (generatable, source_mime.as_deref()) {
+                (true, Some(sm)) => match state
+                    .preview_gen
+                    .ensure_derived(state, uid, &fc_row, sm, &max, bw, bh, crop)
+                    .await
+                {
+                    Some(r) => r,
+                    None => return proxy(state, req).await,
+                },
+                _ => return proxy(state, req).await,
+            },
         }
     };
 

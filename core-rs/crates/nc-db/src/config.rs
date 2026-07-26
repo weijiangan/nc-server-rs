@@ -49,6 +49,11 @@ pub struct NcConfig {
 
     // ── Instance ────────────────────────────────────────────────────────────
     pub instanceid: Option<String>,
+    /// Snowflake server id (`serverid` system config, §11.5).  When unset or ≤ 0,
+    /// the snowflake generator falls back to `crc32(hostname)` (PHP
+    /// `SnowflakeGenerator::getServerId`).  Masked to 9 bits at use.
+    #[serde(default)]
+    pub serverid: Option<i64>,
     #[serde(default)]
     pub installed: bool,
     #[serde(default)]

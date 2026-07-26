@@ -53,6 +53,11 @@ adler = "0.2"
 hex = "0.4"
 bcrypt = "0.15"
 base64 = "0.22"
+# CRC-32 (ISO 3309 / zlib polynomial) — matches PHP `crc32()` for the snowflake
+# `serverid` fallback (`crc32(hostname)`, Phase 11.5).
+crc32fast = "1"
+# Hostname for the snowflake `serverid` fallback (Phase 11.5).
+gethostname = "0.4"
 
 # UUID for request IDs
 uuid = { version = "1", features = ["v4"] }

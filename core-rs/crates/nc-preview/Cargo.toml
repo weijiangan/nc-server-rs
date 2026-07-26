@@ -28,6 +28,9 @@ thiserror.workspace = true
 # to PHP's json_encode (field order preserved by serde derive).
 serde.workspace = true
 serde_json.workspace = true
+# Snowflake ids (snowflake.rs): CRC-32 for the `serverid` fallback + hostname.
+crc32fast.workspace = true
+gethostname.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
