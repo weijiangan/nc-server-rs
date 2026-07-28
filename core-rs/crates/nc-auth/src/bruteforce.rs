@@ -74,7 +74,7 @@ pub async fn check_throttle(
 
     // Count attempts in the short window (30 min).
     // REQ §4.6: > max_attempts in 30 min → 429.
-    let short_count: i64 = sqlx::query_scalar(&format!(
+    let short_count: i64 = match sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM {table} \
          WHERE action = $1 AND subnet = $2 AND occurred >= $3"
     ))
@@ -83,7 +83,18 @@ pub async fn check_throttle(
     .bind(short_cutoff)
     .fetch_one(pool)
     .await
-    .unwrap_or(0);
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                action,
+                subnet = %subnet,
+                error = %e,
+                "brute-force short-window COUNT failed — skipping throttle check for this request"
+            );
+            return ThrottleResult { delay: None, should_reject: false, retry_after_secs: 0 };
+        }
+    };
 
     if short_count > max_attempts {
         return ThrottleResult {
@@ -95,7 +106,7 @@ pub async fn check_throttle(
 
     // Count attempts in long window (12 h) for delay calculation.
     // REQ §4.6: over-threshold in 12 h → throttle (sleep), not 429.
-    let long_count: i64 = sqlx::query_scalar(&format!(
+    let long_count: i64 = match sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM {table} \
          WHERE action = $1 AND subnet = $2 AND occurred >= $3"
     ))
@@ -104,7 +115,18 @@ pub async fn check_throttle(
     .bind(long_cutoff)
     .fetch_one(pool)
     .await
-    .unwrap_or(0);
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                action,
+                subnet = %subnet,
+                error = %e,
+                "brute-force long-window COUNT failed — skipping delay"
+            );
+            return ThrottleResult { delay: None, should_reject: false, retry_after_secs: 0 };
+        }
+    };
 
     if long_count == 0 {
         return ThrottleResult {
@@ -132,7 +154,7 @@ pub async fn record_attempt(action: &str, client_ip: &str, pool: &DbPool, prefix
     let subnet = ip_to_subnet(client_ip);
     let table = format!("{prefix}bruteforce_attempts");
 
-    let _ = sqlx::query(&format!(
+    if let Err(e) = sqlx::query(&format!(
         "INSERT INTO {table}(action, occurred, ip, subnet, metadata) \
          VALUES($1, $2, $3, $4, $5)"
     ))
@@ -142,7 +164,16 @@ pub async fn record_attempt(action: &str, client_ip: &str, pool: &DbPool, prefix
     .bind(&subnet)
     .bind("{}")
     .execute(pool)
-    .await;
+    .await
+    {
+        tracing::warn!(
+            action,
+            ip = %client_ip,
+            subnet = %subnet,
+            error = %e,
+            "failed to record brute-force attempt — throttling may be incomplete"
+        );
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -14,16 +14,27 @@ use nc_db::pool::DbPool;
 ///
 /// If the `oc_twofactor_providers` table is empty or the user has no entry,
 /// 2FA is considered not required.
+///
+/// # Errors
+///
+/// Returns `Err` on database failure. Matching PHP, the caller should respond
+/// with 500 Internal Server Error — a broken DB is neither "2FA required"
+/// nor "2FA passed."
 
-/// Returns `true` if `uid` has at least one enabled 2FA provider AND the
+/// Returns `Ok(true)` if `uid` has at least one enabled 2FA provider AND the
 /// current auth context requires the 2FA check.
 ///
 /// `token_type`: `0` = temporary / session (check required), `1` = permanent /
 /// app token (exempt — token was issued after 2FA was already cleared).
-pub async fn requires_2fa(uid: &str, token_type: i16, pool: &DbPool, prefix: &str) -> bool {
+pub async fn requires_2fa(
+    uid: &str,
+    token_type: i16,
+    pool: &DbPool,
+    prefix: &str,
+) -> Result<bool, sqlx::Error> {
     // Permanent app tokens are exempt from the per-request 2FA gate.
     if token_type == 1 {
-        return false;
+        return Ok(false);
     }
 
     let table = format!("{prefix}twofactor_providers");
@@ -32,10 +43,9 @@ pub async fn requires_2fa(uid: &str, token_type: i16, pool: &DbPool, prefix: &st
     ))
     .bind(uid)
     .fetch_one(pool)
-    .await
-    .unwrap_or(0);
+    .await?;
 
-    count > 0
+    Ok(count > 0)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

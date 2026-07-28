@@ -521,10 +521,13 @@ impl DavFile for NcDavFile {
             // PHP Updater::update computes sizeDifference = newSize - oldSize
             // from a shallow scan (Updater.php:76-80).
             let size_diff = (size as i64) - ctx.old_size;
-            let _ = ctx
+            if let Err(e) = ctx
                 .propagator
                 .propagate_change(&ctx.fc_path, use_mtime, size_diff)
-                .await;
+                .await
+            {
+                tracing::warn!(path = %ctx.fc_path, error = %e, "PUT: propagation failed");
+            }
 
             // Invalidate stale previews so PHP-FPM regenerates from the new
             // file content on next access.  Two layers must be cleared:

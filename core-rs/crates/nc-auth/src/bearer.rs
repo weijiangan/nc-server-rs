@@ -85,15 +85,24 @@ pub async fn lookup_bearer(
     let hash_hex = hex::encode(hash);
     let table = format!("{prefix}authtoken");
 
-    let row: Option<(i64, String, i16, String, Option<i64>, i64)> = sqlx::query_as(&format!(
-        "SELECT id, uid, type, scope, expires, last_activity \
-             FROM {table} WHERE token = $1"
-    ))
-    .bind(&hash_hex)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
+    let row: Option<(i64, String, i16, String, Option<i64>, i64)> =
+        match sqlx::query_as(&format!(
+            "SELECT id, uid, type, scope, expires, last_activity \
+                 FROM {table} WHERE token = $1"
+        ))
+        .bind(&hash_hex)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "bearer token lookup query failed — treating as token not found"
+                );
+                return None;
+            }
+        };
 
     let (id, uid, token_type, scope, expires, last_activity) = row?;
 
@@ -148,13 +157,20 @@ pub async fn update_last_activity(token_id: i64, pool: &DbPool, prefix: &str) {
         .unwrap_or_default()
         .as_secs() as i64;
     let table = format!("{prefix}authtoken");
-    let _ = sqlx::query(&format!(
+    if let Err(e) = sqlx::query(&format!(
         "UPDATE {table} SET last_activity = $1 WHERE id = $2"
     ))
     .bind(now)
     .bind(token_id)
     .execute(pool)
-    .await;
+    .await
+    {
+        tracing::warn!(
+            token_id,
+            error = %e,
+            "failed to update last_activity — session tracking may be stale"
+        );
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

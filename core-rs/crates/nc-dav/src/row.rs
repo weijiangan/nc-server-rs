@@ -86,14 +86,21 @@ pub async fn lookup_storage_id(
     ];
     let sql = format!("SELECT numeric_id FROM {prefix}storages WHERE id = $1");
     for key in &candidates {
-        if let Some(row) = sqlx::query(&sql)
-            .bind(key)
+        let adjusted = adjust_storage_id(key);
+        match sqlx::query(&sql)
+            .bind(&adjusted)
             .fetch_optional(pool)
             .await
-            .ok()
-            .flatten()
         {
-            return Some(row.get::<i64, _>("numeric_id"));
+            Ok(Some(row)) => return Some(row.get::<i64, _>("numeric_id")),
+            Ok(None) => { /* not this key, try next */ }
+            Err(e) => {
+                tracing::warn!(
+                    storage_id = %adjusted,
+                    error = %e,
+                    "storage lookup query failed"
+                );
+            }
         }
     }
     None

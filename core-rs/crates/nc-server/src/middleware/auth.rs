@@ -185,7 +185,7 @@ pub async fn auth_layer(
                     );
 
                     // 2FA gate (task 3.6) — REQ §4.5.
-                    if nc_auth::twofa::requires_2fa(
+                    match nc_auth::twofa::requires_2fa(
                         &cached.uid,
                         cached.token_type,
                         &state.pool,
@@ -193,11 +193,22 @@ pub async fn auth_layer(
                     )
                     .await
                     {
-                        return (
-                            StatusCode::UNAUTHORIZED,
-                            "Not Authenticated: 2FA challenge not passed.",
-                        )
-                            .into_response();
+                        Ok(true) => {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                "Not Authenticated: 2FA challenge not passed.",
+                            )
+                                .into_response();
+                        }
+                        Ok(false) => { /* 2FA not required — continue */ }
+                        Err(e) => {
+                            tracing::error!(
+                                uid = %cached.uid,
+                                error = %e,
+                                "2FA check query failed — returning 500"
+                            );
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
                     }
 
                     // Phase 7.2: admin group check.
@@ -290,7 +301,7 @@ pub async fn auth_layer(
                             );
                             // 2FA gate for Basic auth (REQ §4.5).
                             let token_type = result.token_type.unwrap_or(0);
-                            if nc_auth::twofa::requires_2fa(
+                            match nc_auth::twofa::requires_2fa(
                                 &result.uid,
                                 token_type,
                                 &state.pool,
@@ -298,11 +309,22 @@ pub async fn auth_layer(
                             )
                             .await
                             {
-                                return (
-                                    StatusCode::UNAUTHORIZED,
-                                    "Not Authenticated: 2FA challenge not passed.",
-                                )
-                                    .into_response();
+                                Ok(true) => {
+                                    return (
+                                        StatusCode::UNAUTHORIZED,
+                                        "Not Authenticated: 2FA challenge not passed.",
+                                    )
+                                        .into_response();
+                                }
+                                Ok(false) => { /* 2FA not required — continue */ }
+                                Err(e) => {
+                                    tracing::error!(
+                                        uid = %result.uid,
+                                        error = %e,
+                                        "2FA check query failed — returning 500"
+                                    );
+                                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                                }
                             }
                             // Phase 7.2: admin group check.
                             let is_admin = nc_auth::is_admin_user(
@@ -606,6 +628,11 @@ mod tests {
             forbidden_filename_extensions: vec![".filepart".to_owned()],
         };
         let preview_registry = Arc::new(nc_dav::ProviderRegistry::from_config(&nc_config));
+        let preview_gen = crate::preview_gen::PreviewGen::from_config(
+            &nc_config,
+            &appconfig_cache,
+            &preview_registry,
+        );
         AppState {
             pool,
             mime_cache: Arc::new(RwLock::new(MimeCache::default())),
@@ -620,6 +647,7 @@ mod tests {
             session_cache: None,
             upload_state_store: Arc::new(nc_dav::UploadStateStore::new()),
             preview_registry,
+            preview_gen,
         }
     }
 

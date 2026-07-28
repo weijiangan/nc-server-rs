@@ -59,14 +59,22 @@ pub async fn verify_basic(
     // stalling the async runtime during the compute-heavy hash comparison.
     let table = format!("{prefix}users");
 
-    let row: Option<(String, String)> = sqlx::query_as(&format!(
+    let row: Option<(String, String)> = match sqlx::query_as(&format!(
         "SELECT uid, password FROM {table} WHERE uid_lower = $1"
     ))
     .bind(login.to_lowercase())
     .fetch_optional(pool)
     .await
-    .ok()
-    .flatten();
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "plain-password user lookup query failed — treating as wrong password"
+            );
+            return None;
+        }
+    };
 
     let (uid, hash) = row?;
 
@@ -109,7 +117,7 @@ async fn try_app_token(
     // which filters `WHERE token = $hash AND version = $version` — no `login_name` in the
     // WHERE clause).  The `login_name` validation happens below, matching PHP's
     // `validateTokenLoginName()` case-insensitive comparison.
-    let row: Option<(i64, String, i16, Option<i64>, String)> = sqlx::query_as(&format!(
+    let row: Option<(i64, String, i16, Option<i64>, String)> = match sqlx::query_as(&format!(
         "SELECT id, uid, type, expires, login_name \
          FROM {table} \
          WHERE token = $1"
@@ -117,8 +125,16 @@ async fn try_app_token(
     .bind(&hash_hex)
     .fetch_optional(pool)
     .await
-    .ok()
-    .flatten();
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "app-token lookup query failed — treating as wrong password"
+            );
+            return None;
+        }
+    };
 
     let (id, uid, token_type, expires, db_login_name) = row?;
 

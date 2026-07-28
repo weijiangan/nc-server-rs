@@ -37,16 +37,28 @@ pub struct AuthInfo {
 ///
 /// Queries `oc_group_user WHERE gid = 'admin' AND uid = ?`.
 /// Called at authenticated-request time so the admin flag is always fresh.
+///
+/// On DB error, returns `false` rather than failing the request — admin
+/// operations will be denied rather than the entire request crashing.
 pub async fn is_admin_user(uid: &str, pool: &nc_db::pool::DbPool, prefix: &str) -> bool {
     let table = format!("{prefix}group_user");
-    let row: Option<(String,)> = sqlx::query_as(&format!(
+    let row: Option<(String,)> = match sqlx::query_as(&format!(
         "SELECT uid FROM {table} WHERE gid = 'admin' AND uid = $1"
     ))
     .bind(uid)
     .fetch_optional(pool)
     .await
-    .ok()
-    .flatten();
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(
+                uid = %uid,
+                error = %e,
+                "admin-group membership query failed — treating as non-admin"
+            );
+            return false;
+        }
+    };
     row.is_some()
 }
 

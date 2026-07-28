@@ -463,15 +463,21 @@ impl NcFileSystem {
             .unwrap_or_default()
             .as_secs() as i64;
         if deleted_size > 0 {
-            let _ = self
+            if let Err(e) = self
                 .propagator
                 .propagate_change(fc_path, now, -deleted_size)
-                .await;
+                .await
+            {
+                tracing::warn!(path = %fc_path, error = %e, "delete_dir: propagation failed (size>0)");
+            }
         } else {
-            let _ = self
+            if let Err(e) = self
                 .propagator
                 .propagate_change(fc_path, now, 0)
-                .await;
+                .await
+            {
+                tracing::warn!(path = %fc_path, error = %e, "delete_dir: propagation failed (size=0)");
+            }
         }
 
         Ok(())
@@ -543,15 +549,21 @@ impl NcFileSystem {
             .unwrap_or_default()
             .as_secs() as i64;
         if deleted_size > 0 {
-            let _ = self
+            if let Err(e) = self
                 .propagator
                 .propagate_change(fc_path, now, -deleted_size)
-                .await;
+                .await
+            {
+                tracing::warn!(path = %fc_path, error = %e, "delete_file: propagation failed (size>0)");
+            }
         } else {
-            let _ = self
+            if let Err(e) = self
                 .propagator
                 .propagate_change(fc_path, now, 0)
-                .await;
+                .await
+            {
+                tracing::warn!(path = %fc_path, error = %e, "delete_file: propagation failed (size=0)");
+            }
         }
 
         Ok(())
@@ -1252,10 +1264,13 @@ impl DavFileSystem for NcFileSystem {
 
             // §9.2: MKCOL propagates etag/mtime to the parent chain.
             // New directories have size 0, so sizeDifference=0.
-            let _ = self
+            if let Err(e) = self
                 .propagator
                 .propagate_change(&fc_path, now, 0)
-                .await;
+                .await
+            {
+                tracing::warn!(path = %fc_path, error = %e, "mkcol: propagation failed");
+            }
 
             Ok(())
         }
@@ -1459,22 +1474,34 @@ impl DavFileSystem for NcFileSystem {
                 parts.pop();
                 parts.join("/")
             };
-            let _ = self
+            if let Err(e) = self
                 .propagator
                 .propagate_change(&from_fc, now, 0)
-                .await;
-            let _ = self
+                .await
+            {
+                tracing::warn!(path = %from_fc, error = %e, "move: source propagation failed");
+            }
+            if let Err(e) = self
                 .propagator
                 .propagate_change(&to_fc, now, 0)
-                .await;
+                .await
+            {
+                tracing::warn!(path = %to_fc, error = %e, "move: target propagation failed");
+            }
             // Recalculate immediate parent sizes (size change can't be expressed
             // as a simple signed delta when subtrees move).
             if from_parent_fc != to_parent_fc {
-                let _ = self.propagator.correct_folder_size(&from_parent_fc).await;
-                let _ = self.propagator.correct_folder_size(&to_parent_fc).await;
+                if let Err(e) = self.propagator.correct_folder_size(&from_parent_fc).await {
+                    tracing::warn!(path = %from_parent_fc, error = %e, "move: correct_folder_size from failed");
+                }
+                if let Err(e) = self.propagator.correct_folder_size(&to_parent_fc).await {
+                    tracing::warn!(path = %to_parent_fc, error = %e, "move: correct_folder_size to failed");
+                }
             } else {
                 // Same parent (rename within the same directory) — recalculate once.
-                let _ = self.propagator.correct_folder_size(&to_parent_fc).await;
+                if let Err(e) = self.propagator.correct_folder_size(&to_parent_fc).await {
+                    tracing::warn!(path = %to_parent_fc, error = %e, "move: correct_folder_size failed");
+                }
             }
 
             Ok(())
@@ -1651,16 +1678,21 @@ impl DavFileSystem for NcFileSystem {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64;
-            let _ = self
+            if let Err(e) = self
                 .propagator
                 .propagate_change(&to_fc, now, 0)
-                .await;
+                .await
+            {
+                tracing::warn!(path = %to_fc, error = %e, "copy: propagation failed");
+            }
             let to_parent_fc = {
                 let mut parts: Vec<&str> = to_fc.split('/').collect();
                 parts.pop();
                 parts.join("/")
             };
-            let _ = self.propagator.correct_folder_size(&to_parent_fc).await;
+            if let Err(e) = self.propagator.correct_folder_size(&to_parent_fc).await {
+                tracing::warn!(path = %to_parent_fc, error = %e, "copy: correct_folder_size failed");
+            }
 
             Ok(())
         }
@@ -1695,10 +1727,13 @@ impl DavFileSystem for NcFileSystem {
 
             // §9.2: mtime-changing PROPPATCH propagates etag/mtime to
             // ancestors (sizeDifference=0).
-            let _ = self
+            if let Err(e) = self
                 .propagator
                 .propagate_change(&fc_path, mtime, 0)
-                .await;
+                .await
+            {
+                tracing::warn!(path = %fc_path, error = %e, "set_modified: propagation failed");
+            }
 
             Ok(())
         }
@@ -2052,12 +2087,15 @@ impl DavFileSystem for NcFileSystem {
                                          ON CONFLICT(fileid) DO UPDATE SET creation_time = excluded.creation_time",
                                         prefix = self.state.table_prefix,
                                     );
-                                    let _ = sqlx::query(&sql_upsert)
+                                    if let Err(e) = sqlx::query(&sql_upsert)
                                         .bind(ts)
                                         .bind(self.storage_id)
                                         .bind(&hash)
                                         .execute(&self.state.pool)
-                                        .await;
+                                        .await
+                                    {
+                                        tracing::warn!(path_hash = hash, error = %e, "PROPPATCH: failed to update timestamp");
+                                    }
                                     http::StatusCode::OK
                                 } else {
                                     http::StatusCode::BAD_REQUEST
@@ -2081,12 +2119,15 @@ impl DavFileSystem for NcFileSystem {
                                          ON CONFLICT(fileid) DO UPDATE SET upload_time = excluded.upload_time",
                                         prefix = self.state.table_prefix,
                                     );
-                                    let _ = sqlx::query(&sql_upsert)
+                                    if let Err(e) = sqlx::query(&sql_upsert)
                                         .bind(ts)
                                         .bind(self.storage_id)
                                         .bind(&hash)
                                         .execute(&self.state.pool)
-                                        .await;
+                                        .await
+                                    {
+                                        tracing::warn!(path_hash = hash, error = %e, "PROPPATCH: failed to update timestamp");
+                                    }
                                     http::StatusCode::OK
                                 } else {
                                     http::StatusCode::BAD_REQUEST
