@@ -26,13 +26,16 @@ pub struct BasicAuthResult {
     pub token_type: Option<i16>,
 }
 
-/// Verify `(login, password)` against both `oc_users` (plain password) and
-/// `oc_authtoken` (app token used as password).
+/// Verify `(login, password)` against both `oc_authtoken` (app token used as
+/// password) and `oc_users` (plain password).
 ///
 /// Priority (REQ §4.1, §4.2, §4.3):
-/// 1. Try app-token path first: hash `password` with SHA-512 (v1) or
-///    SHA-512(`password` ‖ `app_secret`) (v2), query `oc_authtoken.token` where
-///    `login_name = login`. If found and not expired → success with token auth.
+/// 1. Try app-token path first: hash `password` with SHA-512 (v1 fallback) or
+///    SHA-512(`password` ‖ `app_secret`) (v2), query `oc_authtoken.token` by
+///    hash only (matching PHP's `PublicKeyTokenMapper::getToken()`).  After
+///    fetching the row, validate `login` against the stored `login_name`
+///    case-insensitively (matching PHP's `validateTokenLoginName()`).  If found,
+///    not expired, and login matches → success with token auth.
 /// 2. Try plain-password path: `oc_users` bcrypt check.
 ///
 /// Returns `None` on invalid credentials or DB error.
@@ -86,7 +89,9 @@ pub async fn verify_basic(
 /// Try to authenticate using the Basic password field as a raw app token.
 ///
 /// Hashes the raw value the same way as bearer token lookup and queries
-/// `oc_authtoken` by `token` hash + `login_name`.
+/// `oc_authtoken` by `token` hash only (matching PHP).  After fetching the
+/// row, validates the provided `login` against the stored `login_name`
+/// case-insensitively (matching PHP's `validateTokenLoginName()`).
 async fn try_app_token(
     login: &str,
     raw_password: &str,
@@ -100,22 +105,29 @@ async fn try_app_token(
     let hash_hex = hex::encode(hash);
     let table = format!("{prefix}authtoken");
 
-    // REQ §4.1: if the token row has `passwordless = 1`, this token cannot
-    // be used to satisfy a Basic auth challenge (the column indicates the
-    // token was issued for a passwordless account — no password exists to verify).
-    let row: Option<(i64, String, i16, Option<i64>)> = sqlx::query_as(&format!(
-        "SELECT id, uid, type, expires \
+    // REQ §4.1: query by token hash only (matching PHP's `PublicKeyTokenMapper::getToken()`
+    // which filters `WHERE token = $hash AND version = $version` — no `login_name` in the
+    // WHERE clause).  The `login_name` validation happens below, matching PHP's
+    // `validateTokenLoginName()` case-insensitive comparison.
+    let row: Option<(i64, String, i16, Option<i64>, String)> = sqlx::query_as(&format!(
+        "SELECT id, uid, type, expires, login_name \
          FROM {table} \
-         WHERE token = $1 AND login_name = $2"
+         WHERE token = $1"
     ))
     .bind(&hash_hex)
-    .bind(login)
     .fetch_optional(pool)
     .await
     .ok()
     .flatten();
 
-    let (id, uid, token_type, expires) = row?;
+    let (id, uid, token_type, expires, db_login_name) = row?;
+
+    // REQ §4.1: validate login name matches the token's stored `login_name`
+    // (case-insensitive, matching PHP's `mb_strtolower` in `validateTokenLoginName()`).
+    // PHP `Session.php:793-809`: `mb_strtolower($token->getLoginName()) !== mb_strtolower($loginName)`.
+    if db_login_name.to_lowercase() != login.to_lowercase() {
+        return None;
+    }
 
     // Check expiry.
     if let Some(exp) = expires {

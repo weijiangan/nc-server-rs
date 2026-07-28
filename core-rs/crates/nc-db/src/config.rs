@@ -58,6 +58,12 @@ pub struct NcConfig {
     pub installed: bool,
     #[serde(default)]
     pub maintenance: bool,
+    /// Instance secret for token hashing and other cryptographic operations.
+    /// PHP: `$CONFIG['secret']` — read via `SystemConfig::getValue('secret')`,
+    /// used as `hash('sha512', $token . $secret)` in `PublicKeyTokenProvider`.
+    /// Auto-generated on install.  Required for correct auth-token verification.
+    #[serde(default)]
+    pub secret: Option<String>,
     pub version: Option<String>,
     pub trusted_domains: Option<Vec<String>>,
 

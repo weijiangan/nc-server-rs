@@ -86,12 +86,12 @@ pub async fn auth_layer(
     let is_dav = is_dav_path(&path);
     let client_ip = extract_client_ip(&req);
 
-    let app_secret = state
-        .appconfig_cache
-        .read()
-        .expect("appconfig lock")
-        .get_string("core", "secret")
-        .unwrap_or_default();
+    // REQ §18: `secret` is a system config key in `config.php`, NOT an
+    // app config — it does not live in `oc_appconfig`.  Token hashing uses
+    // `hash('sha512', $token . $secret)` (`PublicKeyTokenProvider.php:414`)
+    // so an empty secret would produce a different hash than PHP and cause
+    // every app-token / device-token auth to fail with 401.
+    let app_secret = state.nc_config.secret.as_deref().unwrap_or_default();
 
     // ── CSRF check ────────────────────────────────────────────────────────
     // For Phase 3, we only enforce CSRF if session cookies are present AND
@@ -534,6 +534,7 @@ mod tests {
             serverid: None,
             installed: true,
             maintenance: false,
+            secret: None,
             version: None,
             trusted_domains: None,
             overwrite_cli_url: None,

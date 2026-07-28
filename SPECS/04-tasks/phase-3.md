@@ -14,6 +14,8 @@ Goal: every auth method works correctly, the token hot cache is in place, and br
 
 **Verify:** `build/integration/features/auth.feature` — Basic auth success and failure scenarios.
 
+> **Deviation (2026-07-28):** The app-token SQL query originally specified `WHERE token = ? AND login_name = ?` (filtering by both token hash and login name in the database).  PHP's `PublicKeyTokenMapper::getToken()` only filters by `token` hash (plus `version`); the login-name check is a **post-query case-insensitive comparison** (`validateTokenLoginName()`, `Session.php:793`).  The Rust implementation now matches PHP: query by token hash only, then validate `login` against the stored `login_name` with `to_lowercase()`.  Additionally, the `secret` used for token hashing was originally read from `appconfig_cache.get_string("core", "secret")` (`oc_appconfig`), but the `secret` key lives in `config.php` (system config, `$CONFIG['secret']`), not in `oc_appconfig`.  The `secret` is now loaded into `NcConfig.secret` via the existing `config.php` deserialization path and read from there.
+
 ### 3.2 Bearer token auth
 - [x] `Authorization: Bearer {token}` → SHA-512 hash (v1) or HMAC-SHA512 with server secret (v2) → lookup `oc_authtoken.token`
 - [x] Brute-force `check_throttle` called **before** `lookup_bearer` (bearer tokens subject to same throttle as Basic)
@@ -77,3 +79,24 @@ Goal: every auth method works correctly, the token hot cache is in place, and br
 - [x] Disabled when `auth.bruteforce.protection.enabled = false` in **`config.php`** (system config → `NcConfig.bruteforce_protection_enabled`); this is a system-level key, not an `oc_appconfig` entry
 
 **Verify:** `build/integration/ratelimiting_features/ratelimiting.feature` — all throttle and 429 scenarios pass.
+
+---
+
+## Changes
+
+### 2026-07-28 — Fix app-token auth: secret source + login_name filter
+
+**Root cause:** Every app-password / device-token authentication via Basic auth was failing with 401 because:
+
+1. **`secret` read from wrong store.** The middleware read `app_secret` from `appconfig_cache.get_string("core", "secret")` which queries `oc_appconfig`.  Nextcloud's `secret` is a **system config** key (`$CONFIG['secret']` in `config.php`), not an app config — it is never in `oc_appconfig`.  With an empty secret, `token_hash` computed `SHA-512(raw_token)` (the pre-NC20 fallback), but the actual hash stored in `oc_authtoken.token` was `SHA-512(raw_token || secret)`.  The hashes never matched.
+
+   **Fix:** Added `secret: Option<String>` to `NcConfig` (deserialized from `config.php` by the existing parser) and changed the auth middleware to read `state.nc_config.secret.as_deref().unwrap_or_default()`.
+
+2. **`login_name` filtered in SQL WHERE clause.** `try_app_token` queried `WHERE token = $1 AND login_name = $2`, but PHP's `PublicKeyTokenMapper::getToken()` only filters by `token` hash — the login-name check is a post-query case-insensitive comparison (`validateTokenLoginName()`, `Session.php:793`).  Filtering in the WHERE clause is overly restrictive: if a client sends a login that doesn't exactly match the stored `login_name`, the query returns zero rows even though the token is valid.
+
+   **Fix:** Removed `AND login_name = $2` from the WHERE clause, added `login_name` to the SELECT, and added a `to_lowercase()` comparison after fetching the row (matching PHP's `mb_strtolower`).
+
+**Files changed:**
+- `core-rs/crates/nc-db/src/config.rs` — added `secret` field to `NcConfig`
+- `core-rs/crates/nc-server/src/middleware/auth.rs` — read `app_secret` from `nc_config.secret`; updated test state
+- `core-rs/crates/nc-auth/src/basic.rs` — removed `login_name` SQL filter, added post-query case-insensitive validation
