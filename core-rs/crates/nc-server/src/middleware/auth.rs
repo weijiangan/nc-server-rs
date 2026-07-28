@@ -60,6 +60,20 @@ pub async fn auth_layer(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
+    // Diagnostic: log whether we have credentials and their type (first 6 chars).
+    // Auth failures are otherwise silent — this is the only signal in debug logs.
+    match &auth_header {
+        Some(ah) if ah.len() >= 6 => {
+            tracing::debug!(auth_prefix = %&ah[..6], path = %path, "auth header present");
+        }
+        Some(_) => {
+            tracing::debug!(auth_prefix = "???", path = %path, "auth header too short");
+        }
+        None => {
+            tracing::debug!(path = %path, "no Authorization header");
+        }
+    }
+
     let ocs_api_request = req
         .headers()
         .get("ocs-apirequest")
@@ -203,6 +217,7 @@ pub async fn auth_layer(
                 }
                 None => {
                     // Invalid bearer token — record and reject.
+                    tracing::debug!(path = %path, "bearer token lookup failed");
                     nc_auth::bruteforce::record_attempt(
                         "login",
                         &client_ip,
@@ -245,10 +260,19 @@ pub async fn auth_layer(
 
             match nc_auth::basic::extract_basic(ah) {
                 None => {
+                    tracing::debug!(path = %path, "Basic auth header failed to decode (base64/UTF-8/colon)");
                     return build_401(true, is_xhr, is_dav, false);
                 }
                 Some((login, password)) => {
                     // REQ §4.1/4.2: try app token first, then plain password.
+                    let secret_len = app_secret.len();
+                    tracing::debug!(
+                        login_len = login.len(),
+                        password_len = password.len(),
+                        secret_len,
+                        path = %path,
+                        "attempting Basic auth verification"
+                    );
                     match nc_auth::basic::verify_basic(
                         &login,
                         &password,
@@ -259,6 +283,11 @@ pub async fn auth_layer(
                     .await
                     {
                         Some(result) => {
+                            tracing::debug!(
+                                uid = %result.uid,
+                                is_app_token = result.token_id.is_some(),
+                                "Basic auth succeeded"
+                            );
                             // 2FA gate for Basic auth (REQ §4.5).
                             let token_type = result.token_type.unwrap_or(0);
                             if nc_auth::twofa::requires_2fa(
@@ -299,6 +328,12 @@ pub async fn auth_layer(
                             })
                         }
                         None => {
+                            tracing::debug!(
+                                login_len = login.len(),
+                                secret_len,
+                                path = %path,
+                                "Basic auth failed — token hash mismatch and bcrypt mismatch (or DB error)"
+                            );
                             nc_auth::bruteforce::record_attempt(
                                 "login",
                                 &client_ip,
@@ -313,8 +348,13 @@ pub async fn auth_layer(
             }
         }
         _ => {
-            // No Authorization header — try PHP session cookie resolution
-            // (§7.9.6).
+            // No Authorization header (or unrecognized scheme) — try PHP session
+            // cookie resolution (§7.9.6).
+            tracing::debug!(
+                path = %path,
+                has_cookies = !cookie_header.is_empty(),
+                "no recognized Authorization header — falling back to session cookies"
+            );
             //
             // Browser requests authenticate via the PHP login flow and carry
             // only cookies on subsequent requests; the Authorization header is
