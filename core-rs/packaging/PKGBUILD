@@ -1,0 +1,89 @@
+# Maintainer: You <you@example.com>
+#
+# In-tree PKGBUILD: builds the checkout this file lives in
+# (core-rs/packaging/PKGBUILD).  Install with `makepkg -si` from this
+# directory.
+#
+# The binary and the PHP bootstrap shim are packaged from the same revision,
+# so the two halves of the FastCGI trust protocol (docs/deployment.md,
+# "FastCGI trust boundary") can never version-skew.
+
+pkgname=nc-server
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Nextcloud core in Rust: HTTP front-end, native WebDAV/OCS, PHP-FPM FastCGI proxy'
+arch=('x86_64' 'aarch64')
+license=('AGPL-3.0-only')
+# Runtime: glibc only.  PHP-FPM executes the bootstrap shim on every
+# proxied request, but *which* PHP branch serves it depends on how the
+# Nextcloud instance was installed — so the FPM packages are optional
+# deps, the same treatment the nextcloud package gives them.  Without
+# any FPM, nc-server still runs: native routes work and proxied routes
+# return 502 behind a startup warning.
+depends=('glibc')
+makedepends=('cargo')
+optdepends=(
+    'php-legacy-fpm: FPM for Nextcloud installed from the nextcloud package (php-legacy branch)'
+    'php-legacy: php CLI (occ) for the install / maintenance flows'
+)
+backup=('etc/nc-server/nc-server.env')
+# No source=(): built from the surrounding checkout — see prepare().
+# To package a released tarball instead, point source=() at it and replace
+# prepare()'s copy with a plain extraction.
+
+pkgver() {
+    # Workspace version from core-rs/Cargo.toml ([workspace.package]).
+    sed -n 's/^version = "\(.*\)"$/\1/p' "$startdir/../Cargo.toml" | head -n1
+}
+
+prepare() {
+    # Copy the build inputs out of the checkout into srcdir (makepkg
+    # hygiene; excludes the checkout's target/).  The rm keeps repeated
+    # makepkg runs from merging stale artifacts into the fresh copy.
+    rm -rf "$srcdir/core-rs"
+    mkdir -p "$srcdir/core-rs"
+    cp -a "$startdir/../Cargo.toml" "$startdir/../Cargo.lock" "$srcdir/core-rs/"
+    cp -a "$startdir/../crates" "$startdir/../migrations" "$srcdir/core-rs/"
+    cp -a "$startdir/../php-shim" "$srcdir/core-rs/"
+}
+
+build() {
+    cd "$srcdir/core-rs"
+    # Hermetic Rust, LTO-safe C:
+    # - Inherit makepkg's RUSTFLAGS (Arch default: -C force-frame-pointers=yes
+    #   — profileable binaries), falling back to that default if unset.  Being
+    #   set as an env var, it also overrides any personal linker config in
+    #   ~/.cargo (cargo precedence: RUSTFLAGS env > target config), keeping
+    #   the package build independent of the packager's machine.  This also
+    #   defuses the sqlx proc-macro dylib's lazily-resolved sqlite symbols
+    #   under hostile link settings (sqlx issue #3149).
+    # - Keep makepkg's CFLAGS but append -ffat-lto-objects: its -flto=auto
+    #   would otherwise emit bitcode-only objects the proc-macro link
+    #   cannot consume ("mold: unable to handle this LTO object file").
+    #   Fat objects keep LTO active while remaining linkable.  Reaches
+    #   ring's C today; a no-op in builds that compile no C.
+    # - CXXFLAGS/LDFLAGS: nothing here compiles C++, and rustc ignores
+    #   LDFLAGS — drop both rather than carry untested interactions.
+    export CFLAGS="$CFLAGS -ffat-lto-objects"
+    unset CXXFLAGS LDFLAGS DEBUG_RUSTFLAGS
+    export RUSTFLAGS="${RUSTFLAGS:--C force-frame-pointers=yes}"
+    cargo build --release --locked --features postgres
+}
+
+package() {
+    install -D -m 0755 "$srcdir/core-rs/target/release/nc-server" \
+        "$pkgdir/usr/bin/nc-server"
+
+    # PHP bootstrap shim — invoked by PHP-FPM on every proxied request.
+    # This path matches the compiled-in default (see crates/nc-fastcgi/build.rs).
+    install -D -m 0644 "$srcdir/core-rs/php-shim/index.php" \
+        "$pkgdir/usr/share/nc-server/php-shim/index.php"
+
+    install -D -m 0644 "$startdir/nc-server.service" \
+        "$pkgdir/usr/lib/systemd/system/nc-server.service"
+
+    # All keys commented out — safe default config; pacman preserves local
+    # edits via backup=().
+    install -D -m 0644 "$startdir/nc-server.env.example" \
+        "$pkgdir/etc/nc-server/nc-server.env"
+}

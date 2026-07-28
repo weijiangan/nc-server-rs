@@ -40,4 +40,5 @@
 - **Workspace**: `~/Git/nextcloud-rewrite/nextcloud-docker-dev/workspace/server/` contains the PHP reference implementation
 - **Database**: `docker exec master-database-pgsql-1 psql -U postgres -d nextcloud` for live schema verification
 - **Migrations**: `core-rs/migrations/` are exercised against SQLite in tests; production PostgreSQL schemas are created by PHP Doctrine migrations
+- **Packaging**: `core-rs/packaging/` contains an Arch Linux PKGBUILD that copies the real source tree at build time (`prepare()` copies from the parent `core-rs/` directory).  The `packaging/src/` subtree is a stale build artifact — **do not** update it after code changes; it will be refreshed on the next package build.
 - **Test scope**: `cargo test --lib` for unit tests; integration tests (`cargo test`) may fail on pre-existing issues

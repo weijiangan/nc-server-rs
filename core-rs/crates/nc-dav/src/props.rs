@@ -7,11 +7,14 @@
 //! - Added `{oc:}data-fingerprint`, `{nc:}mount-type`, `{nc:}is-mount-root`,
 //!   `{nc:}is-federated`, `{nc:}contained-folder-count`, `{nc:}contained-file-count`
 //! - `build_props` now takes `data_fingerprint`, `child_dir_count`, `child_file_count`
+//! - §9.5: `{oc:}favorite` and `{oc:}tags` are now populated from `oc_vcategory` /
+//!   `oc_vcategory_to_object` instead of hardcoded to `"0"` / `""`
 //!
 //! ## References
 //! - REQ §4.7 — Standard DAV properties
 //! - REQ §4.8 — `{oc:}` namespace properties
 //! - REQ §4.9 — `{nc:}` namespace properties
+//! - REQ §6.5.1 — Favorites & personal tags properties
 
 use dav_server::fs::DavProp;
 

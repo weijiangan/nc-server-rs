@@ -42,6 +42,7 @@ The Rust server reads `config/config.php` (for compat with existing Nextcloud in
 | `preview_ffmpeg_path` | string | ffmpeg binary path (video previews; PHP falls back to a PATH search when unset). |
 | `preview_libreoffice_path` | string | LibreOffice/OpenOffice binary path (office previews; PHP falls back to a PATH search when unset). |
 | `serverid` | int | Snowflake server id for `oc_previews`/`oc_preview_locations` ids (§9.10). Default: `crc32(hostname)`. |
+| `php_binary` | string | PHP CLI interpreter used to parse `config.php` and probe the imagick build at startup (§11.1). Path or `$PATH` name. Default: `php`. The `NC_PHP_BINARY` env var overrides this key (and is the only way to change the interpreter that parses `config.php` itself). |
 
 > **Preview quality** lives in `oc_appconfig` (§9.3), not `config.php`: appid `preview`, keys `jpeg_quality` / `webp_quality`, both default `80`.
 

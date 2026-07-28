@@ -51,6 +51,17 @@ use futures::Stream;
 use nc_db::config::NcConfig;
 use tokio_util::io::StreamReader;
 
+/// Default installed location of the PHP bootstrap shim on packaged systems.
+///
+/// Baked in at compile time by `build.rs`: `$NCSHIMDIR/php-shim/index.php`,
+/// where `NCSHIMDIR` defaults to `/usr/share/nc-server` (FHS location for
+/// architecture-independent read-only data).  Retarget at build time with
+/// `NCSHIMDIR=<dir> cargo build --release`.
+///
+/// Only a *default* — see [`resolve_shim_path`] for the full runtime
+/// resolution order.
+pub const DEFAULT_SHIM_PATH: &str = env!("NC_DEFAULT_SHIM_PATH");
+
 // ── FastCgiState ─────────────────────────────────────────────────────────────
 
 /// Shared state for the PHP-FPM proxy.
@@ -66,10 +77,9 @@ pub struct FastCgiState {
     /// Nextcloud installation root (parent of `config/`, `apps/`, etc.).
     pub nc_root: PathBuf,
     /// Absolute path to the PHP bootstrap shim invoked for every proxied
-    /// request.  Defaults to `{nc_root}/core-rs/php-shim/index.php` (in-tree
-    /// development layout).  Override with the `NC_PHP_SHIM` environment
-    /// variable for deployments where the shim lives outside the NC root
-    /// (e.g. Docker: `/usr/local/share/nc-server/php-shim/index.php`).
+    /// request.  Resolved by [`resolve_shim_path`]: `NC_PHP_SHIM` env var →
+    /// compiled-in packaged default ([`DEFAULT_SHIM_PATH`], when present on
+    /// disk) → in-tree development layout `{nc_root}/core-rs/php-shim/index.php`.
     pub shim_path: PathBuf,
 }
 
@@ -78,9 +88,9 @@ impl FastCgiState {
     ///
     /// `fastcgi_socket` in `config.php` takes priority over the
     /// `NC_FASTCGI_SOCKET` environment variable for the socket path.
-    /// The shim path is resolved from `NC_PHP_SHIM` first (deployment-time
-    /// override for Docker / out-of-tree installs), falling back to
-    /// `{nc_root}/core-rs/php-shim/index.php` for the in-tree dev layout.
+    /// The shim path is resolved by [`resolve_shim_path`].  Logs a warning
+    /// when the resolved shim is missing — every PHP-FPM-proxied request
+    /// will return 502 until the shim is installed.
     ///
     /// Returns `None` when no socket is configured.
     pub fn from_config(config: &NcConfig, nc_root: &Path) -> Option<Self> {
@@ -89,10 +99,15 @@ impl FastCgiState {
             .clone()
             .or_else(|| std::env::var("NC_FASTCGI_SOCKET").ok().map(PathBuf::from))?;
 
-        let shim_path = std::env::var("NC_PHP_SHIM")
-            .ok()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| nc_root.join("core-rs/php-shim/index.php"));
+        let shim_path = resolve_shim_path(nc_root);
+        if !shim_path.is_file() {
+            tracing::warn!(
+                shim = %shim_path.display(),
+                "PHP bootstrap shim not found — every PHP-FPM-proxied request will \
+                 return 502. Install the shim (see packaging/README.md) or set \
+                 NC_PHP_SHIM to its location."
+            );
+        }
 
         Some(Self {
             socket_path,
@@ -101,6 +116,43 @@ impl FastCgiState {
             shim_path,
         })
     }
+}
+
+/// Resolve the PHP bootstrap shim path at startup.
+///
+/// Precedence:
+///
+/// 1. `NC_PHP_SHIM` environment variable — explicit deployment override
+///    (full path to the shim's `index.php`).  Trusted verbatim: a missing
+///    file is surfaced by the caller's warning rather than masked by a
+///    silent fall-through to another candidate.
+/// 2. The compiled-in packaged default [`DEFAULT_SHIM_PATH`] — used only
+///    when that file exists.  It is absent on development checkouts, which
+///    is what lets (3) work with zero configuration.
+/// 3. The in-tree development layout `{nc_root}/core-rs/php-shim/index.php`.
+fn resolve_shim_path(nc_root: &Path) -> PathBuf {
+    let env_override = std::env::var("NC_PHP_SHIM").ok();
+    resolve_shim_path_from(
+        nc_root,
+        Path::new(DEFAULT_SHIM_PATH),
+        env_override.as_deref(),
+    )
+}
+
+/// Pure core of [`resolve_shim_path`], parameterised for testability (no
+/// process-global env access, no hard dependency on the packaged layout).
+fn resolve_shim_path_from(
+    nc_root: &Path,
+    packaged_default: &Path,
+    env_override: Option<&str>,
+) -> PathBuf {
+    if let Some(p) = env_override {
+        return PathBuf::from(p);
+    }
+    if packaged_default.is_file() {
+        return packaged_default.to_path_buf();
+    }
+    nc_root.join("core-rs/php-shim/index.php")
 }
 
 // ── proxy_handler ─────────────────────────────────────────────────────────────
@@ -1609,5 +1661,85 @@ mod tests {
         // Truncated / completely broken output
         let raw = b"Content-Type: application/json".to_vec();
         assert!(parse_resolve_response(&raw).is_none());
+    }
+
+    // ── shim path resolution ─────────────────────────────────────────────────
+
+    /// Scratch directory unique per test — parallel-safe without a tempfile
+    /// crate: `{tmp}/nc-fastcgi-shim-{pid}-{name}`.
+    fn shim_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nc-fastcgi-shim-{}-{}",
+            std::process::id(),
+            name
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn shim_env_override_wins_over_existing_packaged_default() {
+        let dir = shim_test_dir("env-wins");
+        let packaged = dir.join("index.php");
+        std::fs::write(&packaged, "<?php").unwrap();
+
+        let got = resolve_shim_path_from(
+            Path::new("/srv/nc"),
+            &packaged,
+            Some("/etc/nc/custom-shim.php"),
+        );
+        assert_eq!(got, PathBuf::from("/etc/nc/custom-shim.php"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shim_env_override_used_verbatim_even_when_missing() {
+        // An explicit override is trusted: a typo or missing file surfaces
+        // via the startup warning rather than being silently masked by a
+        // fall-through to another candidate.
+        let got = resolve_shim_path_from(
+            Path::new("/srv/nc"),
+            Path::new("/nonexistent/packaged.php"),
+            Some("/nonexistent/custom.php"),
+        );
+        assert_eq!(got, PathBuf::from("/nonexistent/custom.php"));
+    }
+
+    #[test]
+    fn shim_packaged_default_used_when_file_exists() {
+        let dir = shim_test_dir("packaged");
+        let packaged = dir.join("index.php");
+        std::fs::write(&packaged, "<?php").unwrap();
+
+        let got = resolve_shim_path_from(Path::new("/srv/nc"), &packaged, None);
+        assert_eq!(got, packaged);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shim_falls_back_to_in_tree_dev_layout() {
+        let got = resolve_shim_path_from(
+            Path::new("/srv/nc"),
+            Path::new("/nonexistent/packaged.php"),
+            None,
+        );
+        assert_eq!(got, PathBuf::from("/srv/nc/core-rs/php-shim/index.php"));
+    }
+
+    #[test]
+    fn compiled_default_path_is_absolute_shim_location() {
+        // Guard the build.rs contract: packagers rely on an absolute path
+        // under the share dir, ending in the `.php` extension that PHP-FPM's
+        // security.limit_extensions requires.
+        assert!(
+            DEFAULT_SHIM_PATH.starts_with('/'),
+            "DEFAULT_SHIM_PATH must be absolute, got: {DEFAULT_SHIM_PATH}"
+        );
+        assert!(
+            DEFAULT_SHIM_PATH.ends_with("/php-shim/index.php"),
+            "DEFAULT_SHIM_PATH must end in /php-shim/index.php, got: {DEFAULT_SHIM_PATH}"
+        );
     }
 }

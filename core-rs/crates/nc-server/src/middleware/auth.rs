@@ -558,6 +558,7 @@ mod tests {
             preview_concurrency_all: None,
             fastcgi_socket: None,
             fastcgi_timeout_ms: 30_000,
+            php_binary: None,
             forbidden_filenames: vec![".htaccess".to_owned()],
             forbidden_filename_basenames: vec![],
             forbidden_filename_characters: vec![],

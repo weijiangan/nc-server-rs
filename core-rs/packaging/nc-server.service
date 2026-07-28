@@ -1,0 +1,47 @@
+# nc-server — Nextcloud Rust core: HTTP front-end, native WebDAV/OCS, and
+# FastCGI proxy to PHP-FPM for routes it does not (yet) handle natively.
+#
+# Install:
+#   install -D -m 0644 nc-server.service /usr/lib/systemd/system/nc-server.service
+#   systemctl daemon-reload && systemctl enable --now nc-server
+#
+# PHP-FPM runs as its own service and owns the FastCGI socket (see
+# docs/deployment.md for the pool config — listen.mode = 0600 is mandatory).
+# nc-server degrades gracefully when PHP-FPM is down: native routes keep
+# working and proxied routes return 502, so there is no hard Requires=.
+
+[Unit]
+Description=nc-server (Nextcloud Rust core + PHP-FPM proxy)
+Documentation=file:///usr/share/doc/nc-server/deployment.md
+After=network-online.target
+Wants=network-online.target
+# The PHP-FPM unit name varies by distro (php-fpm.service, php8.4-fpm.service,
+# php-fpm-8.4.service …).  Add yours here for ordered startup:
+#After=php8.4-fpm.service
+
+[Service]
+Type=simple
+# Must match the PHP-FPM pool user: the FastCGI socket is 0600-owned by that
+# user, and only this user may connect (docs/deployment.md, "Socket file
+# permissions").
+User=nextcloud
+Group=nextcloud
+
+# Optional admin overrides (NC_PHP_SHIM, NC_FASTCGI_SOCKET, RUST_LOG …).
+# The leading `-` means the file may be absent.
+EnvironmentFile=-/etc/nc-server/nc-server.env
+ExecStart=/usr/bin/nc-server --root /var/www/nextcloud --listen 0.0.0.0:7000
+
+Restart=on-failure
+RestartSec=5
+
+# ── Hardening ─────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+# /usr, /boot, /etc read-only.  For a stricter policy use ProtectSystem=strict
+# and re-allow the data paths with ReadWritePaths=/var/lib/nextcloud …
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

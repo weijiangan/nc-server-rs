@@ -157,6 +157,13 @@ pub struct NcConfig {
     #[serde(default = "default_fastcgi_timeout_ms")]
     pub fastcgi_timeout_ms: u64,
 
+    // ── PHP CLI ────────────────────────────────────────────────────────────────
+    /// PHP CLI interpreter for parsing `config.php` and the imagick startup
+    /// probe.  Key: `php_binary` (path or `$PATH` name).  Default: `php`.
+    /// `NC_PHP_BINARY` env var overrides — the only way to change the
+    /// interpreter that parses `config.php` itself.  See [`resolve_php_binary`].
+    pub php_binary: Option<String>,
+
     // ── Filename validation (§5.1) ───────────────────────────────────────────
     /// Exact filenames that are never allowed (e.g. `.htaccess`).
     /// Key: `forbidden_filenames` in `config.php`.  Default: `[".htaccess"]`.
@@ -205,6 +212,24 @@ fn default_forbidden_extensions() -> Vec<String> {
     vec![".filepart".to_string()]
 }
 
+/// Resolve the PHP CLI interpreter for `config.php` parsing and the imagick
+/// startup probe: `NC_PHP_BINARY` env var → `php_binary` config key → `"php"`.
+/// Empty values are treated as unset.
+pub fn resolve_php_binary(config_value: Option<&str>) -> String {
+    resolve_php_binary_from(config_value, std::env::var("NC_PHP_BINARY").ok().as_deref())
+}
+
+/// Pure core of [`resolve_php_binary`], parameterised for testability.
+fn resolve_php_binary_from(config_value: Option<&str>, env_override: Option<&str>) -> String {
+    if let Some(p) = env_override.map(str::trim).filter(|p| !p.is_empty()) {
+        return p.to_string();
+    }
+    if let Some(p) = config_value.map(str::trim).filter(|p| !p.is_empty()) {
+        return p.to_string();
+    }
+    "php".to_string()
+}
+
 // ── Loaders ─────────────────────────────────────────────────────────────────
 
 impl NcConfig {
@@ -214,9 +239,12 @@ impl NcConfig {
         let php_path = base_dir.join("config/config.php");
         if php_path.exists() {
             // Use PHP CLI to convert config to JSON for reliable parsing
-            // We read the file and extract just the $CONFIG array assignment
+            // We read the file and extract just the $CONFIG array assignment.
+            // The interpreter comes from `NC_PHP_BINARY` only — the `php_binary`
+            // config key is not readable before this parse (bootstrap ordering).
+            let php = resolve_php_binary(None);
             let abs_path = php_path.canonicalize()?;
-            let json_output = std::process::Command::new("php")
+            let json_output = std::process::Command::new(&php)
                 .arg("-r")
                 .arg(format!(
                     r#"
@@ -230,13 +258,18 @@ impl NcConfig {
                 ))
                 .output();
 
-            if let Ok(output) = json_output {
-                if output.status.success() {
+            match json_output {
+                Ok(output) if output.status.success() => {
                     let json_str = String::from_utf8_lossy(&output.stdout);
                     return Ok(serde_json::from_str(&json_str)?);
                 }
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!("PHP config parse failed: {}", stderr);
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!("{php}: PHP config parse failed: {}", stderr.trim());
+                }
+                Err(e) => {
+                    tracing::debug!("config parse could not run {php} ({e}); falling back to the built-in parser");
+                }
             }
 
             // Fallback to manual parsing if PHP CLI fails
@@ -515,5 +548,33 @@ $CONFIG = [
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("localhost:9090"), "URL leaked into Debug: {debug}");
         assert!(debug.contains("Sensitive(<redacted>)"));
+    }
+
+    #[test]
+    fn php_binary_resolution() {
+        // Env var wins over the config key.
+        assert_eq!(
+            resolve_php_binary_from(Some("/usr/bin/php-legacy"), Some("/opt/php")),
+            "/opt/php"
+        );
+        // Config key used when the env var is absent.
+        assert_eq!(
+            resolve_php_binary_from(Some("php-legacy"), None),
+            "php-legacy"
+        );
+        // Default when neither is set.
+        assert_eq!(resolve_php_binary_from(None, None), "php");
+        // Empty / whitespace-only values are treated as unset.
+        assert_eq!(resolve_php_binary_from(Some(""), Some("  ")), "php");
+        assert_eq!(resolve_php_binary_from(Some("  "), Some("")), "php");
+        assert_eq!(
+            resolve_php_binary_from(Some("php-legacy"), Some("")),
+            "php-legacy"
+        );
+        // Values are trimmed.
+        assert_eq!(
+            resolve_php_binary_from(Some(" /usr/bin/php "), None),
+            "/usr/bin/php"
+        );
     }
 }

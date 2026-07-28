@@ -79,7 +79,11 @@ async fn main() -> anyhow::Result<()> {
     // Build FastCGI state from config (None when fastcgi_socket is absent).
     let fastcgi = nc_fastcgi::FastCgiState::from_config(&config, &args.root);
     if let Some(ref fpm) = fastcgi {
-        tracing::info!(socket = %fpm.socket_path.display(), "PHP-FPM proxy enabled");
+        tracing::info!(
+            socket = %fpm.socket_path.display(),
+            shim = %fpm.shim_path.display(),
+            "PHP-FPM proxy enabled"
+        );
     } else {
         tracing::info!("PHP-FPM proxy disabled (fastcgi_socket not set in config)");
     }

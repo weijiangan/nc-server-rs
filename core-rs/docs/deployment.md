@@ -55,6 +55,19 @@ cargo build --release --features postgres   # or --features sqlite
 
 The binary is at `target/release/nc-server`.
 
+**Packaged / systemd install:** use the PKGBUILD in
+[`packaging/`](../packaging/README.md) (`cd packaging && makepkg -si`).  It
+installs the binary, the PHP bootstrap shim (required at runtime — PHP-FPM
+executes it on every proxied request), a systemd unit, and an env file, and
+keeps binary and shim in lockstep.  Running from a source checkout needs no
+installation: the shim resolves to `core-rs/php-shim/index.php` in-tree.
+
+Shim resolution order at startup: `NC_PHP_SHIM` env var → compiled-in
+packaged default (`/usr/share/nc-server/php-shim/index.php`; retarget at
+build time with `NCSHIMDIR=<dir>`) → in-tree dev layout.  The chosen path is
+logged at startup, and a missing shim logs a warning (proxied requests then
+return 502).
+
 ---
 
 ## Step 3 — Add nc-server config keys to config.php
@@ -66,6 +79,9 @@ Append to `config/config.php` (the same file Nextcloud uses):
 'fastcgi_socket' => '/run/nc-fpm.sock',
 // Optional: increase for slow PHP routes (default 30 000 ms).
 'fastcgi_timeout_ms' => 30000,
+// Optional: PHP CLI interpreter for parsing config.php and the imagick
+// startup probe (default 'php'). The NC_PHP_BINARY env var overrides it.
+// 'php_binary' => 'php-legacy',
 ```
 
 No other keys are needed — `nc-server` reads all standard Nextcloud config keys

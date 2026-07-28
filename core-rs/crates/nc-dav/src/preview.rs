@@ -166,7 +166,9 @@ impl ProviderRegistry {
             cfg.preview_libreoffice_path.as_deref(),
             &["libreoffice", "soffice", "openoffice"],
         );
-        let imagick = detect_imagick_formats();
+        let imagick = detect_imagick_formats(&nc_db::config::resolve_php_binary(
+            cfg.php_binary.as_deref(),
+        ));
         Self::build(
             cfg.enable_previews,
             cfg.enabled_preview_providers.as_deref(),
@@ -366,12 +368,11 @@ fn imaginary_url_valid(url: Option<&str>) -> bool {
 /// replicating `IMagickSupport::supportsFormat` (`count(queryFormats($f)) === 1`)
 /// for each format in [`IMAGICK_PROBE_FORMATS`].  Returns uppercase format names.
 ///
-/// Uses the same `php` interpreter already invoked to parse `config.php`.  Any
-/// failure (no `php`, non-zero exit, imagick absent) yields an empty set, which
-/// disables the imagick-family providers — a safe under-report (a stale or missing
-/// hint degrades to a generic icon, never wrong content; generation of imagick-only
-/// types still proxies to PHP-FPM).
-fn detect_imagick_formats() -> Vec<String> {
+/// Any failure (interpreter missing, non-zero exit, imagick absent) yields an
+/// empty set, which disables the imagick-family providers — a safe under-report
+/// (a stale or missing hint degrades to a generic icon, never wrong content;
+/// generation of imagick-only types still proxies to PHP-FPM).
+fn detect_imagick_formats(php: &str) -> Vec<String> {
     // Build the format list literal for the PHP snippet from the shared constant so
     // the probe and the Rust model can never drift apart.
     let list = IMAGICK_PROBE_FORMATS
@@ -386,19 +387,19 @@ fn detect_imagick_formats() -> Vec<String> {
              if (count($i->queryFormats($f)) === 1) {{ echo $f, ','; }} \
          }}"
     );
-    match std::process::Command::new("php").arg("-r").arg(&script).output() {
+    match std::process::Command::new(php).arg("-r").arg(&script).output() {
         Ok(out) if out.status.success() => {
             parse_imagick_probe(&String::from_utf8_lossy(&out.stdout))
         }
         Ok(out) => {
             tracing::debug!(
-                "imagick probe exited non-zero; imagick treated as unavailable: {}",
+                "imagick probe ({php}) exited non-zero; imagick treated as unavailable: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
             Vec::new()
         }
         Err(e) => {
-            tracing::debug!("imagick probe could not run php ({e}); imagick treated as unavailable");
+            tracing::debug!("imagick probe could not run {php} ({e}); imagick treated as unavailable");
             Vec::new()
         }
     }
