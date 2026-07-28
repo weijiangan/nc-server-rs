@@ -88,6 +88,14 @@ Option 1 is recommended. Tracked as a future task because it requires rewriting 
 
 **Fix:** §I.1's config.php watcher covers this automatically — on secret change, re-parse `NcConfig`, flush the entire token hot cache (since all cached hashes computed under the old secret are now invalid).
 
+## I.8a 2FA gate — fail-secure on DB error
+
+**Context:** `requires_2fa()` (`nc-auth/src/twofa.rs`) queries `oc_twofactor_providers` to decide whether to block a request with a 2FA challenge.  Currently matches PHP: a DB error propagates as `Result::Err`, the middleware returns 500 Internal Server Error.  This is correct per PHP but means a degraded `oc_twofactor_providers` table (and only that table) causes a 500 spike for every non-token request while auth itself still works.
+
+**Alternative considered (2026-07-28):** Catch the DB error and return `true` (2FA required → 401).  This is fail-**secure** — a broken 2FA table won't silently open the gate.  But it translates a server problem into a misleading 401 that looks like a client credential issue.  Rejected in favour of matching PHP's 500 behaviour so ops gets an unambiguous infrastructure signal.
+
+**Revisit if:** the DB pattern changes (e.g. a read-replica caches 2FA state) or 2FA becomes a federated call where transient failures are expected and a 500 is too blunt.  At that point, fail-secure with a distinct error body (so clients can distinguish "server can't check 2FA" from "you need to 2FA") may be the better trade-off.
+
 ## I.9 `{oc:}permissions` `W` flag on movable-mount roots (single-file shares)
 
 **Context:** PHP `DavUtil::getDavPermissions()` (`lib/public/Files/DavUtil.php`) special-cases the `W` ("writable file") letter for the **root of a movable mount** (`getInternalPath() === '' && mount instanceof IMovableMount`): instead of the node's own `UPDATE` bit, it re-derives writability from the underlying storage's root cache entry. The mount layer artificially adds `UPDATE` to a mount root so it can be renamed/moved as a unit, which would otherwise emit a bogus `W`. Since `W` is only appended for files, this only matters for a **single-file share** (a share of one file, mounted as a file at its own root). Rust's `encode_permissions` (`nc-dav/src/props.rs`) derives `W` directly from the persisted `oc_filecache.permissions` bit and has no movable-mount re-derivation.
