@@ -113,9 +113,11 @@ impl DavMetaData for NcMetaData {
         Ok(UNIX_EPOCH + Duration::from_secs(self.creation_time.max(0) as u64))
     }
 
-    /// Return the ETag stored in `oc_filecache.etag` verbatim.
+    /// Return the ETag stored in `oc_filecache.etag`, quoted per RFC 4918 §8.8.
+    /// PHP's `SabreDAV` wraps the raw DB value in double quotes for both
+    /// `{DAV:}getetag` in the XML body and the `ETag` response header.
     fn etag(&self) -> Option<String> {
-        self.etag.clone()
+        self.etag.as_ref().map(|e| format!("\"{e}\""))
     }
 }
 

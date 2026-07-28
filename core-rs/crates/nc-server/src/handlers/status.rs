@@ -23,23 +23,29 @@ pub async fn status(State(state): State<AppState>) -> Response {
         .read()
         .expect("appconfig lock poisoned");
 
+    // PHP's `status.php` reads `version` from `version.php` (a static file at the
+    // Nextcloud root containing `$OC_Version = [34, 0, 1, 2]` and
+    // `$OC_VersionString = '34.0.1'`).  We already parse the dotted version from
+    // `config.php` ($CONFIG['version']).  Derive the human-readable string by
+    // dropping the last component — `34.0.1.2` → `34.0.1`.
+    let version = state.nc_config.version.clone()
+        .or_else(|| ac.get_string("core", "oc_version"))
+        .or_else(|| ac.get_string("core", "version"))
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let version_string = version.rfind('.')
+        .map(|pos| version[..pos].to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Unknown".to_string());
+
     let body = StatusResponse {
         installed: state.nc_config.installed,
         maintenance: state.nc_config.maintenance,
         needs_db_upgrade: ac.get_bool("core", "needsDbUpgrade"),
-        version: ac
-            .get_string("core", "oc_version")
-            .or_else(|| ac.get_string("core", "version"))
-            .unwrap_or_else(|| "0.0.0.0".to_string()),
-        version_string: ac
-            .get_string("core", "oc_version_string")
-            .or_else(|| ac.get_string("core", "versionstring"))
-            .unwrap_or_else(|| "Unknown".to_string()),
-        edition: ac.get_string("core", "edition").unwrap_or_default(),
-        product_name: ac
-            .get_string("core", "productname")
-            .unwrap_or_else(|| "Nextcloud".to_string()),
-        extended_support: ac.get_bool("core", "extendedSupport"),
+        version,
+        version_string,
+        edition: String::new(),
+        product_name: "Nextcloud".to_string(),
+        extended_support: false,
     };
 
     // Drop the read guard before building the response.

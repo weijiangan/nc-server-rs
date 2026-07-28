@@ -68,12 +68,14 @@ async fn dav_arbiter_handler(
     State(state): State<AppState>,
     req: Request<Body>,
 ) -> Response {
-    if req.method().as_str() == "SEARCH" {
+    // SEARCH and REPORT are not implemented natively on the files tree.
+    // Proxy them to PHP-FPM (which handles filter-files, sync-collection, etc.).
+    if matches!(req.method().as_str(), "SEARCH" | "REPORT") {
         if let Some(ref fpm) = state.fastcgi {
             return nc_fastcgi::proxy_handler(fpm, req).await;
         }
         // No PHP-FPM configured → fall through; the native handler
-        // will return 405 Method Not Allowed.
+        // will return 405 / 501.
     }
     nc_dav::dav_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await
 }

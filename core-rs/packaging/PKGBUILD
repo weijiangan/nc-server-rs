@@ -44,6 +44,7 @@ prepare() {
     mkdir -p "$srcdir/core-rs"
     cp -a "$startdir/../Cargo.toml" "$startdir/../Cargo.lock" "$srcdir/core-rs/"
     cp -a "$startdir/../crates" "$startdir/../migrations" "$srcdir/core-rs/"
+    cp -a "$startdir/../vendor" "$srcdir/core-rs/"
     cp -a "$startdir/../php-shim" "$srcdir/core-rs/"
 }
 

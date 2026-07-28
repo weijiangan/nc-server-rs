@@ -10,6 +10,14 @@
 //! - §9.5: `{oc:}favorite` and `{oc:}tags` are now populated from `oc_vcategory` /
 //!   `oc_vcategory_to_object` instead of hardcoded to `"0"` / `""`
 //!
+//! ## PHASE-12.1 value discipline
+//! Properties that have no value under PHP semantics (no checksum, no
+//! direct-download URL, no share note, `upload_time` on directories,
+//! `hide-download` off shared storage) are OMITTED rather than emitted
+//! empty — the patched dav-server then groups them into the 404 propstat,
+//! exactly matching PHP's null-returning handlers. `acl-can-*` /
+//! `remind-me-at` are not PHP-core properties and are never emitted.
+//!
 //! ## References
 //! - REQ §4.7 — Standard DAV properties
 //! - REQ §4.8 — `{oc:}` namespace properties
@@ -106,6 +114,37 @@ pub fn build_props(
     let is_mount_root = matches!(meta.path.as_deref(), Some("") | Some("files"));
     let is_mount_root_str = if is_mount_root { "true" } else { "false" };
 
+    // {DAV:}displayname — PHP: FilesPlugin.php:470-472 emits $node->getName(),
+    // which is FileInfo::getName() (FileInfo.php:136-139): oc_filecache.name
+    // when non-empty, else basename(path). For the home DAV root the cache
+    // name is empty and PHP's tree resolves the name to the UID (the root
+    // node is the user folder itself) — mirror that exactly: cached name
+    // first, mount-root → uid, then basename(path) as the last fallback.
+    // PHASE-12.2.
+    let displayname_val: &str = if !meta.display_name.is_empty() {
+        meta.display_name.as_str()
+    } else if is_mount_root {
+        uid
+    } else {
+        meta.path
+            .as_deref()
+            .and_then(|p| p.rsplit('/').next())
+            .filter(|n| !n.is_empty())
+            .unwrap_or(uid)
+    };
+
+    // {nc:}mount-type — PHP: FilesPlugin.php:404-406 →
+    // MountPoint::getMountType():
+    //   home mounts      → ""       (MountPoint.php:268-270)
+    //   shared mounts    → "shared" (files_sharing/lib/SharedMount.php:184-186)
+    //   external storage → "external" / "external-session"
+    //                      (files_external/lib/Config/ExternalMountPoint.php:27-29)
+    //   group folders    → "group"  (groupfolders app)
+    // The rewrite serves home and shared mounts today; external/group mounts
+    // have no storage support yet, so they cannot reach this code path.
+    // PHASE-12.8.
+    let mount_type = if is_shared { "shared" } else { "" };
+
     let mut props = vec![
         // ── oc: ──────────────────────────────────────────────────────────
         make_prop("id", "oc", OC_NS, &oc_id),
@@ -115,10 +154,15 @@ pub fn build_props(
         make_prop("owner-id", "oc", OC_NS, uid),
         // {oc:}owner-display-name — resolved from oc_users.displayname (REQ §6.5 / §4.8)
         make_prop("owner-display-name", "oc", OC_NS, owner_display_name),
-        make_prop("etag", "oc", OC_NS, meta.etag.as_deref().unwrap_or("")),
-        make_prop("checksums", "oc", OC_NS, &checksums_val),
+        // NOTE: {oc:}etag is deliberately NOT emitted — PHP has no registration
+        // for {http://owncloud.org/ns}etag on the files endpoint and never
+        // includes it in PROPFIND responses (verified against PHP source and
+        // wire captures). `{DAV:}getetag` is emitted by dav-server from the
+        // quoted `DavMetaData::etag()`. PHASE-12.10.
+        // {oc:}checksums / {oc:}downloadURL — emitted conditionally below
+        // (PHASE-12.1): PHP returns null (→404 propstat) when there is no
+        // checksum / direct-download URL.
         make_prop("data-fingerprint", "oc", OC_NS, data_fingerprint),
-        make_prop("downloadURL", "oc", OC_NS, download_url),
         // §9.5: tags / favorite are populated from oc_vcategory / oc_vcategory_to_object.
         // Tags are serialized as <oc:tags><oc:tag>...</oc:tag>...</oc:tags>.
         // Favorite is "1" or "0".
@@ -153,13 +197,13 @@ pub fn build_props(
             NC_NS,
             &meta.creation_time.to_string(),
         ),
-        make_prop("upload_time", "nc", NC_NS, &meta.upload_time.to_string()),
-        make_prop("mount-type", "nc", NC_NS, "local"),
+        // {nc:}upload_time — emitted conditionally below: PHP registers it
+        // for File nodes only; directories get a 404 propstat (PHASE-12.1).
+        make_prop("mount-type", "nc", NC_NS, mount_type),
         make_prop("is-mount-root", "nc", NC_NS, is_mount_root_str),
         make_prop("is-federated", "nc", NC_NS, "false"),
-        // {nc:}hide-download — relevant for public shares; always "false" for
-        // home-storage nodes (REQ §6.5, PHASE-4.9)
-        make_prop("hide-download", "nc", NC_NS, "false"),
+        // {nc:}hide-download — emitted conditionally below: PHP returns null
+        // (→404) unless the node lives on shared storage (PHASE-12.1).
         make_prop(
             "contained-folder-count",
             "nc",
@@ -172,14 +216,16 @@ pub fn build_props(
             NC_NS,
             &child_file_count.to_string(),
         ),
-        make_prop("remind-me-at", "nc", NC_NS, ""),
-        make_prop("note", "nc", NC_NS, note),
         make_prop("hidden", "nc", NC_NS, "false"),
-        make_prop("share-attributes", "nc", NC_NS, ""),
-        make_prop("acl-can-read", "nc", NC_NS, "true"),
-        make_prop("acl-can-write", "nc", NC_NS, "true"),
-        make_prop("acl-can-delete", "nc", NC_NS, "true"),
-        make_prop("acl-can-manage", "nc", NC_NS, "true"),
+        // {nc:}share-attributes — PHP json_encode()s the share attributes
+        // (FilesPlugin.php:350-352): "[]" when empty, NOT the empty string.
+        // TODO(PHASE-12): real per-share attributes.
+        make_prop("share-attributes", "nc", NC_NS, "[]"),
+        // {nc:}acl-can-* and {nc:}remind-me-at were removed in PHASE-12.1:
+        // they do not exist in PHP core (they belong to the groupfolders /
+        // deck apps). PHP answers requested-but-unknown properties with a
+        // 404 propstat, which the patched dav-server now produces
+        // automatically.
         // ── DAV quota (unlimited) ─────────────────────────────────────────
         //
         // dav-server emits `{DAV:}quota-available-bytes` only when
@@ -192,7 +238,47 @@ pub fn build_props(
         // the `used` first-element from `get_quota()` and does NOT need to
         // appear here.
         make_prop("quota-available-bytes", "D", "DAV:", "-3"),
+        // {DAV:}displayname — PHASE-12.2 (value computed above).
+        make_prop("displayname", "D", "DAV:", displayname_val),
     ];
+
+    // ── PHASE-12.1 value discipline ────────────────────────────────────────
+    // Properties whose PHP handlers return null — or that PHP does not
+    // register for this node type — are OMITTED here, so the patched
+    // dav-server groups them into the 404 propstat, exactly matching PHP.
+    // Emitting "" / 0 instead would place them in the 200 propstat.
+
+    // {oc:}checksums — FilesPlugin.php:506-513: null (→404) without checksum.
+    if !checksums_val.is_empty() {
+        props.push(make_prop("checksums", "oc", OC_NS, &checksums_val));
+    }
+    // {oc:}downloadURL — FilesPlugin.php:491-496: false (→404) when there is
+    // no direct-download URL (non-home storage).
+    if !download_url.is_empty() {
+        props.push(make_prop("downloadURL", "oc", OC_NS, download_url));
+    }
+    // {nc:}upload_time — FilesPlugin.php:515-517 sits in the File-only
+    // branch: directories land in the 404 propstat.
+    if !meta.is_dir_flag {
+        props.push(make_prop(
+            "upload_time",
+            "nc",
+            NC_NS,
+            &meta.upload_time.to_string(),
+        ));
+    }
+    // {nc:}hide-download — FilesPlugin.php:425-436: null (→404) unless the
+    // node lives on shared storage.
+    // TODO(PHASE-12): source the actual oc_share.hide_download bit; shared
+    // nodes report "false" until then.
+    if is_shared {
+        props.push(make_prop("hide-download", "nc", NC_NS, "false"));
+    }
+    // {nc:}note — FilesPlugin.php:418-423: null (→404) when the share has
+    // no note.
+    if !note.is_empty() {
+        props.push(make_prop("note", "nc", NC_NS, note));
+    }
 
     // Conditionally include metadata_etag if present.
     if let Some(ref etag) = meta.metadata_etag {
@@ -327,7 +413,6 @@ fn prop_names() -> Vec<DavProp> {
         name_only("size", "oc", OC_NS),
         name_only("owner-id", "oc", OC_NS),
         name_only("owner-display-name", "oc", OC_NS),
-        name_only("etag", "oc", OC_NS),
         name_only("checksums", "oc", OC_NS),
         name_only("data-fingerprint", "oc", OC_NS),
         name_only("downloadURL", "oc", OC_NS),
@@ -344,14 +429,12 @@ fn prop_names() -> Vec<DavProp> {
         name_only("hide-download", "nc", NC_NS),
         name_only("contained-folder-count", "nc", NC_NS),
         name_only("contained-file-count", "nc", NC_NS),
-        name_only("remind-me-at", "nc", NC_NS),
         name_only("note", "nc", NC_NS),
         name_only("hidden", "nc", NC_NS),
         name_only("share-attributes", "nc", NC_NS),
-        name_only("acl-can-read", "nc", NC_NS),
-        name_only("acl-can-write", "nc", NC_NS),
-        name_only("acl-can-delete", "nc", NC_NS),
-        name_only("acl-can-manage", "nc", NC_NS),
+        // {nc:}acl-can-* and {nc:}remind-me-at are not PHP-core properties
+        // (PHASE-12.1) — removed.
+        name_only("displayname", "D", "DAV:"),
         // Note: {DAV:}quota-available-bytes is listed by dav-server's own
         // allprop/propname set so we do NOT duplicate it here.
     ]
@@ -575,16 +658,15 @@ mod tests {
     // ── downloadURL (§4.8 / PHASE-7.6) ───────────────────────────────────────────
 
     #[test]
-    fn download_url_empty_when_not_provided() {
+    fn download_url_omitted_when_not_provided() {
+        // PHASE-12.1: PHP returns false (→404 propstat) when there is no
+        // direct-download URL — the property must be omitted, not empty.
         let props = build(&test_meta(None));
-        let p = props
-            .iter()
-            .find(|p| p.name == "downloadURL" && p.namespace.as_deref() == Some(OC_NS))
-            .expect("{oc:}downloadURL must be present");
-        let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
         assert!(
-            !xml.is_empty(),
-            "xml element should be present even if value is empty: {xml}"
+            props
+                .iter()
+                .all(|p| !(p.name == "downloadURL" && p.namespace.as_deref() == Some(OC_NS))),
+            "{{oc:}}downloadURL must be omitted when no URL is available"
         );
     }
 
@@ -655,13 +737,13 @@ mod tests {
     // ── note (PHASE-7.6) ──────────────────────────────────────────────────────
 
     #[test]
-    fn note_empty_by_default() {
+    fn note_omitted_by_default() {
+        // PHASE-12.1: PHP returns null (→404 propstat) when the share has no
+        // note — the property must be omitted, not empty.
         let props = build(&test_meta(None));
-        let p = props.iter().find(|p| p.name == "note").unwrap();
-        let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
         assert!(
-            !xml.contains("hello"),
-            "should not contain note text when empty: {xml}"
+            props.iter().all(|p| p.name != "note"),
+            "{{nc:}}note must be omitted when empty"
         );
     }
 
@@ -765,12 +847,11 @@ mod tests {
             &[],
             false,
         );
-        let p = props.iter().find(|p| p.name == "checksums").unwrap();
-        let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        // Should just be <oc:checksums …></oc:checksums> with no inner element
+        // PHASE-12.1: PHP returns null (→404 propstat) when there is no
+        // checksum — the property must be omitted, not empty.
         assert!(
-            !xml.contains("oc:checksum>S"),
-            "should not have checksum when none stored: {xml}"
+            props.iter().all(|p| p.name != "checksums"),
+            "{{oc:}}checksums must be omitted when no checksum is stored"
         );
     }
 
@@ -880,16 +961,34 @@ mod tests {
     // ── hide-download (§4.9) ──────────────────────────────────────────────────
 
     #[test]
-    fn hide_download_present_and_false() {
+    fn hide_download_omitted_for_non_shared() {
+        // PHASE-12.1: PHP returns null (→404 propstat) unless the node lives
+        // on shared storage (FilesPlugin.php:425-436).
         let props = build(&test_meta(None));
+        assert!(
+            props
+                .iter()
+                .all(|p| !(p.name == "hide-download" && p.namespace.as_deref() == Some(NC_NS))),
+            "{{nc:}}hide-download must be omitted for non-shared nodes"
+        );
+    }
+
+    #[test]
+    fn hide_download_present_on_shared_nodes() {
+        let meta = test_meta(None);
+        let props = build_props(
+            &meta, "inst", "u", "U", true, "", 0, 0, false, true, 31, "", "",            false,
+            &[],
+            false,
+        );
         let p = props
             .iter()
             .find(|p| p.name == "hide-download" && p.namespace.as_deref() == Some(NC_NS))
-            .expect("{nc:}hide-download must be present");
+            .expect("{nc:}hide-download must be present on shared nodes");
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
         assert!(
             xml.contains("false"),
-            "{{nc:}}hide-download must be false for home nodes: {xml}"
+            "{{nc:}}hide-download must be false (TODO: real value) for shared nodes: {xml}"
         );
     }
 
@@ -935,8 +1034,11 @@ mod tests {
     }
 
     #[test]
-    fn mount_type_is_local() {
-        let props = build_props(
+    fn mount_type_matches_php_mount_point_type() {
+        // PHP: FilesPlugin.php:404-406 → MountPoint::getMountType():
+        // home mount → "" (MountPoint.php:268-270), shared mount → "shared"
+        // (SharedMount.php:184-186). PHASE-12.8.
+        let home = build_props(
             &test_meta(None),
             "inst",
             "u",
@@ -953,9 +1055,64 @@ mod tests {
             &[],
             false,
         );
-        let p = props.iter().find(|p| p.name == "mount-type").unwrap();
+        let p = home.iter().find(|p| p.name == "mount-type").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(xml.contains("local"), "{xml}");
+        assert_eq!(
+            xml,
+            "<nc:mount-type xmlns:nc=\"http://nextcloud.org/ns\"></nc:mount-type>",
+            "home mount must emit empty mount-type, got {xml}"
+        );
+
+        let shared = build_props(
+            &test_meta(None),
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            false,
+            true,
+            31,
+            "",
+            "",            false,
+            &[],
+            false,
+        );
+        let p = shared.iter().find(|p| p.name == "mount-type").unwrap();
+        let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
+        assert!(
+            xml.contains("shared"),
+            "shared mount must emit 'shared', got {xml}"
+        );
+    }
+
+    #[test]
+    fn displayname_matches_php_getname() {
+        // PHP: FilesPlugin.php:470-472 → FileInfo::getName() (FileInfo.php:
+        // 136-139): cached name when non-empty, mount root falls back to the
+        // UID in PHP's tree. PHASE-12.2.
+        // Non-root: cached name wins.
+        let props = build(&test_meta(None));
+        let p = props.iter().find(|p| p.name == "displayname").unwrap();
+        let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
+        assert!(xml.contains(">test.txt<"), "{xml}");
+
+        // Mount root with empty cache name (home roots have NULL name in
+        // oc_filecache) → UID.
+        let mut root_meta = test_meta(None);
+        root_meta.display_name = String::new();
+        root_meta.path = Some("files".into());
+        root_meta.is_dir_flag = true;
+        let props = build(&root_meta);
+        let p = props.iter().find(|p| p.name == "displayname").unwrap();
+        let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            xml,
+            "<D:displayname xmlns:D=\"DAV:\">alice</D:displayname>",
+            "mount root must emit the UID, got {xml}"
+        );
     }
 
     #[test]

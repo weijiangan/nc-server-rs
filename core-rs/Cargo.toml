@@ -113,3 +113,17 @@ nc-preview = { path = "crates/nc-preview" }
 [profile.release]
 lto = "thin"
 strip = true
+
+# NEXTCLOUD-RS: vendored dav-server — upstream
+# https://github.com/messense/dav-server-rs, branch `nextcloud-0.11.0` based
+# on tag v0.11.0 (byte-identical to the crates.io tarball; verify with
+# `git diff v0.11.0` inside vendor/dav-server).  Carries the PHASE-12.1
+# patch set for PHP/SabreDAV PROPFIND parity:
+#   - requested-but-unavailable properties are grouped into a 404 propstat
+#     instead of being silently dropped (RFC 4918 §9.1),
+#   - filesystem-driver properties are filtered to the client's requested
+#     set on explicit <prop> requests (allprop/propname unchanged),
+#   - collections report {DAV:}getcontenttype in the 404 propstat rather
+#     than as "httpd/unix-directory".
+[patch.crates-io]
+dav-server = { path = "vendor/dav-server" }

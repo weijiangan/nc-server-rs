@@ -128,6 +128,19 @@ Each entry below is a concrete, scoped task, verified against the PHP reference 
 
 ## Changes
 
+### 2026-07-29 — implementation, batch 1
+
+Implemented **12.2, 12.8, 12.10, 12.13** and both code halves of **12.1** (framework patch + value discipline). `cargo test --lib` green across the workspace.
+
+- **dav-server vendored** at `core-rs/vendor/dav-server` — clone of `messense/dav-server-rs`, branch `nextcloud-0.11.0` based on tag `v0.11.0` (verified byte-identical to the crates.io tarball), patch commit `b9cd889`, wired via `[patch.crates-io]`. Patches (all marked `NEXTCLOUD-RS PATCH`): requested-but-unavailable properties grouped into a 404 propstat instead of dropped; driver properties filtered to the requested set on explicit `<prop>` requests (allprop/propname unchanged); driver props override NOT_FOUND placeholders for the same name; `getcontenttype` 404 for collections. Rebase path: fetch upstream tag, rebase the branch, bump the pin. *Pending:* push the branch to a fork and register as a git submodule of the outer repo.
+- **12.1 value discipline** (`crates/nc-dav/src/props.rs`): `checksums`/`downloadURL`/`note` omitted when empty, `upload_time` omitted for directories, `hide-download` only on shared nodes, `share-attributes` now `[]` (PHP's `json_encode`); removed `acl-can-*` and `remind-me-at` (not PHP-core; PHP 404s them).
+- **12.2:** `{DAV:}displayname` emitted — cached name, UID at mount roots (mirrors `FileInfo::getName()`).
+- **12.8:** `mount-type` now `""` (home) / `"shared"` (shared) — was hardcoded `"local"`.
+- **12.10:** `oc:etag` no longer emitted.
+- **12.13:** `Vary: Brief,Prefer` on PROPFIND/REPORT.
+
+**Verification status:** unit-tested behavior; the end-to-end check — replaying the captured iOS request against a deployed Rust build and diffing 200/404 propstat sets against PHP — is still pending.
+
 ### 2026-07-29 — spec accuracy review
 
 Reviewed every claim against the PHP reference source and the 2026-07-28 wire captures; rewrote accordingly:

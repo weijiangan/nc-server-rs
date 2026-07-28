@@ -581,6 +581,32 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
             }
         }
     }
+    // 0. DAV compliance classes (match PHP's SabreDAV output).
+    //    1         = Class 1 (WebDAV)
+    //    3         = Class 3 (Advanced Collections)
+    //    extended-mkcol, access-control, calendarserver-principal-property-search,
+    //    nc-paginate, nextcloud-checksum-update, nc-calendar-search,
+    //    nc-enable-birthday-calendar, 2 = Class 2 (Locking)
+    parts.headers.insert(
+        HeaderName::from_static("dav"),
+        HeaderValue::from_static(
+            "1, 3, extended-mkcol, access-control, \
+             calendarserver-principal-property-search, nc-paginate, \
+             nextcloud-checksum-update, nc-calendar-search, \
+             nc-enable-birthday-calendar, 2",
+        ),
+    );
+    // Vary: Brief,Prefer on PROPFIND/REPORT responses — SabreDAV CorePlugin
+    // (3rdparty/sabre/dav/lib/DAV/CorePlugin.php:332 httpPropFind, :376
+    // httpReport). Note the exact value has NO space after the comma.
+    // PHASE-12.13.
+    if matches!(req_method.as_str(), "PROPFIND" | "REPORT") {
+        parts.headers.insert(
+            HeaderName::from_static("vary"),
+            HeaderValue::from_static("Brief,Prefer"),
+        );
+    }
+
     // 1. Content-Security-Policy on every DAV response (REQ §2.4 / §15.1)
     parts.headers.insert(
         H_CSP.clone(),
