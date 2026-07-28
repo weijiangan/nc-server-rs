@@ -73,6 +73,18 @@ pub fn disk_path(data_dir: &std::path::Path, uid: &str, fc_path: &str) -> std::p
 /// Tries multiple known formats:
 /// - `home::{uid}` — used by NC home directory wrappers (default for most installs)
 /// - `local::{data_dir}/{uid}/` — used by raw LocalStorage backends
+/// Match PHP's `\OC\Files\Cache\Storage::adjustStorageId`.
+/// Storage IDs longer than 64 characters are stored as their MD5 hex digest
+/// in `oc_storages.id` (see `lib/private/Files/Cache/Storage.php:99-105`).
+fn adjust_storage_id(id: &str) -> String {
+    if id.len() > 64 {
+        use md5::Digest;
+        format!("{:x}", md5::Md5::digest(id.as_bytes()))
+    } else {
+        id.to_string()
+    }
+}
+
 pub async fn lookup_storage_id(
     pool: &DbPool,
     prefix: &str,

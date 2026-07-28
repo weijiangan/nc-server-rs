@@ -100,3 +100,15 @@ Goal: every auth method works correctly, the token hot cache is in place, and br
 - `core-rs/crates/nc-db/src/config.rs` — added `secret` field to `NcConfig`
 - `core-rs/crates/nc-server/src/middleware/auth.rs` — read `app_secret` from `nc_config.secret`; updated test state
 - `core-rs/crates/nc-auth/src/basic.rs` — removed `login_name` SQL filter, added post-query case-insensitive validation
+
+### 2026-07-28 — Fix storage lookup: `adjustStorageId` (MD5 hash of long IDs)
+
+**Root cause:** Users with UIDs longer than 64 characters (e.g. OIDC users with 64-char hex UIDs) could authenticate but got `503 Storage not available` on any DAV request.  `lookup_storage_id()` queried `oc_storages.id` with the raw `home::<uid>` string, but PHP's `adjustStorageId` (`Storage.php:99-105`) MD5-hashes any storage ID longer than 64 characters before storing it.  `home::` + 64-char UID = 70 chars → stored as 32-char MD5 hex.
+
+**Fix:** Added `adjust_storage_id()` in `row.rs` that MD5-hashes IDs > 64 chars before querying `oc_storages`, matching PHP exactly.
+
+**Files changed:**
+- `core-rs/crates/nc-dav/src/row.rs` — added `adjust_storage_id()`, used in `lookup_storage_id()`
+- `SPECS/01-requirements/requirements/09-database-schema.md` — documented `adjustStorageId` on `oc_storages.id`
+
+**Follow-up:** The `M` (mounted) flag check at `filesystem.rs:1846` does `!id.starts_with("home::")` — this check is against the **hashed** `id` for long-UID users, so it incorrectly reports a home mount as non-home.  This is cosmetic (UI hint only), but the check should reverse the hash or test the original unhashed candidate instead.

@@ -78,6 +78,7 @@ The Rust server manages the following tables (minimum required for core + files)
 **`oc_storages`**
 - `numeric_id` BIGINT PK AI
 - `id` VARCHAR(64) UNIQUE — e.g. `home::alice`, `object::store::s3::…`
+  - **`adjustStorageId`:** IDs longer than 64 characters are stored as their MD5 hex digest (`md5($id)`), per `\OC\Files\Cache\Storage::adjustStorageId` (`lib/private/Files/Cache/Storage.php:99-105`).  All Rust code that queries `oc_storages.id` MUST apply this same transform before the lookup.  For example, `home::6c21875f…` (70 chars with a 64-char OIDC UID) becomes `9516ebfeff194c67ea…` in the `id` column.
 - `available` SMALLINT
 - `last_checked` INT
 
