@@ -321,21 +321,59 @@ pub async fn count_children(
     }
 }
 
-/// Look up the display name for a user from `oc_users.displayname`.
+/// Look up the display name for a user, matching PHP's
+/// `$owner->getDisplayName()` → `IAccountManager` → `oc_accounts.data`,
+/// falling back to `oc_users.displayname`, and finally to the UID itself.
 ///
-/// Falls back to returning `uid` if no row exists or the `displayname` column
-/// is NULL or empty.  This is used for `{oc:}owner-display-name` (REQ §6.5).
+/// PHP's `oc_accounts` table stores account data as JSON in the `data` column:
+/// `{"displayname":{"value":"Tan Siew Kin",...},...}`.  The display name is
+/// resolved from `data->>'displayname'->>'value'` first, then from
+/// `oc_users.displayname` as a fallback.
 pub async fn lookup_user_display_name(pool: &DbPool, prefix: &str, uid: &str) -> String {
-    let sql = format!("SELECT displayname FROM {prefix}users WHERE uid = $1");
-    sqlx::query(&sql)
+    // 1. Try oc_accounts first (PHP IAccountManager path).
+    let accounts_sql = format!("SELECT data FROM {prefix}accounts WHERE uid = $1");
+    let accounts_data: Option<String> = sqlx::query_scalar(&accounts_sql)
         .bind(uid)
         .fetch_optional(pool)
         .await
         .ok()
-        .flatten()
-        .and_then(|r| r.get::<Option<String>, _>("displayname"))
+        .flatten();
+    if let Some(ref data) = accounts_data {
+        if let Some(dn) = extract_displayname_from_accounts_json(data) {
+            return dn;
+        }
+    }
+
+    // 2. Fall back to oc_users.displayname.
+    let users_sql = format!("SELECT displayname FROM {prefix}users WHERE uid = $1");
+    if let Ok(Some(dn)) = sqlx::query_scalar::<_, Option<String>>(&users_sql)
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+    {
+        if let Some(dn) = dn {
+            if !dn.is_empty() {
+                return dn;
+            }
+        }
+    }
+
+    // 3. Fall back to UID.
+    uid.to_string()
+}
+
+/// Extract the display name from an `oc_accounts.data` JSON value.
+///
+/// PHP stores: `{"displayname":{"value":"Tan Siew Kin","scope":"...","verified":"0"},...}`
+fn extract_displayname_from_accounts_json(data: &str) -> Option<String> {
+    // Use simple JSON parsing via serde_json.
+    let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
+    parsed
+        .get("displayname")?
+        .get("value")?
+        .as_str()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| uid.to_string())
+        .map(|s| s.to_string())
 }
 
 /// Look up the string ID for a storage row by its numeric ID.
@@ -669,6 +707,595 @@ pub async fn update_custom_properties_path_subtree(
             update_custom_properties_path(pool, prefix, userid, &old_child_path, &new_child_path)
                 .await;
     }
+}
+
+// ─── Phase 12.3: sharing mask (PHP SetupManager sharing_mask wrapper) ─────────
+
+/// Check whether sharing is disabled for a user, replicating PHP
+/// `ShareDisableChecker::sharingDisabledForUser()`.
+///
+/// Reads `shareapi_exclude_groups` and `shareapi_exclude_groups_list` from
+/// `oc_appconfig`, then checks the user's group membership in `oc_group_user`.
+///
+/// PHP's `sharing_mask` storage wrapper (`SetupManager.php:176-189`) wraps
+/// storages with `PermissionsMask(mask=PERMISSION_ALL-SHARE=15)` whenever this
+/// returns `true`, stripping the SHARE bit from every cache read.  Rust must
+/// replicate this check so permissions match PHP byte-for-byte.
+pub async fn sharing_disabled_for_user(pool: &DbPool, prefix: &str, uid: &str) -> bool {
+    // Read shareapi_exclude_groups from oc_appconfig.
+    let key = "shareapi_exclude_groups";
+    let sql = format!(
+        "SELECT configvalue FROM {prefix}appconfig WHERE appid = 'core' AND configkey = $1"
+    );
+    let exclude_groups: Option<String> = sqlx::query_scalar(&sql)
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+    match exclude_groups.as_deref() {
+        None | Some("no") | Some("") => {
+            // Sharing is not restricted by group — enabled for everyone.
+            false
+        }
+        Some(mode @ ("yes" | "allow")) => {
+            // Read the group list.
+            let list_sql = format!(
+                "SELECT configvalue FROM {prefix}appconfig WHERE appid = 'core' AND configkey = 'shareapi_exclude_groups_list'"
+            );
+            let list_val: Option<String> = sqlx::query_scalar(&list_sql)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+
+            let excluded_groups: Vec<String> = match list_val.as_deref() {
+                Some(s) if !s.is_empty() => {
+                    // PHP tries json_decode first, then explodes on comma.
+                    serde_json::from_str::<Vec<String>>(s)
+                        .unwrap_or_else(|_| s.split(',').map(|g| g.trim().to_string()).collect())
+                }
+                _ => vec![],
+            };
+
+            if excluded_groups.is_empty() {
+                return false;
+            }
+
+            // Query the user's group memberships.
+            let groups_sql = format!("SELECT gid FROM {prefix}group_user WHERE uid = $1");
+            let user_groups: Vec<String> = match sqlx::query_scalar::<_, String>(&groups_sql)
+                .bind(uid)
+                .fetch_all(pool)
+                .await
+            {
+                Ok(g) => g,
+                Err(_) => return false,
+            };
+
+            if mode == "allow" {
+                // Allowlist: sharing allowed only if user is in at least one allowed group.
+                // If user is in no groups at all, they can't be in an allowed group → disabled.
+                let in_allowed = user_groups.iter().any(|g| excluded_groups.contains(g));
+                !in_allowed
+            } else {
+                // Exclude mode: sharing disabled only if ALL user groups are excluded.
+                // PHP: if (!empty($usersGroups)) guards the diff; empty groups → falls
+                // through to return false (sharing NOT disabled).
+                if user_groups.is_empty() {
+                    false
+                } else {
+                    user_groups.iter().all(|g| excluded_groups.contains(g))
+                }
+            }
+        }
+        Some(other) => {
+            tracing::warn!(
+                %other,
+                "unexpected value for shareapi_exclude_groups; treating as sharing enabled"
+            );
+            false
+        }
+    }
+}
+
+/// Apply the sharing mask to raw `oc_filecache.permissions`, matching PHP's
+/// `PermissionsMask` storage wrapper (`SetupManager.php:176-189`).
+///
+/// When sharing is disabled for the user, the SHARE bit (16) is stripped.
+/// `PERMISSION_ALL - PERMISSION_SHARE = 31 - 16 = 15`.
+pub fn apply_sharing_mask(raw_permissions: i32, sharing_disabled: bool) -> i32 {
+    if sharing_disabled {
+        raw_permissions & 15 // PERMISSION_ALL - PERMISSION_SHARE
+    } else {
+        raw_permissions
+    }
+}
+
+// ─── Phase 12.4: share-permissions (PHP Node::getSharePermissions) ────────────
+
+/// Compute the `{ocs:}share-permissions` value matching PHP
+/// `Node::getSharePermissions()` (`apps/dav/lib/Connector/Sabre/Node.php:235-276`).
+///
+/// For non-shared storage (the only kind Rust supports today): returns the node's
+/// own `oc_filecache.permissions`, with DELETE|UPDATE OR-ed in for a non-moveable,
+/// non-readonly mount root, and CREATE|DELETE cleared for files.
+///
+/// Constants (from `\OCP\Constants`): READ=1, UPDATE=2, CREATE=4, DELETE=8, SHARE=16.
+pub fn compute_share_permissions(raw_permissions: i32, is_dir: bool, is_mount_root: bool) -> i32 {
+    let mut perms = raw_permissions;
+
+    // PHP lines 261-275: mount roots of non-moveable, non-readonly mounts
+    // always gain DELETE|UPDATE.  Home storage's "files" root satisfies this.
+    if is_mount_root {
+        perms |= 8 | 2; // PERMISSION_DELETE | PERMISSION_UPDATE
+    }
+
+    // PHP lines 280-282: files can't have CREATE or DELETE
+    if !is_dir {
+        perms &= !(4 | 8); // clear PERMISSION_CREATE | PERMISSION_DELETE
+    }
+
+    perms
+}
+
+/// Map an NC permission bitmask to OCM share-permissions JSON array string,
+/// matching PHP `FilesPlugin::ncPermissions2ocmPermissions()`.
+///
+/// SHARE(16) → "share", READ(1) → "read", CREATE(4)|UPDATE(2) → "write".
+pub fn permissions_to_ocm_json(permissions: i32) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if permissions & 16 != 0 {
+        parts.push("\"share\"");
+    }
+    if permissions & 1 != 0 {
+        parts.push("\"read\"");
+    }
+    if permissions & 4 != 0 || permissions & 2 != 0 {
+        parts.push("\"write\"");
+    }
+    format!("[{}]", parts.join(","))
+}
+
+// ─── Phase 12.5: share-types / sharees ─────────────────────────────────────────
+
+/// One share row for the `{oc:}share-types` and `{nc:}sharees` properties.
+#[derive(Debug, Clone)]
+pub struct ShareDetail {
+    pub share_type: i16,
+    pub share_with: Option<String>,
+    /// Resolved display name; falls back to `share_with` for non-user types.
+    pub share_with_displayname: String,
+}
+
+/// Return share details for a file node, matching PHP `SharesPlugin::getShare()`.
+///
+/// Queries shares **by** the user (`uid_owner` / `uid_initiator`) plus shares
+/// **with** the user (`share_with`), for all PHP share types (USER, GROUP, LINK,
+/// EMAIL, REMOTE, CIRCLE, ROOM, DECK).
+pub async fn get_share_details(
+    pool: &DbPool,
+    prefix: &str,
+    uid: &str,
+    fileid: i64,
+) -> Vec<ShareDetail> {
+    let sql = format!(
+        "SELECT DISTINCT share_type, share_with \
+         FROM {prefix}share \
+         WHERE file_source = $1 \
+         AND share_type IN (0,1,3,4,6,7,10,12) \
+         AND (uid_owner = $2 OR uid_initiator = $3 OR share_with = $4)",
+        prefix = prefix
+    );
+    let rows = match sqlx::query(&sql)
+        .bind(fileid)
+        .bind(uid)
+        .bind(uid)
+        .bind(uid)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(fileid, uid, error = %e, "get_share_details: SQL error");
+            return vec![];
+        }
+    };
+
+    // Batch-resolve display names for user-type shares (share_type = 0).
+    let user_withs: Vec<String> = rows
+        .iter()
+        .filter(|r| r.get::<i16, _>("share_type") == 0)
+        .filter_map(|r| r.get::<Option<String>, _>("share_with"))
+        .collect();
+    let display_names = if !user_withs.is_empty() {
+        batch_lookup_display_names(pool, prefix, &user_withs).await
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    rows.iter()
+        .map(|r| {
+            let share_type: i16 = r.get("share_type");
+            let share_with: Option<String> = r.get("share_with");
+            let displayname = match share_type {
+                0 => share_with
+                    .as_ref()
+                    .and_then(|sw| display_names.get(sw.as_str()).cloned())
+                    .unwrap_or_else(|| share_with.clone().unwrap_or_default()),
+                _ => share_with.clone().unwrap_or_default(),
+            };
+            ShareDetail {
+                share_type,
+                share_with,
+                share_with_displayname: displayname,
+            }
+        })
+        .collect()
+}
+
+async fn batch_lookup_display_names(
+    pool: &DbPool,
+    prefix: &str,
+    uids: &[String],
+) -> std::collections::HashMap<String, String> {
+    if uids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let mut display_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut unresolved: Vec<&String> = Vec::new();
+
+    // 1. Batch-query oc_accounts first (PHP IAccountManager path).
+    //    oc_accounts stores display names in JSON under data->'displayname'->>'value'.
+    let placeholders = uids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("${}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let accounts_sql = format!(
+        "SELECT uid, data FROM {prefix}accounts WHERE uid IN ({placeholders})",
+        prefix = prefix
+    );
+    let mut query = sqlx::query(&accounts_sql);
+    for uid in uids {
+        query = query.bind(uid);
+    }
+    let account_rows: Vec<(String, String)> = query
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            let uid: String = r.get("uid");
+            let data: String = r.get("data");
+            (uid, data)
+        })
+        .collect();
+    for (uid, data) in &account_rows {
+        if let Some(dn) = extract_displayname_from_accounts_json(data) {
+            display_names.insert(uid.clone(), dn);
+        }
+    }
+
+    // Collect UIDs not found in oc_accounts for the oc_users fallback.
+    for uid in uids {
+        if !display_names.contains_key(uid.as_str()) {
+            unresolved.push(uid);
+        }
+    }
+
+    // 2. Batch-query oc_users for remaining UIDs.
+    if !unresolved.is_empty() {
+        let users_placeholders = unresolved
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("${}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let users_sql = format!(
+            "SELECT uid, displayname FROM {prefix}users WHERE uid IN ({users_placeholders})",
+            prefix = prefix
+        );
+        let mut query = sqlx::query(&users_sql);
+        for uid in &unresolved {
+            query = query.bind(uid);
+        }
+        let user_rows = query.fetch_all(pool).await.unwrap_or_default();
+        for row in &user_rows {
+            let uid: String = row.get("uid");
+            let dn: Option<String> = row.get("displayname");
+            if let Some(dn) = dn.filter(|s| !s.is_empty()) {
+                display_names.entry(uid).or_insert(dn);
+            }
+        }
+        // 3. For any UIDs still unresolved, fall back to the UID itself.
+        for uid in &unresolved {
+            display_names.entry((*uid).clone()).or_insert_with(|| (*uid).clone());
+        }
+    }
+
+    // 4. For UIDs that had no oc_accounts row and no oc_users row, fall back to UID.
+    for uid in uids {
+        display_names.entry(uid.clone()).or_insert_with(|| uid.clone());
+    }
+
+    display_names
+}
+
+/// Format share types as XML matching PHP `ShareTypeList::xmlSerialize()`.
+///
+/// Empty when no shares → `<oc:share-types/>` (self-closing, handled by the
+/// fact we emit content as raw inner XML).
+pub fn format_share_types_xml(types: &[i32]) -> String {
+    if types.is_empty() {
+        return String::new();
+    }
+    let mut xml = String::new();
+    for t in types {
+        xml.push_str(&format!(
+            "<oc:share-type xmlns:oc=\"http://owncloud.org/ns\">{t}</oc:share-type>"
+        ));
+    }
+    xml
+}
+
+/// Format sharees as XML matching PHP `ShareeList::xmlSerialize()`.
+pub fn format_sharees_xml(details: &[ShareDetail]) -> String {
+    if details.is_empty() {
+        return String::new();
+    }
+    let mut xml = String::new();
+    for d in details {
+        xml.push_str(&format!(
+            "<nc:sharee xmlns:nc=\"http://nextcloud.org/ns\">\
+             <nc:id>{}</nc:id>\
+             <nc:display-name>{}</nc:display-name>\
+             <nc:type>{}</nc:type>\
+             </nc:sharee>",
+            d.share_with.as_deref().unwrap_or(""),
+            d.share_with_displayname,
+            d.share_type,
+        ));
+    }
+    xml
+}
+
+// ─── Phase 12.6: comments properties ───────────────────────────────────────────
+
+/// Return the number of top-level comments for a file, matching PHP
+/// `ICommentsManager::getNumberOfCommentsForObject('files', $id)`.
+pub async fn get_comments_count(pool: &DbPool, prefix: &str, fileid: i64) -> i64 {
+    let sql = format!(
+        "SELECT COUNT(*) FROM {prefix}comments \
+         WHERE object_type = 'files' AND object_id = $1",
+        prefix = prefix
+    );
+    sqlx::query_scalar::<_, Option<i64>>(&sql)
+        .bind(fileid.to_string())
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .unwrap_or(0)
+}
+
+/// Return the number of unread comments for a file and user, matching PHP
+/// `ICommentsManager::getNumberOfUnreadCommentsForObjects()`.
+pub async fn get_comments_unread(
+    pool: &DbPool,
+    prefix: &str,
+    fileid: i64,
+    uid: &str,
+) -> i64 {
+    let sql = format!(
+        "SELECT COUNT(*) FROM {prefix}comments c \
+         WHERE c.object_type = 'files' AND c.object_id = $1 \
+         AND c.actor_type = 'users' AND c.actor_id != $2 \
+         AND c.creation_timestamp > COALESCE( \
+             (SELECT marker_datetime FROM {prefix}comments_read_markers \
+              WHERE user_id = $3 AND object_type = 'files' AND object_id = $4), \
+             TIMESTAMP '1970-01-01 00:00:00' \
+         )",
+        prefix = prefix
+    );
+    sqlx::query_scalar::<_, Option<i64>>(&sql)
+        .bind(fileid.to_string())
+        .bind(uid)
+        .bind(uid)
+        .bind(fileid.to_string())
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .unwrap_or(0)
+}
+
+/// Build the `{oc:}comments-href` URL, matching PHP
+/// `CommentPropertiesPlugin::getCommentsLink()`.
+///
+/// The format is: `{base_url}/remote.php/dav/comments/files/{fileid}`
+pub fn build_comments_href(base_url: &str, fileid: i64) -> String {
+    let base = base_url.trim_end_matches('/');
+    format!("{base}/remote.php/dav/comments/files/{fileid}")
+}
+
+/// Batch query for comments counts across multiple file IDs.
+///
+/// Returns a `HashMap<fileid, count>`.  Files with no comments are absent.
+pub async fn batch_comments_counts(
+    pool: &DbPool,
+    prefix: &str,
+    fileids: &[i64],
+) -> std::collections::HashMap<i64, i64> {
+    if fileids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let placeholders = fileids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("${}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT object_id, COUNT(*) AS cnt FROM {prefix}comments \
+         WHERE object_type = 'files' AND object_id IN ({placeholders}) \
+         GROUP BY object_id",
+        prefix = prefix
+    );
+    let mut query = sqlx::query(&sql);
+    for id in fileids {
+        query = query.bind(id.to_string());
+    }
+    query
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            let object_id: String = r.get("object_id");
+            let cnt: i64 = r.get("cnt");
+            object_id.parse::<i64>().ok().map(|fid| (fid, cnt))
+        })
+        .collect()
+}
+
+/// Batch query for unread comments counts across multiple file IDs for a user.
+pub async fn batch_comments_unread(
+    pool: &DbPool,
+    prefix: &str,
+    fileids: &[i64],
+    uid: &str,
+) -> std::collections::HashMap<i64, i64> {
+    if fileids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    // For each file, count comments whose creation_timestamp exceeds the user's
+    // read marker.  We process per-file since the marker query is per-file.
+    let mut map = std::collections::HashMap::new();
+    for &fid in fileids {
+        let fid_str = fid.to_string();
+        let sql = format!(
+            "SELECT COUNT(*) FROM {prefix}comments \
+             WHERE object_type = 'files' AND object_id = $1 \
+             AND actor_type = 'users' AND actor_id != $2 \
+             AND creation_timestamp > COALESCE( \
+                 (SELECT marker_datetime FROM {prefix}comments_read_markers \
+                  WHERE user_id = $3 AND object_type = 'files' AND object_id = $4), \
+                 TIMESTAMP '1970-01-01 00:00:00' \
+             )",
+            prefix = prefix
+        );
+        if let Ok(Some(cnt)) = sqlx::query_scalar::<_, Option<i64>>(&sql)
+            .bind(&fid_str)
+            .bind(uid)
+            .bind(uid)
+            .bind(&fid_str)
+            .fetch_optional(pool)
+            .await
+        {
+            if let Some(c) = cnt {
+                if c > 0 {
+                    map.insert(fid, c);
+                }
+            }
+        }
+    }
+    map
+}
+
+// ─── Phase 12.7: system tags ───────────────────────────────────────────────────
+
+/// One system tag row from `oc_systemtag` joined with `oc_systemtag_object_mapping`.
+#[derive(Debug, Clone)]
+pub struct SystemTagRow {
+    pub id: i64,
+    pub name: String,
+    pub user_visible: bool,
+    pub user_assignable: bool,
+    pub color: Option<String>,
+}
+
+/// Return system tags for a file, matching PHP `SystemTagPlugin::getTagsForFile()`.
+///
+/// Tags are filtered for user visibility and sorted by natural-sort name
+/// (we approximate with case-insensitive alphanumeric order).
+pub async fn get_system_tags_for_file(
+    pool: &DbPool,
+    prefix: &str,
+    fileid: i64,
+) -> Vec<SystemTagRow> {
+    let sql = format!(
+        "SELECT t.id, t.name, t.visibility, t.editable, t.color \
+         FROM {prefix}systemtag t \
+         JOIN {prefix}systemtag_object_mapping m \
+           ON m.systemtagid = t.id \
+         WHERE m.objectid = $1 AND m.objecttype = 'files' \
+         AND t.visibility = 1 \
+         ORDER BY LOWER(t.name)",
+        prefix = prefix
+    );
+    match sqlx::query(&sql)
+        .bind(fileid.to_string())
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows
+            .iter()
+            .map(|r| SystemTagRow {
+                id: r.get("id"),
+                name: r.get("name"),
+                user_visible: r.get::<i16, _>("visibility") == 1,
+                user_assignable: r.get::<i16, _>("editable") == 1,
+                color: r.get("color"),
+            })
+            .collect(),
+        Err(e) => {
+            tracing::error!(fileid, error = %e, "get_system_tags_for_file: SQL error");
+            vec![]
+        }
+    }
+}
+
+/// Format system tags as XML matching PHP `SystemTagList::xmlSerialize()`.
+///
+/// PHP wraps in `<nc:system-tags>` with child `<nc:system-tag>` elements.
+/// Each tag element contains `{oc:}id`, `{nc:}display-name`, `{nc:}user-visible`,
+/// `{nc:}user-assignable`, `{nc:}can-assign`, and optionally `{nc:}color`.
+pub fn format_system_tags_xml(tags: &[SystemTagRow], _can_assign_all: bool) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    let mut xml = String::new();
+    for t in tags {
+        let color_attr = t
+            .color
+            .as_ref()
+            .filter(|c| !c.is_empty())
+            .map(|c| format!("<nc:color>{c}</nc:color>"))
+            .unwrap_or_default();
+        xml.push_str(&format!(
+            "<nc:system-tag xmlns:nc=\"http://nextcloud.org/ns\">\
+             <oc:id xmlns:oc=\"http://owncloud.org/ns\">{id}</oc:id>\
+             <nc:display-name>{name}</nc:display-name>\
+             <nc:user-visible>{uv}</nc:user-visible>\
+             <nc:user-assignable>{ua}</nc:user-assignable>\
+             <nc:can-assign>{ua}</nc:can-assign>\
+             {color}\
+             </nc:system-tag>",
+            id = t.id,
+            name = t.name,
+            uv = if t.user_visible { "true" } else { "false" },
+            ua = if t.user_assignable { "true" } else { "false" },
+            color = color_attr,
+        ));
+    }
+    xml
 }
 
 // ─── private helper ───────────────────────────────────────────────────────────

@@ -1790,7 +1790,7 @@ impl DavFileSystem for NcFileSystem {
     ) -> FsFuture<'a, Vec<DavProp>> {
         async move {
             let fc_path = self.to_fc_path(path);
-            let meta = match self.load_meta(&fc_path).await {
+            let mut meta = match self.load_meta(&fc_path).await {
                 Some(m) => m,
                 None => return Ok(vec![]),
             };
@@ -1847,15 +1847,48 @@ impl DavFileSystem for NcFileSystem {
                     .unwrap_or(false)
             };
 
-            // `share_permissions`: MAX(permissions) from oc_share for this
-            // file and the authenticated user.  Default 31 (all) when no row.
-            let share_permissions = row::get_share_max_permissions(
+            // is_shared: false for home-storage nodes — the file is the user's own.
+            // Shared nodes (from oc_share) are detected via is_mounted/share_permissions.
+            // Declared early so share_permissions computation can branch on it.
+            let is_shared = false;
+
+            // ── Phase 12.3: sharing mask — match PHP's sharing_mask storage wrapper.
+            // PHP's SetupManager wraps storages with PermissionsMask(mask=15) when
+            // sharing is disabled, stripping SHARE from every cache read.  Apply
+            // the same mask so Rust's {oc:}permissions and {ocs:}share-permissions
+            // match PHP byte-for-byte.
+            let sharing_disabled = row::sharing_disabled_for_user(
                 &self.state.pool,
                 &self.state.table_prefix,
                 &self.uid,
-                meta.fileid,
             )
             .await;
+            let effective_permissions = row::apply_sharing_mask(meta.permissions, sharing_disabled);
+            // Update meta so build_props() uses the masked permissions for {oc:}permissions.
+            meta.permissions = effective_permissions;
+
+            // ── Phase 12.4: share_permissions — match PHP Node::getSharePermissions().
+            // For non-shared nodes (home storage) use the node's own (masked) permissions,
+            // with DELETE|UPDATE OR-ed for the mount root, and CREATE|DELETE
+            // cleared for files.  For shared nodes (future) use the share's mask.
+            let is_mount_root = matches!(meta.path.as_deref(), Some("") | Some("files"));
+            let share_permissions = if is_shared {
+                // Shared node: use the share's permissions from oc_share.
+                row::get_share_max_permissions(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    &self.uid,
+                    meta.fileid,
+                )
+                .await
+            } else {
+                // Own file: derive from the node's (masked) permissions.
+                row::compute_share_permissions(effective_permissions, meta.is_dir_flag, is_mount_root)
+            };
+
+            // ── Phase 12.4: OCM share-permissions JSON ─────────────────────
+            let ocm_share_permissions =
+                row::permissions_to_ocm_json(share_permissions);
 
             // `note`: most-recent non-empty share note for this file.
             let note =
@@ -1882,9 +1915,6 @@ impl DavFileSystem for NcFileSystem {
                 };
 
             let instance_id = &self.state.instance_id;
-            // is_shared: false for home-storage nodes — the file is the user's own.
-            // Shared nodes (from oc_share) are detected via is_mounted/share_permissions.
-            let is_shared = false;
 
             // §10.12 / §11.1: compute {nc:}has-preview from mimetype + the resolved
             // provider registry (enabledPreviewProviders gating, Imaginary, binaries).
@@ -1902,6 +1932,53 @@ impl DavFileSystem for NcFileSystem {
                 &self.tag_cache,
             )
             .await;
+
+            // ── PHASE-12.5: share-types / sharees ──────────────────────────
+            let share_details = row::get_share_details(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.uid,
+                meta.fileid,
+            )
+            .await;
+            let mut share_types: Vec<i32> = share_details
+                .iter()
+                .map(|d| d.share_type as i32)
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            share_types.sort_unstable();
+            let share_types_xml = row::format_share_types_xml(&share_types);
+            let sharees_xml = row::format_sharees_xml(&share_details);
+
+            // ── PHASE-12.6: comments properties ────────────────────────────
+            let (comments_count, comments_unread, comments_href) = if do_content {
+                let count = row::get_comments_count(&self.state.pool, &self.state.table_prefix, meta.fileid).await;
+                let unread = row::get_comments_unread(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    meta.fileid,
+                    &self.uid,
+                )
+                .await;
+                let href = if !self.state.base_url.is_empty() {
+                    row::build_comments_href(&self.state.base_url, meta.fileid)
+                } else {
+                    String::new()
+                };
+                (count, unread, href)
+            } else {
+                (0, 0, String::new())
+            };
+
+            // ── PHASE-12.7: system tags ────────────────────────────────────
+            let system_tags_xml = if do_content {
+                let tags =
+                    row::get_system_tags_for_file(&self.state.pool, &self.state.table_prefix, meta.fileid).await;
+                row::format_system_tags_xml(&tags, true)
+            } else {
+                String::new()
+            };
 
             let mut props = crate::props::build_props(
                 &meta,
@@ -1921,6 +1998,22 @@ impl DavFileSystem for NcFileSystem {
                 &tag_info.tags,
                 tag_info.is_favorite,
             );
+
+            // ── Append Phase 12 extended properties ──────────────────────────
+            if do_content {
+                crate::props::add_phase12_props(
+                    &mut props,
+                    &crate::props::Phase12PropCtx {
+                        ocm_share_permissions: &ocm_share_permissions,
+                        share_types_xml: &share_types_xml,
+                        sharees_xml: &sharees_xml,
+                        comments_count,
+                        comments_unread,
+                        comments_href: &comments_href,
+                        system_tags_xml: &system_tags_xml,
+                    },
+                );
+            }
 
             // ── Append custom properties from oc_properties (task §10.11) ─────
             if do_content {

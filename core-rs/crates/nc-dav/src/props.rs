@@ -35,6 +35,8 @@ pub const OC_NS: &str = "http://owncloud.org/ns";
 pub const NC_NS: &str = "http://nextcloud.org/ns";
 /// OCS (Open Collaboration Services) namespace — used for `{ocs:}share-permissions`.
 pub const OCS_NS: &str = "http://open-collaboration-services.org/ns";
+/// OCM (Open Cloud Mesh) namespace — used for `{ocm:}share-permissions`.
+pub const OCM_NS: &str = "http://open-cloud-mesh.org/ns";
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -115,16 +117,18 @@ pub fn build_props(
     let is_mount_root_str = if is_mount_root { "true" } else { "false" };
 
     // {DAV:}displayname — PHP: FilesPlugin.php:470-472 emits $node->getName(),
-    // which is FileInfo::getName() (FileInfo.php:136-139): oc_filecache.name
-    // when non-empty, else basename(path). For the home DAV root the cache
-    // name is empty and PHP's tree resolves the name to the UID (the root
-    // node is the user folder itself) — mirror that exactly: cached name
-    // first, mount-root → uid, then basename(path) as the last fallback.
+    // which is FileInfo::getName() (FileInfo.php:136-139): the cached name in
+    // oc_filecache.name, or basename(path) when empty.  For the home DAV root
+    // the cache name is "files" but PHP's FileInfo::getName() returns the UID
+    // here because View::getFileInfo() overrides the root's name to basename(path)
+    // only when internalPath is empty and the cached name is non-empty — the
+    // net result is UID at the mount root.  Mirror that: mount-root → uid first,
+    // then cached name, then basename(path).
     // PHASE-12.2.
-    let displayname_val: &str = if !meta.display_name.is_empty() {
-        meta.display_name.as_str()
-    } else if is_mount_root {
+    let displayname_val: &str = if is_mount_root {
         uid
+    } else if !meta.display_name.is_empty() {
+        meta.display_name.as_str()
     } else {
         meta.path
             .as_deref()
@@ -288,6 +292,85 @@ pub fn build_props(
     props
 }
 
+// ─── Phase 12 extended properties ──────────────────────────────────────────────
+
+/// Grouped parameters for Phase 12 PROPFIND properties that are populated from
+/// additional tables beyond `oc_filecache`.
+pub struct Phase12PropCtx<'a> {
+    /// `{ocm:}share-permissions` — JSON array of OCM permission strings.
+    /// Matches PHP `FilesPlugin::ncPermissions2ocmPermissions()`.
+    pub ocm_share_permissions: &'a str,
+    /// Inner XML for `{oc:}share-types` (child `<oc:share-type>` elements).
+    /// Empty when no shares → self-closing element.
+    pub share_types_xml: &'a str,
+    /// Inner XML for `{nc:}sharees` (child `<nc:sharee>` elements).
+    pub sharees_xml: &'a str,
+    /// `{oc:}comments-count` — number of top-level comments for the node.
+    pub comments_count: i64,
+    /// `{oc:}comments-unread` — unread comments for the requesting user.
+    pub comments_unread: i64,
+    /// `{oc:}comments-href` — URL to the comments DAV endpoint.
+    pub comments_href: &'a str,
+    /// Inner XML for `{nc:}system-tags` (child `<nc:system-tag>` elements).
+    /// Empty when no tags → self-closing element.
+    pub system_tags_xml: &'a str,
+}
+
+/// Append all Phase 12 extended properties to the prop list.
+///
+/// Separated from `build_props` so the existing signature and all its tests
+/// stay untouched. Properties are appended with PHP-semantics: empty strings
+/// produce the correct self-closing elements (e.g. `<oc:share-types/>`).
+pub fn add_phase12_props(props: &mut Vec<DavProp>, ctx: &Phase12PropCtx<'_>) {
+    // {ocm:}share-permissions — JSON array (PHASE-12.4).
+    props.push(make_prop(
+        "share-permissions",
+        "ocm",
+        OCM_NS,
+        ctx.ocm_share_permissions,
+    ));
+
+    // {oc:}share-types — always 200, self-closing when empty (PHASE-12.5).
+    props.push(make_prop("share-types", "oc", OC_NS, ctx.share_types_xml));
+
+    // {nc:}sharees — always 200, self-closing when empty (PHASE-12.5).
+    props.push(make_prop("sharees", "nc", NC_NS, ctx.sharees_xml));
+
+    // {oc:}comments-count — always int (PHASE-12.6).
+    props.push(make_prop(
+        "comments-count",
+        "oc",
+        OC_NS,
+        &ctx.comments_count.to_string(),
+    ));
+
+    // {oc:}comments-unread — always int (PHASE-12.6).
+    props.push(make_prop(
+        "comments-unread",
+        "oc",
+        OC_NS,
+        &ctx.comments_unread.to_string(),
+    ));
+
+    // {oc:}comments-href — only when non-empty (PHASE-12.6).
+    if !ctx.comments_href.is_empty() {
+        props.push(make_prop(
+            "comments-href",
+            "oc",
+            OC_NS,
+            ctx.comments_href,
+        ));
+    }
+
+    // {nc:}system-tags — always 200, self-closing when empty (PHASE-12.7).
+    props.push(make_prop(
+        "system-tags",
+        "nc",
+        NC_NS,
+        ctx.system_tags_xml,
+    ));
+}
+
 // ─── Permission encoding ──────────────────────────────────────────────────────
 
 /// Encode an `oc_filecache.permissions` bitmask to the Nextcloud permission
@@ -419,6 +502,11 @@ fn prop_names() -> Vec<DavProp> {
         name_only("tags", "oc", OC_NS),
         name_only("favorite", "oc", OC_NS),
         name_only("share-permissions", "ocs", OCS_NS),
+        name_only("share-permissions", "ocm", OCM_NS),
+        name_only("share-types", "oc", OC_NS),
+        name_only("comments-count", "oc", OC_NS),
+        name_only("comments-href", "oc", OC_NS),
+        name_only("comments-unread", "oc", OC_NS),
         name_only("has-preview", "nc", NC_NS),
         name_only("creation_time", "nc", NC_NS),
         name_only("upload_time", "nc", NC_NS),
@@ -432,6 +520,8 @@ fn prop_names() -> Vec<DavProp> {
         name_only("note", "nc", NC_NS),
         name_only("hidden", "nc", NC_NS),
         name_only("share-attributes", "nc", NC_NS),
+        name_only("sharees", "nc", NC_NS),
+        name_only("system-tags", "nc", NC_NS),
         // {nc:}acl-can-* and {nc:}remind-me-at are not PHP-core properties
         // (PHASE-12.1) — removed.
         name_only("displayname", "D", "DAV:"),
