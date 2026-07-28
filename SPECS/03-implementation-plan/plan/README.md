@@ -20,5 +20,6 @@ Split from the original `IMPL_PLAN.md` (Rust Nextcloud Core+Files Implementation
 - [`12-existing-tests-you-can-directly-reuse.md`](12-existing-tests-you-can-directly-reuse.md) — Existing tests you can directly reuse
 - [`13-future-considerations-architectural-evolution.md`](13-future-considerations-architectural-evolution.md) — Future Considerations: Architectural Evolution
 - [`14-native-preview-thumbnail-fast-path.md`](14-native-preview-thumbnail-fast-path.md) — 9) Native preview / thumbnail fast path
+- [`15-edge-security-hardening.md`](15-edge-security-hardening.md) — 10) Edge security hardening (PHP-FPM forwarding path)
 
 Back: [`../README.md`](../README.md)
