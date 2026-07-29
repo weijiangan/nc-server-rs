@@ -37,7 +37,7 @@
 
 ## Project Context
 
-- **Workspace**: `~/Git/nextcloud-rewrite/nextcloud-docker-dev/workspace/server/` contains the PHP reference implementation
+- **Workspace**: `~/Git/nextcloud-rewrite/nextcloud-docker-dev/workspace/server/` contains the PHP reference implementation. All PHP source references in this codebase were originally based on commit `e2dc439c7157e6864313d19e90e626a5db7f20bf`; the workspace is now at `1a0ccac96f9b4a0682c60eac550c0eb03294626b` — verify against the current state when tracing PHP behavior.
 - **Database**: `docker exec master-database-pgsql-1 psql -U postgres -d nextcloud` for live schema verification
 - **Migrations**: `core-rs/migrations/` are exercised against SQLite in tests; production PostgreSQL schemas are created by PHP Doctrine migrations
 - **Packaging**: `core-rs/packaging/` contains an Arch Linux PKGBUILD that copies the real source tree at build time (`prepare()` copies from the parent `core-rs/` directory).  The `packaging/src/` subtree is a stale build artifact — **do not** update it after code changes; it will be refreshed on the next package build.
