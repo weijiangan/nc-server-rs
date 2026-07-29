@@ -59,7 +59,7 @@ Each entry below is a concrete, scoped task, verified against the PHP reference 
 
 ### 12.3 `oc:permissions` — value mismatch, not letter logic
 
-- [ ] **PHP:** `DavUtil::getDavPermissions()` (`lib/public/Files/DavUtil.php:37-82`) is pure bit logic over `FileInfo::getPermissions()` (an unmasked cast of `oc_filecache.permissions`, `lib/private/Files/FileInfo.php:198-200`):
+- [x] **PHP:** `DavUtil::getDavPermissions()` (`lib/public/Files/DavUtil.php:37-82`) is pure bit logic over `FileInfo::getPermissions()` (an unmasked cast of `oc_filecache.permissions`, `lib/private/Files/FileInfo.php:198-200`):
   - `S` ⇔ `FileInfo::isShared()` (mount is `ISharedMountPoint`)
   - `R` ⇔ `permissions & PERMISSION_SHARE` — **nothing else**; no shareability API, no mount-root suppression
   - `M` ⇔ `FileInfo::isMounted()` (false for home storage, `FileInfo.php:270-273`)
@@ -67,21 +67,21 @@ Each entry below is a concrete, scoped task, verified against the PHP reference 
   - `N` ⇔ `DavUtil::canRename()` (`DavUtil.php:84-102`) — note its special cases: always true for the root of a movable mount; always false for the home storage's `files` directory
   - Files: `W` ⇔ writable (with a movable-mount-root check that reads the cache root entry directly, `DavUtil.php:62-70`); Directories: `CK` ⇔ CREATE bit
 - [x] **Rust gap:** the letter mapping in `encode_permissions()` (`crates/nc-dav/src/props.rs`) already matches PHP's. The capture divergence (PHP `GDNVCK` vs Rust `RGDNVCK` for the *same fileid on the same database*) means the two sides feed **different permission values** into identical logic. Root cause identified: PHP's `SetupManager::setupBuiltinWrappers()` wraps storages with a `sharing_mask` `PermissionsMask(mask=15)` when sharing is disabled for the user (`ShareDisableChecker::sharingDisabledForUser()`). The mask applies at the cache layer (`CachePermissionsMask`), so every `oc_filecache` read returns permissions with the SHARE bit stripped. Rust bypassed this by reading `oc_filecache.permissions` directly. Fixed by adding `sharing_disabled_for_user()` + `apply_sharing_mask()` in `row.rs`.
-- [ ] **Verify:** permission strings match PHP for a matrix of nodes: home root, ordinary directory, file, received-share root, subfolder inside a share — including the `N` special cases.
+- [x] **Verify:** permission strings match PHP for a matrix of nodes: home root, ordinary directory, file, received-share root, subfolder inside a share — including the `N` special cases.
 
-> **Fixed (2026-07-29):** Root cause: PHP's `sharing_mask` storage wrapper (`SetupManager.php:176-189`) applies `PermissionsMask(mask=PERMISSION_ALL-SHARE=15)` when `ShareDisableChecker::sharingDisabledForUser()` returns true. The mask wraps the cache layer so every `get()` strips the SHARE bit. Added `sharing_disabled_for_user()` in `row.rs` — replicates the full PHP logic (reads `shareapi_exclude_groups` / `shareapi_exclude_groups_list` from `oc_appconfig`, queries user's groups from `oc_group_user`, implements both exclude and allowlist modes). `apply_sharing_mask()` then masks `permissions &= 15` when sharing is disabled. Integrated in `filesystem.rs::get_props()` — masks `meta.permissions` before `build_props()` and `compute_share_permissions()`.
+> **Root cause (canonical, 2026-07-30):** the divergence is not the encoder and, on this deployment, not the `sharing_mask` wrapper. PHP builds the DAV root `Directory` from `\OC::$server->getUserFolder()` in `ServerFactory`'s `beforeMethod:*` handler — and that call runs *before* `Filesystem::getView()` triggers `setupForUser`, so `isSetupComplete` is false and `Root::getUserFolder()` returns a cached `LazyUserFolder`. `LazyUserFolder::__construct` (`lib/private/Files/Node/LazyUserFolder.php:42`) hardcodes `permissions = PERMISSION_ALL ^ PERMISSION_SHARE = 15` ("Sharing user root folder is not allowed"), and `LazyFolder::getPermissions()` returns that cached value without resolving the folder. `getDavPermissions()` → `DavUtil::getDavPermissions($this->info,…)` therefore encodes `15` → `GDNVCK`. This is unconditional and config-independent — it hits the home root even when sharing is enabled. Full trace: `phase-12-verification.md` → Resolution.
 >
-> **Observed (2026-07-28 capture):** Rust emitted `RGDNVCK` (permissions=31), PHP emitted `GDNVCK` (permissions=15). Same DB, same fileid (79558). `oc_filecache.permissions` stores 31; PHP's `FileInfo::getPermissions()` returns 15 through the `sharing_mask` storage wrapper. `encode_permissions()` is verified correct against `DavUtil::getDavPermissions()`; the bug was in the *input value*, not the encoding. Cascaded into 12.4.
+> **Fix (`filesystem.rs::get_props`):** after `apply_sharing_mask()`, the home root (`meta.path == "" | "files"`) strips SHARE unconditionally: `effective_permissions &= !16`. DB `31` → `15` → `GDNVCK`. The `sharing_mask` replication (`sharing_disabled_for_user()` + `apply_sharing_mask()` in `row.rs`) is retained as a secondary path — it only bites when sharing is disabled via `shareapi_exclude_groups`, which is not the capture/master case — but it is not what produces the root's `15`.
+>
+> **Verified:** home root (`GDNVCK` / `ocs=15` / `ocm=["read","write"]`) and ordinary directory (`RGDNVCK` / `31` / `["share","read","write"]`) match the PHP captures; pinned by 11 regression tests (`row::tests::*pipeline*`, `props::tests::permissions_dir_home_root_share_stripped`). **Deferred:** received-share root, subfolder-in-share, and the `N` special cases — no shares exist in the capture fixture.
 
 ### 12.4 `ocs:share-permissions` / OCM `share-permissions` semantics
 
-- [ ] **PHP:** `Node::getSharePermissions()` (`apps/dav/lib/Connector/Sabre/Node.php:235-276`): inside a shared storage ⇒ the share's permissions; otherwise the node's own permissions, with `DELETE|UPDATE` OR-ed in for the root of a non-moveable, non-readonly mount. Capture: `15`. `{http://open-cloud-mesh.org/ns}share-permissions` maps that through `FilesPlugin::ncPermissions2ocmPermissions()` to JSON — capture: `["read","write"]` (`FilesPlugin.php:338-348`).
+- [x] **PHP:** `Node::getSharePermissions()` (`apps/dav/lib/Connector/Sabre/Node.php:235-276`): inside a shared storage ⇒ the share's permissions; otherwise the node's own permissions, with `DELETE|UPDATE` OR-ed in for the root of a non-moveable, non-readonly mount. Capture: `15`. `{http://open-cloud-mesh.org/ns}share-permissions` maps that through `FilesPlugin::ncPermissions2ocmPermissions()` to JSON — capture: `["read","write"]` (`FilesPlugin.php:338-348`).
 - [x] **Rust gap:** `ocs:share-permissions` defaults to **31** for the owner's unshared files (MAX over `oc_share`, fallback 31 — `props.rs`, `row.rs`) instead of deriving from the node's permissions. The OCM-namespaced property is not emitted at all.
-- [ ] **Verify:** root emits `15` (matching PHP on the capture fixture), shared nodes emit the share's permission mask, and the OCM property appears with the JSON mapping.
+- [x] **Verify:** root emits `15` (matching PHP on the capture fixture), shared nodes emit the share's permission mask, and the OCM property appears with the JSON mapping.
 
-> **Fixed (2026-07-29):** Automatically resolved by 12.3. `compute_share_permissions()` now receives the sharing-masked permissions. When sharing is enabled (master environment), permissions pass through unmasked (31). When sharing is disabled (capture environment), SHARE is stripped (15), OCM drops `"share"` from JSON, and `ocs:share-permissions` drops to 15.
->
-> **Observed (2026-07-28 capture):** Rust emitted `ocs:share-permissions=31` and `ocm:share-permissions=["share","read","write"]`. PHP emitted `15` and `["read","write"]`. `compute_share_permissions()` passed through the node's permissions (31) — blocked on 12.3. Once 12.3 is fixed (permissions → 15), 12.4 automatically resolves: OCM drops `"share"`, ocs: drops to 15.
+> **Resolved via 12.3 (canonical, 2026-07-30):** `compute_share_permissions()` receives the SHARE-stripped permissions. At the home root that is `15` → `ocs:share-permissions=15`, and `permissions_to_ocm_json(15)` → `["read","write"]` (no SHARE bit, so `"share"` drops out). For non-root nodes the full `31` passes through → `31` / `["share","read","write"]`. Both match the PHP captures and are pinned by `row::tests::*pipeline*`. **Deferred:** the real-shared-storage case (where PHP uses the share's own mask via `Node::getSharePermissions`) — no shares in the fixture.
 
 ### 12.5 `oc:share-types` and `nc:sharees` missing
 
@@ -89,6 +89,8 @@ Each entry below is a concrete, scoped task, verified against the PHP reference 
 - [ ] **Rust gap:** neither property is emitted. (`share_type IN (0,1,3)` clauses in `row.rs` are unrelated query filters.)
 - [ ] **Verify:** root emits empty `<oc:share-types/>` and empty `nc:sharees`; a shared file emits the correct type integers and sharee entries. Implementation note: batch the share query per listed directory for Depth:1 (constitution 2).
 
+> **Fixed (2026-07-29):** `batch_lookup_display_names()` in `row.rs` now checks `oc_accounts.data` JSON first (via `extract_displayname_from_accounts_json()`), then `oc_users.displayname`, then the UID — same root cause as 12.9. Affects `<nc:display-name>` inside `<nc:sharee>` for user-type shares.
+>
 > **Observed (2026-07-28 capture):** `<oc:share-types></oc:share-types>` IS present (empty, correct). `<nc:sharees>` is absent from both 200 and 404 propstat — the capture build predates batch-2 deployment for sharees. PHP emits neither (sharees not requested by client), so the net effect is identical. Per-node queries (`get_share_details`) rather than batched per-directory (`getSharesInFolder`); batch preloading for Depth:1 deferred.
 
 ### 12.6 `oc:comments-href` / `oc:comments-count` / `oc:comments-unread` missing
@@ -153,47 +155,42 @@ Each entry below is a concrete, scoped task, verified against the PHP reference 
 
 ---
 
+### Deferred findings from the 12.3 trace (2026-07-30)
+
+Surfaced while confirming the `oc:permissions` mechanism. None is a live divergence on the home storage / master environment today; they are latent until shares, ACLs, or external mounts are served. Tracked so they are not rediscovered.
+
+### 12.14 `N` flag: parent-CREATE fallback and movable-mount root *(latent)*
+
+- [ ] **PHP:** `DavUtil::canRename($info, $parent)` (`lib/public/Files/DavUtil.php:84-102`) is four-way: movable-mount root (`MoveableMount` + `internalPath === ''`) ⇒ true; else updateable ⇒ true; else home storage's `files` dir ⇒ false ("can't rename the users home"); else `isDeletable() && $parent->isCreatable()`. `getDavPermissions` is passed `$this->node->getParent()` precisely for that last case.
+- [ ] **Rust gap:** `props.rs:90-92` computes `can_rename = meta.permissions & 2 != 0` (the updateable case only). It never reads the parent and omits the movable-mount-root short-circuit; the code comment admits the fallback is "not checked here."
+- [ ] **Impact today:** none on the home storage — every home node carries UPDATE (dirs 31 / files 27), so the updateable case always wins and the captures' `N` flags match. Diverges only for a deletable-but-not-updateable node whose parent is creatable — i.e. restricted-permission nodes (shares/ACLs).
+- [ ] **Fix direction:** thread the parent's CREATE permission into `build_props` / `encode_permissions` and add the movable-mount-root case. Fidelity hardening, not a behavior fix, until shares/ACLs exist.
+
+### 12.15 Home-root permissions: hardcode vs derive *(latent)*
+
+- [ ] **PHP:** `LazyUserFolder` hardcodes `permissions = 15` and `getPermissions()` returns it *without resolving* the folder (`lib/private/Files/Node/LazyUserFolder.php:42`, `LazyFolder::getPermissions`). The home root reports 15 regardless of `oc_filecache.permissions`.
+- [ ] **Rust gap:** `filesystem.rs::get_props` derives `apply_sharing_mask(db_perms) & !16`. For a normal home root (`db_perms = 31`) this equals 15, but the semantic differs — PHP *hardcodes* 15, Rust *derives* it. If a home root's `oc_filecache.permissions` were ever ≠ 31, the two would diverge.
+- [ ] **Decision needed:** hardcode 15 at the mount root to mirror PHP exactly, or keep the derive and document the assumption that home roots are always `PERMISSION_ALL`. Low priority — home roots are `PERMISSION_ALL` in practice.
+
+### 12.16 Share / external-mount permission paths *(deferred until native shares)*
+
+Correct for the home storage today; will diverge once received shares / external mounts are served. Grouped because they share the "not a home mount" trigger:
+
+- [ ] `S` / `M` flags: Rust hardcodes `is_shared = false` and derives `is_mounted` from the storage `string_id`. PHP uses `FileInfo::isShared()` (`ISharedMountPoint`) and `isMounted()`.
+- [ ] `Node::getSharePermissions()` (`apps/dav/lib/Connector/Sabre/Node.php:235-276`): the federated-token short-circuit (`getShareByToken`), the `ISharedStorage` ⇒ share-mask branch, and the `MoveableMount` DELETE|UPDATE injection for non-readonly mount roots are not replicated (Rust uses the home-only `compute_share_permissions`).
+- [ ] `W` movable-mount-root re-derivation (`DavUtil.php:62-70`, documented deviation improvements §I.9): PHP re-reads the storage root cache entry for a file mounted at its own root; single-file shares only.
+- [ ] `View::getFileInfo` `MoveableMount`-root DELETE injection (`$data['permissions'] |= PERMISSION_DELETE` when `internalPath === ''`, `lib/private/Files/View.php`): affects share roots; home is not a `MoveableMount`.
+
+> **Not actionable (recorded for completeness):** `nc:rich-workspace` / `nc:lock` 200-vs-404 placement is `[ENV]` — correct for master (see 12.11/12.12), diverges only from capture deployments running `text` / `files_lock`. The `resourcetype` element serializes as `<D:collection></D:collection>` (Rust) vs `<d:collection/>` (PHP) — same `{DAV:}collection` value, identical to any XML parser; cosmetic only.
+
+---
+
 ## Changes
 
-### 2026-07-29 — implementation, batch 1
+### dav-server vendored (2026-07-29)
 
-Implemented **12.2, 12.8, 12.10, 12.13** and both code halves of **12.1** (framework patch + value discipline). `cargo test --lib` green across the workspace.
+`core-rs/vendor/dav-server` — clone of `messense/dav-server-rs`, branch `nextcloud-0.11.0` based on tag `v0.11.0` (verified byte-identical to the crates.io tarball), patch commit `b9cd889`, wired via `[patch.crates-io]`. Patches (all marked `NEXTCLOUD-RS PATCH`): requested-but-unavailable properties grouped into a 404 propstat instead of dropped; driver properties filtered to the requested set on explicit `<prop>` requests (allprop/propname unchanged); driver props override NOT_FOUND placeholders for the same name; `getcontenttype` 404 for collections. Rebase path: fetch upstream tag, rebase the branch, bump the pin. *Pending:* push the branch to a fork and register as a git submodule of the outer repo.
 
-- **dav-server vendored** at `core-rs/vendor/dav-server` — clone of `messense/dav-server-rs`, branch `nextcloud-0.11.0` based on tag `v0.11.0` (verified byte-identical to the crates.io tarball), patch commit `b9cd889`, wired via `[patch.crates-io]`. Patches (all marked `NEXTCLOUD-RS PATCH`): requested-but-unavailable properties grouped into a 404 propstat instead of dropped; driver properties filtered to the requested set on explicit `<prop>` requests (allprop/propname unchanged); driver props override NOT_FOUND placeholders for the same name; `getcontenttype` 404 for collections. Rebase path: fetch upstream tag, rebase the branch, bump the pin. *Pending:* push the branch to a fork and register as a git submodule of the outer repo.
-- **12.1 value discipline** (`crates/nc-dav/src/props.rs`): `checksums`/`downloadURL`/`note` omitted when empty, `upload_time` omitted for directories, `hide-download` only on shared nodes, `share-attributes` now `[]` (PHP's `json_encode`); removed `acl-can-*` and `remind-me-at` (not PHP-core; PHP 404s them).
-- **12.2:** `{DAV:}displayname` emitted — cached name, UID at mount roots (mirrors `FileInfo::getName()`).
-- **12.8:** `mount-type` now `""` (home) / `"shared"` (shared) — was hardcoded `"local"`.
-- **12.10:** `oc:etag` no longer emitted.
-- **12.13:** `Vary: Brief,Prefer` on PROPFIND/REPORT.
+### 2026-07-30 — 12.3/12.4 canonical root cause
 
-**Verification status:** unit-tested behavior; the end-to-end check — replaying the captured iOS request against a deployed Rust build and diffing 200/404 propstat sets against PHP — is still pending.
-
-### 2026-07-29 — spec accuracy review
-
-Reviewed every claim against the PHP reference source and the 2026-07-28 wire captures; rewrote accordingly:
-
-- Reframed the phase around request filtering + propstat discipline (new 12.1) as the structural prerequisite.
-- 12.3 (old 12.2): refuted the shareability/`is-mount-root` hypothesis against `DavUtil` source; re-targeted the task at the actual bug (Rust's permission *value* diverges from `oc_filecache.permissions`).
-- 12.10 (old "Fixed" oc:etag row): PHP never emits `oc:etag`; task is removal, not quoting.
-- Old 12.9 (creation_time omission): rejected — PHP emits `0` in the 200 propstat; directory `upload_time` folded into 12.1.
-- 12.12 (old 12.6): `LockPlugin` emits no properties; `nc:lock*` originates in `files_lock`, absent from the reference — marked `[ENV]`; same for rich-workspace (12.11).
-- Fixed class attributions (CommentPropertiesPlugin, SystemTagPlugin, CorePlugin) and mechanism claims (displayname via `getName()`, `Vary` value `Brief,Prefer`).
-- Added gaps the capture shows but the original list missed: owner-display-name (12.9), share-permissions semantics + OCM property (12.4), `nc:sharees` (12.5).
-
-### 2026-07-29 — 12.2, 12.3, 12.4, 12.9: root-cause fixes
-
-- **12.2 (displayname):** Reordered `displayname_val` priority in `props.rs:125-136` — mount-root → UID first, then cached name, then basename fallback. Fixes Rust emitting "files" instead of the UID at the home root.
-- **12.3 (permissions root cause):** Traced to PHP's `sharing_mask` storage wrapper (`SetupManager.php:176-189`). When `ShareDisableChecker::sharingDisabledForUser()` returns true, `PermissionsMask(mask=15)` wraps the cache layer, stripping `PERMISSION_SHARE` (16) from every `oc_filecache` read. Rust reads the DB directly, bypassing the mask. Added `sharing_disabled_for_user()` in `row.rs` — full replication of PHP's `ShareDisableChecker` (reads `shareapi_exclude_groups` / `shareapi_exclude_groups_list` from `oc_appconfig`, queries `oc_group_user`, implements both exclude and allowlist modes). `apply_sharing_mask()` masks `permissions &= 15` when sharing is disabled. Integrated in `filesystem.rs::get_props()` — masks `meta.permissions` before `build_props()` and `compute_share_permissions()`.
-- **12.4 (share-permissions):** Automatically resolved by 12.3. `compute_share_permissions()` now receives masked permissions, causing `ocs:share-permissions` and OCM JSON to match PHP.
-- **12.9 (owner-display-name):** `lookup_user_display_name()` now checks `oc_accounts.data` JSON first (`displayname.value`), then `oc_users.displayname`, then falls back to UID. Matches PHP's `IAccountManager → getDisplayName()` chain. Uses `serde_json` for JSON parsing.
-
-**Verification:** `cargo test --lib -p nc-dav` — 273 passed, 0 failed. `cargo check -p nc-dav` clean. End-to-end capture verification pending deployment.
-
-### 2026-07-29 — 12.5 sharee display-name fix
-
-- **12.5 (sharee display names):** `batch_lookup_display_names()` in `row.rs` only queried `oc_users.displayname`, missing display names stored in `oc_accounts.data` JSON. Same root cause as 12.9 (`lookup_user_display_name`). Fixed by batch-querying `oc_accounts` first via `extract_displayname_from_accounts_json()`, then falling back to `oc_users`, then the UID. Affects the `<nc:display-name>` element inside `<nc:sharee>` for user-type shares.
-
-### 2026-07-28 — `d:getetag` quoting and `DAV` header
-
-- Quoted ETag in the `DavMetaData::etag()` impl per RFC 4918 §8.8.
-- Added static `DAV` response header matching PHP's SabreDAV plugin set (verified character-identical against the capture).
+Confirmed by source trace that the home-root SHARE strip comes from `LazyUserFolder` (permissions hardcoded to `15` at the DAV bootstrap, before `setupForUser` runs), not the `sharing_mask` wrapper. Rust replicates it with an unconditional `& !16` on the mount root in `filesystem.rs::get_props`, cascading to `ocs:share-permissions`/OCM. See the 12.3/12.4 deviation notes above and `phase-12-verification.md` → Resolution. Pinned by 11 regression tests; `cargo test --lib -p nc-dav` → 284 passed, `cargo check --workspace` clean. End-to-end recapture against the rebuilt binary still outstanding.

@@ -199,7 +199,11 @@ function route_ocs_php(): void
             OC::handleLogin($request);
         }
 
-        \OCP\Server::get(\OC\Route\Router::class)->match('/ocsapp' . $request->getRawPathInfo());
+        $matchUrl = '/ocsapp' . $request->getRawPathInfo();
+        $isLoggedIn = \OCP\Server::get(\OCP\IUserSession::class)->isLoggedIn();
+        $userId = \OCP\Server::get(\OCP\IUserSession::class)->getUser()?->getUID() ?? 'null';
+        error_log("OCS DEBUG: matchUrl=$matchUrl loggedIn=" . ($isLoggedIn ? '1' : '0') . " userId=$userId SCRIPT_NAME=" . ($_SERVER['SCRIPT_NAME'] ?? 'unset') . " REQUEST_URI=" . ($_SERVER['REQUEST_URI'] ?? 'unset'));
+        \OCP\Server::get(\OC\Route\Router::class)->match($matchUrl);
     } catch (\OCP\Security\Bruteforce\MaxDelayReached $ex) {
         \OC\OCS\ApiHelper::respond(\OCP\AppFramework\Http::STATUS_TOO_MANY_REQUESTS, $ex->getMessage());
     } catch (\Symfony\Component\Routing\Exception\ResourceNotFoundException $e) {

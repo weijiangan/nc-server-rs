@@ -601,6 +601,17 @@ mod tests {
     }
 
     #[test]
+    fn permissions_dir_home_root_share_stripped() {
+        // Phase 12.3: the home storage root has PERMISSION_SHARE (16) stripped
+        // unconditionally (PHP LazyUserFolder: "Sharing user root folder is not
+        // allowed"), so permissions=15 rather than the DB's 31.  With no SHARE
+        // bit the 'R' flag disappears: PHP returns "GDNVCK" for the home root
+        // (see SPECS/04-tasks/comparison.md, PHP depth:0 capture).
+        let s = encode_permissions(15, true, false, false, true);
+        assert_eq!(s, "GDNVCK", "perms=15 home root: expected GDNVCK, got {s}");
+    }
+
+    #[test]
     fn permissions_shared_read_only_file() {
         // perms=1 (READ only), file, not mounted, is_shared=true, can_rename=false
         // PHP: S G = "SG"
