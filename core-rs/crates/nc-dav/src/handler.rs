@@ -399,21 +399,87 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         }
     }
 
-    // ── REPORT is not implemented on the file tree ──────────────────
+    // ── REPORT: handle filter-files natively (Phase 9.8) ──────────────────
     //
-    // dav-server-rs does not implement REPORT, and the Nextcloud files tree has
-    // no native REPORT: `sync-collection` is CalDAV/CardDAV-only in PHP (the
-    // files connector never implements `ISyncCollection`), and `filter-files`
-    // is tracked for a later phase.  Return 501.
+    // dav-server-rs does not implement REPORT.  Nextcloud's files tree has
+    // one native REPORT: `{oc:}filter-files` (FilesReportPlugin), used by
+    // web/iOS clients for Favorites / Tags / Recent views.
     if req_method.as_str() == "REPORT" {
-        return http::Response::builder()
-            .status(StatusCode::NOT_IMPLEMENTED)
-            .header(
-                H_CSP.clone(),
-                HeaderValue::from_static("default-src 'none';"),
-            )
-            .body(Body::from("Not Implemented"))
-            .unwrap();
+        // Clone state fields needed for REPORT handling before we consume the body.
+        let report_pool = state.pool.clone();
+        let report_prefix = state.table_prefix.clone();
+        let report_base_url = state.base_url.as_ref().clone();
+        let report_instance_id = state.instance_id.as_ref().clone();
+        let report_mime_cache = state.mime_cache.clone();
+
+        // Read the request body.
+        let body_bytes = match axum::body::to_bytes(req.into_body(), 65536).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "REPORT: failed to read body");
+                return http::Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(
+                        H_CSP.clone(),
+                        HeaderValue::from_static("default-src 'none';"),
+                    )
+                    .body(Body::from("Failed to read request body"))
+                    .unwrap();
+            }
+        };
+
+        match crate::report::handle_report(
+            &report_pool,
+            &report_prefix,
+            &uid,
+            storage_id,
+            &report_base_url,
+            &report_instance_id,
+            &report_mime_cache,
+            &body_bytes,
+        )
+        .await
+        {
+            Some(resp) => {
+                // Post-process: inject CSP, DAV, Vary headers (same as PROPFIND).
+                let (mut parts, body) = resp.into_parts();
+                parts.headers.insert(
+                    H_CSP.clone(),
+                    HeaderValue::from_static("default-src 'none';"),
+                );
+                parts.headers.insert(
+                    HeaderName::from_static("dav"),
+                    HeaderValue::from_static(
+                        "1, 3, extended-mkcol, access-control, \
+                         calendarserver-principal-property-search, nc-paginate, \
+                         nextcloud-checksum-update, nc-calendar-search, \
+                         nc-enable-birthday-calendar, 2",
+                    ),
+                );
+                parts.headers.insert(
+                    HeaderName::from_static("vary"),
+                    HeaderValue::from_static("Brief,Prefer"),
+                );
+                if let Ok(v) = HeaderValue::from_str(&request_id) {
+                    parts.headers.insert(H_X_REQUEST_ID.clone(), v);
+                }
+                if let Ok(v) = HeaderValue::from_str(&uid) {
+                    parts.headers.insert(H_X_USER_ID.clone(), v);
+                }
+                return http::Response::from_parts(parts, body);
+            }
+            None => {
+                // Not a filter-files REPORT — return 501.
+                return http::Response::builder()
+                    .status(StatusCode::NOT_IMPLEMENTED)
+                    .header(
+                        H_CSP.clone(),
+                        HeaderValue::from_static("default-src 'none';"),
+                    )
+                    .body(Body::from("Not Implemented"))
+                    .unwrap();
+            }
+        }
     }
 
     // Clone what we need for post-response steps (state is moved below).

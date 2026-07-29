@@ -122,16 +122,16 @@ independently.
 ### 9.8 `filter-files` REPORT — web Favorites / Tags / Recent views (REQ §6.10)
 > PHP source: `apps/dav/lib/Connector/Sabre/FilesReportPlugin.php` (registered for logged-in users at `apps/dav/lib/Server.php:361`).
 
-- [ ] `REPORT` `{http://owncloud.org/ns}filter-files` (`REPORT_NAME` `FilesReportPlugin.php:33`) on `/dav/files/{userId}/…` handled natively (intercept before dav-server, which does not implement REPORT); only when the target is a `Directory` (`onReport` `:108-111`)
-- [ ] `{oc:}filter-rules` parsing (`:122-125`):
-  - `{oc:}favorite` — **presence-based** (the rule's value is ignored): if present, results = `fileTagger->load('files')->getFavorites()` from `oc_vcategory` (`:228-243`). *(Correction: not a `1`/`0` toggle.)*
-  - `{oc:}systemtag` (`SYSTEMTAG_PROPERTYNAME` `:34`) — repeatable tag id; resolves via `getTagsByIds` + `userFolder->searchBySystemTag`, intersected across multiple tags (`:253-290`)
-  - `{oc:}circle` (`CIRCLE_PROPERTYNAME` `:35`) — circle id; returns `[]` unless the `circles` app is enabled (`getCirclesFileIds` `:300-305`)
-- [ ] Empty `filter-rules` block → `400 Bad Request` ("Missing filter-rule block") — never scans all files (`:145-148`)
+- [x] `REPORT` `{http://owncloud.org/ns}filter-files` (`REPORT_NAME` `FilesReportPlugin.php:33`) on `/dav/files/{userId}/…` handled natively (intercept before dav-server, which does not implement REPORT); only when the target is a `Directory` (`onReport` `:108-111`) *(partial: directory check deferred; REPORT handled on all paths)*
+- [x] `{oc:}filter-rules` parsing (`:122-125`):
+  - [x] `{oc:}favorite` — **presence-based** (the rule's value is ignored): if present, results = `fileTagger->load('files')->getFavorites()` from `oc_vcategory` (`:228-243`). *(Correction: not a `1`/`0` toggle.)*
+  - [ ] `{oc:}systemtag` (`SYSTEMTAG_PROPERTYNAME` `:34`) — repeatable tag id; resolves via `getTagsByIds` + `userFolder->searchBySystemTag`, intersected across multiple tags (`:253-290`)
+  - [ ] `{oc:}circle` (`CIRCLE_PROPERTYNAME` `:35`) — circle id; returns `[]` unless the `circles` app is enabled (`getCirclesFileIds` `:300-305`)
+- [x] Empty `filter-rules` block → `400 Bad Request` ("Missing filter-rule block") — never scans all files (`:145-148`)
 - [ ] Filter by non-existent tag → `TagNotFoundException` → `412 Precondition Failed` (`:158-160`)
-- [ ] `{DAV:}limit` paging: `{DAV:}nresults` (page size) + `{nc:}firstresult` (offset) (`:134-141`)
-- [ ] `{DAV:}prop` block selects the per-match property set (`:128-133`; property set = §4.7–§4.9 + §9.5–§9.7)
-- [ ] Response `207 Multi-Status`, one `<d:response>` per match, scoped to the report target's subtree via `findNodesByFileIds` (`:169`; status set `:184-190`)
+- [x] `{DAV:}limit` paging: `{DAV:}nresults` (page size) + `{nc:}firstresult` (offset) (`:134-141`)
+- [x] `{DAV:}prop` block selects the per-match property set (`:128-133`; property set = §4.7–§4.9 + §9.5–§9.7)
+- [x] Response `207 Multi-Status`, one `<d:response>` per match, scoped to the report target's subtree via `findNodesByFileIds` (`:169`; status set `:184-190`) *(partial: subtree scoping deferred — all favorites returned regardless of REPORT URI path)*
 - [ ] `{DAV:}supported-report-set` advertises `{oc:}filter-files` (`getSupportedReportSet` `:96`)
 
 **Verify:** star two files, then `REPORT filter-files` with an `{oc:}favorite` filter-rule returns exactly those two. Empty filter → `400`. Non-existent systemtag → `412`. Cypress Favorites and Tags sidebar views load in the web client.
