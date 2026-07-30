@@ -65,7 +65,8 @@ async fn main() -> anyhow::Result<()> {
     let appconfig_cache = nc_db::appconfig::load_appconfig_cache(&pool, prefix)
         .await
         .context("Failed to load app config cache")?;
-    let capability_cache = nc_ocs::load_capability_cache(&appconfig_cache);
+    let capability_cache =
+        nc_ocs::load_capability_cache(&appconfig_cache, config.version.as_deref());
     let token_cache = nc_auth::new_token_cache();
 
     {

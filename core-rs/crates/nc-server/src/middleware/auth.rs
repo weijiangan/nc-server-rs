@@ -583,7 +583,7 @@ mod tests {
         sqlx::any::install_default_drivers();
         let pool = sqlx::AnyPool::connect("sqlite::memory:").await.unwrap();
         let appconfig_cache = Arc::new(RwLock::new(AppConfigCache::default()));
-        let capability_cache = nc_ocs::load_capability_cache(&appconfig_cache);
+        let capability_cache = nc_ocs::load_capability_cache(&appconfig_cache, None);
         let nc_config = NcConfig {
             dbtype: DbType::Sqlite,
             dbhost: None,

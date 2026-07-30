@@ -125,15 +125,22 @@ pub async fn rebuild_capability_cache(
     appconfig_cache: &nc_db::appconfig::SharedAppConfigCache,
     capability_cache: &SharedCapabilityCache,
 ) {
-    // Snapshot both PHP capability sources before rebuilding so we can re-merge them.
-    let (existing_php_caps, existing_php_pub_caps) = {
+    // Snapshot both PHP capability sources and version before rebuilding so we
+    // can re-merge them.  The version is immutable for the server's lifetime
+    // (only changes on upgrade, which requires restart).
+    let (existing_php_caps, existing_php_pub_caps, existing_version) = {
         let r = capability_cache.read().expect("capability cache read lock");
-        (r.php_app_capabilities.clone(), r.php_public_capabilities.clone())
+        (
+            r.php_app_capabilities.clone(),
+            r.php_public_capabilities.clone(),
+            r.version.clone(),
+        )
     };
 
     let new_cache = {
         let ac = appconfig_cache.read().expect("appconfig lock");
-        let mut cache = crate::capabilities::build_capability_cache(&ac);
+        let mut cache =
+            crate::capabilities::build_capability_cache(&ac, Some(&existing_version));
         // Re-merge both PHP capability sources into the freshly built native cache.
         if !existing_php_caps.is_null() {
             cache.apply_php_capabilities(existing_php_caps);

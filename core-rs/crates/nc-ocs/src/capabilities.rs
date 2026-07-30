@@ -26,6 +26,11 @@ pub struct CapabilityCache {
     /// results only).  Merged into `public_*` only.  `Value::Null` until the
     /// Phase 7.7 public fetch completes.
     pub php_public_capabilities: serde_json::Value,
+    /// Canonical version string from `config.php` (`NcConfig.version`), stored so
+    /// `rebuild_capability_cache` can re-use it without access to the config struct.
+    /// Falls back to `"0.0.0.0"` when config.php has no version key and
+    /// `oc_appconfig` has no `core/oc_version` or `core/version` row.
+    pub version: String,
     pub auth_json: String,
     pub auth_xml: String,
     pub auth_etag: String,
@@ -105,11 +110,21 @@ impl CapabilityCache {
 
 /// Build the capability cache from the appconfig cache.
 ///
+/// `version_override` — when `Some`, this version string is used instead of
+/// looking up `oc_appconfig`.  It comes from `config.php`'s `$CONFIG['version']`
+/// (`NcConfig.version`), which is the canonical source (the same source PHP's
+/// `status.php` reads via `ServerVersion` → `version.php`).  `oc_appconfig`
+/// is consulted only as a fallback on installs where `config.php` lacks the key.
+///
 /// Called at startup and after any config write that affects capabilities.
-pub fn build_capability_cache(ac: &nc_db::appconfig::AppConfigCache) -> CapabilityCache {
+pub fn build_capability_cache(
+    ac: &nc_db::appconfig::AppConfigCache,
+    version_override: Option<&str>,
+) -> CapabilityCache {
     // ── Version info ─────────────────────────────────────────────────────────
-    let version_str = ac
-        .get_string("core", "oc_version")
+    let version_str = version_override
+        .map(|v| v.to_string())
+        .or_else(|| ac.get_string("core", "oc_version"))
         .or_else(|| ac.get_string("core", "version"))
         .unwrap_or_else(|| "0.0.0.0".to_string());
 
@@ -194,6 +209,7 @@ pub fn build_capability_cache(ac: &nc_db::appconfig::AppConfigCache) -> Capabili
         native_data: data,
         php_app_capabilities: serde_json::Value::Null,
         php_public_capabilities: serde_json::Value::Null,
+        version: version_str,
         auth_json: json.clone(),
         auth_xml: xml.clone(),
         auth_etag: etag.clone(),
@@ -207,9 +223,15 @@ pub fn build_capability_cache(ac: &nc_db::appconfig::AppConfigCache) -> Capabili
 }
 
 /// Load a `SharedCapabilityCache` from the appconfig cache at startup.
-pub fn load_capability_cache(appconfig_cache: &SharedAppConfigCache) -> SharedCapabilityCache {
+///
+/// `version_override` is the canonical version string from `config.php`
+/// (`NcConfig.version`).  It takes precedence over `oc_appconfig` keys.
+pub fn load_capability_cache(
+    appconfig_cache: &SharedAppConfigCache,
+    version_override: Option<&str>,
+) -> SharedCapabilityCache {
     let ac = appconfig_cache.read().expect("appconfig lock poisoned");
-    let cache = build_capability_cache(&ac);
+    let cache = build_capability_cache(&ac, version_override);
     Arc::new(RwLock::new(cache))
 }
 
@@ -228,7 +250,7 @@ mod tests {
     #[test]
     fn builds_without_appconfig() {
         let empty = AppConfigCache::default();
-        let cache = build_capability_cache(&empty);
+        let cache = build_capability_cache(&empty, None);
         assert!(!cache.auth_etag.is_empty());
         assert!(cache.auth_json.contains("pollinterval"));
         assert!(cache.auth_json.contains("bigfilechunking"));
@@ -238,7 +260,7 @@ mod tests {
     #[test]
     fn etag_is_md5_of_json() {
         let empty = AppConfigCache::default();
-        let cache = build_capability_cache(&empty);
+        let cache = build_capability_cache(&empty, None);
         let expected = {
             let mut h = Md5::new();
             h.update(cache.auth_json.as_bytes());
@@ -250,7 +272,7 @@ mod tests {
     #[test]
     fn public_and_auth_match_before_php_fpm_merge() {
         let empty = AppConfigCache::default();
-        let cache = build_capability_cache(&empty);
+        let cache = build_capability_cache(&empty, None);
         assert_eq!(cache.auth_json, cache.public_json);
         assert_eq!(cache.auth_etag, cache.public_etag);
     }
@@ -258,7 +280,7 @@ mod tests {
     #[test]
     fn native_data_contains_capabilities_key() {
         let empty = AppConfigCache::default();
-        let cache = build_capability_cache(&empty);
+        let cache = build_capability_cache(&empty, None);
         assert!(cache.native_data.get("capabilities").is_some());
         assert!(cache.native_data.get("version").is_some());
         assert!(cache.php_app_capabilities.is_null());
@@ -268,7 +290,7 @@ mod tests {
     #[test]
     fn apply_php_capabilities_updates_only_auth() {
         let empty = AppConfigCache::default();
-        let mut cache = build_capability_cache(&empty);
+        let mut cache = build_capability_cache(&empty, None);
         let native_etag = cache.auth_etag.clone();
         let native_public_json = cache.public_json.clone();
 
@@ -296,7 +318,7 @@ mod tests {
     #[test]
     fn apply_php_public_capabilities_updates_only_public() {
         let empty = AppConfigCache::default();
-        let mut cache = build_capability_cache(&empty);
+        let mut cache = build_capability_cache(&empty, None);
 
         // First fill auth with full caps.
         let php_caps = serde_json::json!({"files_sharing": {"api_enabled": true}});
@@ -324,7 +346,7 @@ mod tests {
     #[test]
     fn auth_and_public_differ_after_separate_merges() {
         let empty = AppConfigCache::default();
-        let mut cache = build_capability_cache(&empty);
+        let mut cache = build_capability_cache(&empty, None);
 
         // Simulate: authenticated fetch returns more capabilities than public.
         let auth_only_caps = serde_json::json!({
@@ -347,9 +369,37 @@ mod tests {
     }
 
     #[test]
+    fn version_override_takes_precedence_over_appconfig() {
+        // When version_override is provided, it must be used even when
+        // oc_appconfig has rows (simulating config.php providing the version).
+        let mut ac = AppConfigCache::default();
+        // Insert a value that must NOT be used — the override must win.
+        ac.set_raw("core", "oc_version", "99.99.99.99".to_string());
+        let cache = build_capability_cache(&ac, Some("34.0.1.2"));
+        assert_eq!(cache.version, "34.0.1.2");
+        let v = &cache.native_data["version"];
+        assert_eq!(v["major"], 34);
+        assert_eq!(v["minor"], 0);
+        assert_eq!(v["micro"], 1);
+        assert_eq!(v["string"], "34.0.1");
+    }
+
+    #[test]
+    fn version_falls_back_to_appconfig() {
+        let mut ac = AppConfigCache::default();
+        ac.set_raw("core", "oc_version", "30.0.2.1".to_string());
+        let cache = build_capability_cache(&ac, None);
+        assert_eq!(cache.version, "30.0.2.1");
+        let v = &cache.native_data["version"];
+        assert_eq!(v["major"], 30);
+        assert_eq!(v["minor"], 0);
+        assert_eq!(v["micro"], 2);
+    }
+
+    #[test]
     fn rebuild_serialized_no_php_caps_unchanged() {
         let empty = AppConfigCache::default();
-        let mut cache = build_capability_cache(&empty);
+        let mut cache = build_capability_cache(&empty, None);
         let original_auth = cache.auth_json.clone();
         let original_pub = cache.public_json.clone();
         // Calling rebuild_serialized with no PHP caps should produce identical output.

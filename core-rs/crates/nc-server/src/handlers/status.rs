@@ -69,8 +69,12 @@ struct StatusResponse {
     maintenance: bool,
     needs_db_upgrade: bool,
     version: String,
+    /// PHP outputs `versionstring` (all lowercase, not camelCase).
+    #[serde(rename = "versionstring")]
     version_string: String,
     edition: String,
+    /// PHP outputs `productname` (all lowercase, not camelCase).
+    #[serde(rename = "productname")]
     product_name: String,
     extended_support: bool,
 }
