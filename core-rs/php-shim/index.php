@@ -86,10 +86,19 @@ require_once $_NC_ROOT . '/lib/base.php'; // base.php calls OC::init() at file s
 
 // ── Inject pre-authenticated user (conditional) ────────────────────────────────
 // When the request is authenticated Rust has already validated the
-// token/password and brute-force gates before forwarding.  We use
-// setVolatileActiveUser() so that:
-//   - isLoggedIn() returns true (suppresses OC::handleRequest login attempt)
-//   - no PHP session write-back occurs (this is a stateless API request)
+// token/password and brute-force gates before forwarding.  We establish the
+// user with IUserSession::setUser(), which does two things:
+//   - sets the in-memory active user, so isLoggedIn()/getUser() return true/the
+//     user (suppressing OC::handleRequest's login attempt); AND
+//   - writes `user_id` to the session.
+//
+// The second point is essential: the AppFramework injects controller `$userId`
+// constructor arguments from `ISession::get('user_id')` (the `userId` service in
+// AppFramework\DependencyInjection\DIContainer), NOT from IUserSession::getUser().
+// The previous setVolatileActiveUser() set only the in-memory active user, so
+// every proxied OCS controller that injects $userId (user_status, dashboard,
+// notifications, …) received null and returned HTTP 500.  setUser() matches what
+// a real PHP login does, so the injected $userId is populated.
 //
 // Unauthenticated whitelisted probes (e.g. the public capabilities fetch) skip
 // this block so PHP sees no session and naturally calls getCapabilities(true),
@@ -106,7 +115,7 @@ if ($_NC_IS_AUTHENTICATED) {
         exit(0);
     }
 
-    \OCP\Server::get(\OCP\IUserSession::class)->setVolatileActiveUser($_NC_user);
+    \OCP\Server::get(\OCP\IUserSession::class)->setUser($_NC_user);
 }
 
 // ── Route request ─────────────────────────────────────────────────────────────

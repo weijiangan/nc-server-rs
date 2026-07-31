@@ -106,6 +106,9 @@ pub async fn auth_layer(
     // so an empty secret would produce a different hash than PHP and cause
     // every app-token / device-token auth to fail with 401.
     let app_secret = state.nc_config.secret.as_deref().unwrap_or_default();
+    // `passwordsalt` — only used by the hasher's legacy (pre-versioning) path;
+    // empty matches PHP's `getSystemValue('passwordsalt', '')` default.
+    let legacy_salt = state.nc_config.passwordsalt.as_deref().unwrap_or_default();
 
     // ── CSRF check ────────────────────────────────────────────────────────
     // For Phase 3, we only enforce CSRF if session cookies are present AND
@@ -290,6 +293,7 @@ pub async fn auth_layer(
                         &state.pool,
                         &state.table_prefix,
                         &app_secret,
+                        &legacy_salt,
                     )
                     .await
                     {
@@ -354,7 +358,7 @@ pub async fn auth_layer(
                                 login_len = login.len(),
                                 secret_len,
                                 path = %path,
-                                "Basic auth failed — token hash mismatch and bcrypt mismatch (or DB error)"
+                                "Basic auth failed — token hash mismatch and password-hash mismatch (or DB error)"
                             );
                             nc_auth::bruteforce::record_attempt(
                                 "login",
@@ -597,6 +601,7 @@ mod tests {
             installed: true,
             maintenance: false,
             secret: None,
+            passwordsalt: None,
             version: None,
             trusted_domains: None,
             overwrite_cli_url: None,

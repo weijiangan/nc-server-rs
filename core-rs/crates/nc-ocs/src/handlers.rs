@@ -3,6 +3,7 @@ use axum::{
     http::HeaderMap,
     response::Response,
 };
+use nc_auth::AuthInfo;
 
 use crate::{
     capabilities::SharedCapabilityCache,
@@ -54,7 +55,6 @@ pub async fn ocs_config(State(state): State<OcsState>, request: Request) -> Resp
 /// REQ §5.6: returns pre-built payload from `CapabilityCache`.
 /// ETag = `md5(json_encode($result))`.
 /// Unauthenticated → public-only subset; authenticated → full set.
-/// (Auth distinction is implemented in Phase 3; for now always returns public.)
 pub async fn ocs_capabilities(
     State(state): State<OcsState>,
     request: Request,
@@ -67,12 +67,26 @@ pub async fn ocs_capabilities(
         .read()
         .expect("capability cache lock poisoned");
 
-    // TODO Phase 3: detect authenticated state and use auth_* vs public_*.
-    let (body_json, body_xml, etag) = (
-        cache.public_json.clone(),
-        cache.public_xml.clone(),
-        cache.public_etag.clone(),
-    );
+    // Check whether the request is authenticated.  The auth middleware inserts
+    // `AuthInfo` as an extension (§7.2) only when credentials are valid; its
+    // absence means unauthenticated.  (The middleware inserts `AuthInfo`
+    // directly — not `Option<AuthInfo>` — matching every other consumer, e.g.
+    // nc-dav/src/handler.rs and nc-fastcgi/src/lib.rs.)
+    let is_authenticated = request.extensions().get::<AuthInfo>().is_some();
+
+    let (body_json, body_xml, etag) = if is_authenticated {
+        (
+            cache.auth_json.clone(),
+            cache.auth_xml.clone(),
+            cache.auth_etag.clone(),
+        )
+    } else {
+        (
+            cache.public_json.clone(),
+            cache.public_xml.clone(),
+            cache.public_etag.clone(),
+        )
+    };
     drop(cache);
 
     use axum::{body::Body, http::StatusCode, response::Response as AxumResponse};

@@ -601,14 +601,14 @@ mod tests {
     }
 
     #[test]
-    fn permissions_dir_home_root_share_stripped() {
-        // Phase 12.3: the home storage root has PERMISSION_SHARE (16) stripped
-        // unconditionally (PHP LazyUserFolder: "Sharing user root folder is not
-        // allowed"), so permissions=15 rather than the DB's 31.  With no SHARE
-        // bit the 'R' flag disappears: PHP returns "GDNVCK" for the home root
-        // (see SPECS/04-tasks/comparison.md, PHP depth:0 capture).
+    fn permissions_dir_value_15_encodes_gdnvck() {
+        // Pure encoding fact: a directory whose effective permissions are 15
+        // (SHARE bit absent) has no 'R' flag → "GDNVCK".  This is the value the
+        // home root takes ONLY when sharing is disabled (apply_sharing_mask);
+        // in the normal sharing-enabled case the home root is 31 → "RGDNVCK"
+        // (see permissions_dir_all and the note in filesystem.rs::get_props).
         let s = encode_permissions(15, true, false, false, true);
-        assert_eq!(s, "GDNVCK", "perms=15 home root: expected GDNVCK, got {s}");
+        assert_eq!(s, "GDNVCK", "perms=15 dir: expected GDNVCK, got {s}");
     }
 
     #[test]

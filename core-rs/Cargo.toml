@@ -52,6 +52,11 @@ md-5 = "0.10"
 adler = "0.2"
 hex = "0.4"
 bcrypt = "0.15"
+# Argon2 (PHP `password_hash` default → `oc_users.password` = `3|$argon2id$…`).
+# Pure-Rust RustCrypto implementation; `PasswordHash` parses the PHC string and
+# `Argon2::verify_password` dispatches on the embedded algorithm identifier
+# (argon2id / argon2i / argon2d), matching PHP's `password_verify()`.
+argon2 = "0.5"
 base64 = "0.22"
 # CRC-32 (ISO 3309 / zlib polynomial) — matches PHP `crc32()` for the snowflake
 # `serverid` fallback (`crc32(hostname)`, Phase 11.5).

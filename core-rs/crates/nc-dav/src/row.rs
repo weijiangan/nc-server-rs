@@ -1630,13 +1630,15 @@ mod tests {
 
     // ── Phase 12.3 / 12.4: permission masking pipeline ──────────────────────
     //
-    // These lock in the home-root SHARE strip that matches PHP.  PHP builds the
-    // DAV root Directory from `getUserFolder()`, a `LazyUserFolder` whose
-    // permissions are hardcoded to `PERMISSION_ALL ^ PERMISSION_SHARE = 15`
-    // ("Sharing user root folder is not allowed"), independent of shareapi
-    // config.  Rust replicates this with `apply_sharing_mask` (the SetupManager
-    // sharing_mask wrapper) followed by an unconditional `& !16` on the mount
-    // root in `filesystem.rs::get_props`.
+    // The only SHARE-bit stripping Rust performs is `apply_sharing_mask`, which
+    // mirrors PHP's SetupManager `sharing_mask` storage wrapper and fires ONLY
+    // when sharing is disabled via shareapi config.  In the normal (sharing
+    // enabled) case permissions pass through unchanged, so the home storage
+    // root keeps PERMISSION_SHARE — verified against live PHP: the home root
+    // reports `oc:permissions` = RGDNVCK, `ocs:share-permissions` = 31,
+    // `ocm:share-permissions` = ["share","read","write"].  (An earlier revision
+    // also stripped SHARE unconditionally on the mount root to match a stale
+    // cold-start capture; that strip was removed — see filesystem.rs.)
 
     const P_READ: i32 = 1;
     const P_UPDATE: i32 = 2;
@@ -1663,8 +1665,9 @@ mod tests {
 
     #[test]
     fn compute_share_permissions_mount_root_dir() {
-        // Home root directory, already SHARE-stripped (15).  The mount-root
-        // DELETE|UPDATE OR-in is a no-op (both bits already set).
+        // A mount root whose effective permissions are 15 (SHARE absent — the
+        // sharing-disabled case).  The mount-root DELETE|UPDATE OR-in is a no-op
+        // (both bits already set).
         assert_eq!(compute_share_permissions(15, true, true), 15);
     }
 
@@ -1705,37 +1708,40 @@ mod tests {
     }
 
     #[test]
-    fn home_root_permission_pipeline_matches_php_capture() {
+    fn home_root_permission_pipeline_matches_php() {
         // End-to-end composition for the home storage root, mirroring
-        // `filesystem.rs::get_props`.  DB stores 31; PHP returns GDNVCK /
-        // ocs=15 / ocm=["read","write"] (comparison.md, PHP depth:0).
+        // `filesystem.rs::get_props`.  DB stores 31 and — sharing enabled — the
+        // value passes through unchanged.  Verified against live PHP: the home
+        // root returns RGDNVCK / ocs=31 / ocm=["share","read","write"].
         let db_permissions = P_ALL;
         let sharing_disabled = false; // master environment
         let is_mount_root = true;
 
-        let mut effective = apply_sharing_mask(db_permissions, sharing_disabled);
-        if is_mount_root {
-            effective &= !P_SHARE; // unconditional home-root SHARE strip
-        }
+        let effective = apply_sharing_mask(db_permissions, sharing_disabled);
 
-        assert_eq!(effective, 15, "home root permissions must be 15 (→ GDNVCK)");
-        assert_eq!(compute_share_permissions(effective, true, is_mount_root), 15);
+        assert_eq!(effective, P_ALL, "home root keeps SHARE (→ RGDNVCK)");
+        assert_eq!(compute_share_permissions(effective, true, is_mount_root), P_ALL);
+        assert_eq!(permissions_to_ocm_json(effective), r#"["share","read","write"]"#);
+    }
+
+    #[test]
+    fn home_root_permission_pipeline_strips_share_when_sharing_disabled() {
+        // When sharing is genuinely disabled (shareapi config), the mask strips
+        // SHARE even on the home root → GDNVCK / ocs=15 / ocm=["read","write"].
+        let effective = apply_sharing_mask(P_ALL, true);
+        assert_eq!(effective, P_ALL - P_SHARE);
         assert_eq!(permissions_to_ocm_json(effective), r#"["read","write"]"#);
     }
 
     #[test]
-    fn non_root_dir_permission_pipeline_matches_php_capture() {
+    fn non_root_dir_permission_pipeline_matches_php() {
         // Ordinary directory (e.g. "files/Photos"): SHARE is retained.  PHP
-        // returns RGDNVCK / ocs=31 / ocm=["share","read","write"]
-        // (comparison.md, PHP depth:1).
+        // returns RGDNVCK / ocs=31 / ocm=["share","read","write"].
         let db_permissions = P_ALL;
         let sharing_disabled = false;
         let is_mount_root = false;
 
-        let mut effective = apply_sharing_mask(db_permissions, sharing_disabled);
-        if is_mount_root {
-            effective &= !P_SHARE;
-        }
+        let effective = apply_sharing_mask(db_permissions, sharing_disabled);
 
         assert_eq!(effective, P_ALL, "non-root keeps SHARE (→ RGDNVCK)");
         assert_eq!(compute_share_permissions(effective, true, is_mount_root), P_ALL);

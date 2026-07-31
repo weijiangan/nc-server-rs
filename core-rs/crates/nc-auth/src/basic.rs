@@ -36,7 +36,11 @@ pub struct BasicAuthResult {
 ///    fetching the row, validate `login` against the stored `login_name`
 ///    case-insensitively (matching PHP's `validateTokenLoginName()`).  If found,
 ///    not expired, and login matches → success with token auth.
-/// 2. Try plain-password path: `oc_users` bcrypt check.
+/// 2. Try plain-password path: `oc_users.password` via the PHP-compatible
+///    [`crate::hasher`] (argon2id / argon2i / bcrypt / legacy SHA-1).
+///
+/// `legacy_salt` is the `passwordsalt` system-config value, used only by the
+/// hasher's legacy path.
 ///
 /// Returns `None` on invalid credentials or DB error.
 pub async fn verify_basic(
@@ -45,6 +49,7 @@ pub async fn verify_basic(
     pool: &DbPool,
     prefix: &str,
     app_secret: &str,
+    legacy_salt: &str,
 ) -> Option<BasicAuthResult> {
     // ── App-token path (REQ §4.2) ─────────────────────────────────────────
     // Desktop clients send their app token as the Basic password field.
@@ -55,8 +60,8 @@ pub async fn verify_basic(
 
     // ── Plain-password path ───────────────────────────────────────────────
     // Lookup is case-insensitive via the `uid_lower` index column.
-    // bcrypt verification is off-loaded to a blocking thread pool to avoid
-    // stalling the async runtime during the compute-heavy hash comparison.
+    // Hash verification (argon2id by default) is CPU-heavy, so it is off-loaded
+    // to a blocking thread pool to avoid stalling the async runtime.
     let table = format!("{prefix}users");
 
     let row: Option<(String, String)> = match sqlx::query_as(&format!(
@@ -79,9 +84,12 @@ pub async fn verify_basic(
     let (uid, hash) = row?;
 
     let password = password.to_string();
-    let ok = tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash).unwrap_or(false))
-        .await
-        .unwrap_or(false);
+    let legacy_salt = legacy_salt.to_string();
+    let ok = tokio::task::spawn_blocking(move || {
+        crate::hasher::verify_password(&password, &hash, &legacy_salt)
+    })
+    .await
+    .unwrap_or(false);
 
     if ok {
         Some(BasicAuthResult {

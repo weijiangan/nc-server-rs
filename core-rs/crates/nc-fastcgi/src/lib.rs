@@ -982,9 +982,21 @@ pub async fn fetch_php_capabilities(
         .cloned();
 
     if caps.is_none() {
-        tracing::warn!("capabilities-fetch: PHP response missing ocs.data.capabilities");
+        let body_str = String::from_utf8_lossy(body);
+        tracing::warn!(
+            %body_str,
+            "capabilities-fetch: PHP response missing ocs.data.capabilities"
+        );
     } else {
-        tracing::debug!("capabilities-fetch: received PHP-app capabilities");
+        let keys: Vec<&str> = caps
+            .as_ref()
+            .and_then(|c| c.as_object())
+            .map(|o| o.keys().map(|k| k.as_str()).collect())
+            .unwrap_or_default();
+        tracing::debug!(
+            ?keys,
+            "capabilities-fetch: received PHP-app capabilities"
+        );
     }
 
     caps

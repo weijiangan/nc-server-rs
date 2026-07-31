@@ -4,6 +4,7 @@ pub mod basic;
 pub mod bearer;
 pub mod bruteforce;
 pub mod csrf;
+pub mod hasher;
 pub mod session;
 pub mod token;
 pub mod twofa;
@@ -19,7 +20,8 @@ pub use session::{
 /// The resolved identity attached to a request after successful authentication.
 ///
 /// Stored as an axum request extension so downstream handlers can extract it
-/// with `Extension<Option<AuthInfo>>`.
+/// with `request.extensions().get::<AuthInfo>()` (present only when the request
+/// is authenticated) or the `Option<Extension<AuthInfo>>` extractor.
 #[derive(Debug, Clone)]
 pub struct AuthInfo {
     pub uid: String,

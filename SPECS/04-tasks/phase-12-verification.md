@@ -64,7 +64,7 @@ error_log("PERMISSIONS DEBUG: raw_perms=$permsRaw dav_permissions=$permsDav path
 
 Then reproduce and check:
 ```bash
-curl -sk -X PROPFIND -u "admin:helloworld" -H "Depth: 0" \
+curl -sk -X PROPFIND -u "admin:admin" -H "Depth: 0" \
   -H "Content-Type: application/xml" \
   -d '<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><oc:permissions/></d:prop></d:propfind>' \
   "https://cloud2.home.lan/remote.php/dav/files/6c21875f5c096195a380c345979d02419c98359d28fad44432c4f579f26bc452"

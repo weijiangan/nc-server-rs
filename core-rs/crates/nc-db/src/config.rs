@@ -72,6 +72,14 @@ pub struct NcConfig {
     pub overwrite_cli_url: Option<String>,
 
     // ── Auth / security ─────────────────────────────────────────────────────
+    /// Legacy password salt (`passwordsalt`).  PHP
+    /// `Hasher::legacyHashVerify()` mixes it into pre-versioning PHPass/bcrypt
+    /// hashes (`password_verify($message . $salt, $hash)`).  Irrelevant for any
+    /// version-prefixed hash (the only kind a modern install stores) — threaded
+    /// through only so the legacy verification path stays faithful.  PHP reads
+    /// it via `SystemConfig::getValue('passwordsalt', '')`, defaulting to empty.
+    #[serde(default)]
+    pub passwordsalt: Option<String>,
     #[serde(
         rename = "auth.bruteforce.protection.enabled",
         default = "default_true"

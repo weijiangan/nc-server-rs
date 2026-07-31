@@ -1853,31 +1853,33 @@ impl DavFileSystem for NcFileSystem {
             let is_shared = false;
 
             // ── Determine if this is the home storage mount root.
-            // PHP LazyUserFolder: "Sharing user root folder is not allowed" —
-            // unconditionally strips PERMISSION_SHARE (16) from the home root,
-            // yielding PERMISSION_ALL ^ PERMISSION_SHARE = 15.  This is NOT
-            // the same as the SetupManager sharing_mask wrapper; it happens at
-            // the Node layer regardless of shareapi config.
+            // Used for the displayname fallback, the is-mount-root prop, and
+            // compute_share_permissions (mount roots gain DELETE|UPDATE).
             let is_mount_root = matches!(meta.path.as_deref(), Some("") | Some("files"));
 
             // ── Phase 12.3: sharing mask — match PHP's SetupManager sharing_mask
-            // storage wrapper.  When sharing is disabled via shareapi_exclude_groups,
-            // the SHARE bit is stripped from ALL cache reads.  Combined with the
-            // mount-root mask below (which always strips SHARE on the home root).
+            // storage wrapper.  When sharing is disabled via shareapi config, the
+            // SHARE bit is stripped from ALL cache reads; when sharing is enabled
+            // (the normal case) this is a passthrough.
             let sharing_disabled = row::sharing_disabled_for_user(
                 &self.state.pool,
                 &self.state.table_prefix,
                 &self.uid,
             )
             .await;
-            let mut effective_permissions = row::apply_sharing_mask(meta.permissions, sharing_disabled);
+            let effective_permissions = row::apply_sharing_mask(meta.permissions, sharing_disabled);
 
-            // Strip SHARE from the home storage root, matching PHP LazyUserFolder
-            // ("Sharing user root folder is not allowed").  This is unconditional:
-            // you can never share your own home folder root.
-            if is_mount_root {
-                effective_permissions &= !16; // PERMISSION_SHARE
-            }
+            // NOTE (correction, 2026-07-31): an earlier revision unconditionally
+            // stripped PERMISSION_SHARE (16) from the home root here, on the theory
+            // that PHP's LazyUserFolder forbids sharing the user root.  That matched
+            // only a cold/first-request artifact (a stale capture that seeded
+            // SPECS/04-tasks/comparison.md).  Verified against live PHP — both this
+            // dev instance (via the proxy's php.dev.local entry) and the reference
+            // deployment — the home root reports PERMISSION_SHARE in steady state:
+            // `oc:permissions` = RGDNVCK, `ocs:share-permissions` = 31,
+            // `ocm:share-permissions` = ["share","read","write"].  The unconditional
+            // `& !16` is therefore removed; only the genuine sharing-disabled mask
+            // above applies.
 
             // Update meta so build_props() uses the masked permissions for {oc:}permissions.
             meta.permissions = effective_permissions;
