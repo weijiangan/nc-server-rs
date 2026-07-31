@@ -453,7 +453,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
                         "1, 3, extended-mkcol, access-control, \
                          calendarserver-principal-property-search, nc-paginate, \
                          nextcloud-checksum-update, nc-calendar-search, \
-                         nc-enable-birthday-calendar, 2",
+                         nc-enable-birthday-calendar",
                     ),
                 );
                 parts.headers.insert(
@@ -652,7 +652,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
     //    3         = Class 3 (Advanced Collections)
     //    extended-mkcol, access-control, calendarserver-principal-property-search,
     //    nc-paginate, nextcloud-checksum-update, nc-calendar-search,
-    //    nc-enable-birthday-calendar, 2 = Class 2 (Locking)
+    //    nc-enable-birthday-calendar
     parts.headers.insert(
         HeaderName::from_static("dav"),
         HeaderValue::from_static(
