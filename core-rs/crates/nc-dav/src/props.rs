@@ -241,9 +241,9 @@ pub fn build_props(
         // `{DAV:}quota-used-bytes` is handled entirely by dav-server using
         // the `used` first-element from `get_quota()` and does NOT need to
         // appear here.
-        make_prop("quota-available-bytes", "D", "DAV:", "-3"),
+        make_prop("quota-available-bytes", "d", "DAV:", "-3"),
         // {DAV:}displayname — PHASE-12.2 (value computed above).
-        make_prop("displayname", "D", "DAV:", displayname_val),
+        make_prop("displayname", "d", "DAV:", displayname_val),
     ];
 
     // ── PHASE-12.1 value discipline ────────────────────────────────────────
@@ -524,7 +524,7 @@ fn prop_names() -> Vec<DavProp> {
         name_only("system-tags", "nc", NC_NS),
         // {nc:}acl-can-* and {nc:}remind-me-at are not PHP-core properties
         // (PHASE-12.1) — removed.
-        name_only("displayname", "D", "DAV:"),
+        name_only("displayname", "d", "DAV:"),
         // Note: {DAV:}quota-available-bytes is listed by dav-server's own
         // allprop/propname set so we do NOT duplicate it here.
     ]
@@ -1211,7 +1211,7 @@ mod tests {
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
         assert_eq!(
             xml,
-            "<D:displayname xmlns:D=\"DAV:\">alice</D:displayname>",
+            "<d:displayname xmlns:d=\"DAV:\">alice</d:displayname>",
             "mount root must emit the UID, got {xml}"
         );
     }
