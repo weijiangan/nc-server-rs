@@ -826,6 +826,7 @@ async fn handle_delete(state: NcDavState, upload_id: Option<&str>, path: &str) -
 // ─── Response helpers ────────────────────────────────────────────────────────────
 
 fn bad_request_response(msg: &str) -> Response {
+    tracing::warn!(error = %msg, "Chunked upload: bad request — returning 400");
     http::Response::builder()
         .status(StatusCode::BAD_REQUEST)
         .header(

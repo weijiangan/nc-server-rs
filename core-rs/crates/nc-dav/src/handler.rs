@@ -50,11 +50,18 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
             .and_then(|v| v.to_str().ok()),
     ) {
         Ok(v) => v,
-        Err(msg) => {
+        Err(ref msg) => {
+            tracing::warn!(
+                method = %req.method(),
+                path = %req.uri().path(),
+                header = "X-OC-MTime",
+                error = %msg,
+                "MtimeSanitizer rejected header value — returning 400"
+            );
             return http::Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
-                .body(Body::from(msg))
+                .body(Body::from(msg.clone()))
                 .unwrap();
         }
     };
@@ -64,11 +71,18 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
             .and_then(|v| v.to_str().ok()),
     ) {
         Ok(v) => v,
-        Err(msg) => {
+        Err(ref msg) => {
+            tracing::warn!(
+                method = %req.method(),
+                path = %req.uri().path(),
+                header = "X-OC-CTime",
+                error = %msg,
+                "MtimeSanitizer rejected header value — returning 400"
+            );
             return http::Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
-                .body(Body::from(msg))
+                .body(Body::from(msg.clone()))
                 .unwrap();
         }
     };
@@ -135,6 +149,11 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
     let uid = match req.extensions().get::<AuthInfo>() {
         Some(info) => info.uid.clone(),
         None => {
+            tracing::warn!(
+                method = %req_method,
+                path = %req_path,
+                "DAV: AuthInfo extension missing — returning 401"
+            );
             return http::Response::builder()
                 .status(401)
                 .header("WWW-Authenticate", "Basic realm=\"Nextcloud\"")
@@ -172,9 +191,9 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         destination_header.as_deref(),
     ) {
         if let Err(e) = state.filename_validator.validate(&name) {
-            tracing::debug!(
+            tracing::warn!(
                 method = %req_method, path = %req_path, name = %name,
-                reason = %e, "§5.1 filename validation rejected"
+                reason = %e, "§5.1 filename validation rejected — returning 400"
             );
             return build_filename_error_response(e);
         }
@@ -213,6 +232,11 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         )
         .await
         {
+            tracing::warn!(
+                method = %req_method, path = %req_path, uid = %uid,
+                upload_bytes = max_upload_bytes,
+                "Quota exceeded on PUT — returning 507"
+            );
             return insufficient_storage_response(
                 "Quota exceeded: insufficient free space to upload.",
                 &request_id,
@@ -235,6 +259,10 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         )
         .await
         {
+            tracing::warn!(
+                method = %req_method, path = %req_path, uid = %uid,
+                "Quota exceeded on MKCOL — returning 507"
+            );
             return insufficient_storage_response(
                 "Quota exceeded: insufficient free space to create directory.",
                 &request_id,
@@ -643,6 +671,10 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
     if req_method == Method::PUT && parts.status == StatusCode::INTERNAL_SERVER_ERROR {
         if let Ok(guard) = put_error.lock() {
             if *guard == Some(crate::PutErrorKind::ChecksumMismatch) {
+                tracing::warn!(
+                    method = %req_method, path = %req_path, uid = %uid,
+                    "PUT checksum mismatch — rewriting 500 → 400"
+                );
                 parts.status = StatusCode::BAD_REQUEST;
             }
         }

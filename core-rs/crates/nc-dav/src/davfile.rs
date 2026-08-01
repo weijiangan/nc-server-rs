@@ -334,6 +334,12 @@ impl DavFile for NcDavFile {
                 if let Some(computed_hex) = running_hash.finalize_hex() {
                     let expected_hash = expected.splitn(2, ':').nth(1).unwrap_or("");
                     if !computed_hex.eq_ignore_ascii_case(expected_hash) {
+                        tracing::warn!(
+                            expected = %expected,
+                            computed = %computed_hex,
+                            path = %ctx.fc_path,
+                            "PUT checksum mismatch — returning 400"
+                        );
                         // Remove the temp file before returning the error.
                         let temp = ctx.temp_path.clone();
                         let temp_display = temp.clone();
