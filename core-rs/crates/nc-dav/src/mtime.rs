@@ -39,7 +39,14 @@ pub(crate) fn sanitize_mtime(value: Option<&str>) -> Result<Option<i64>, String>
     }
 
     // ── Numeric check ────────────────────────────────────────────────────
-    let parsed: i64 = raw.parse().map_err(|_| {
+    // PHP uses `is_numeric()` which accepts floats, scientific notation, and
+    // integers — then casts with `(int)` to truncate.  We parse as f64 first
+    // to match that leniency, then discard the fractional part.
+    let parsed: f64 = raw.parse().map_err(|_| {
+        tracing::warn!(
+            header_value = %raw,
+            "X-OC-MTime / X-OC-CTime header rejected: not numeric"
+        );
         format!(
             "X-OC-MTime header must be a valid integer (unix timestamp), got \"{}\".",
             raw
@@ -48,14 +55,15 @@ pub(crate) fn sanitize_mtime(value: Option<&str>) -> Result<Option<i64>, String>
 
     // ── Bounds check: <= 86400 (24*60*60) is rejected ────────────────────
     // PHP: "must be a valid positive unix timestamp greater than one day"
-    if parsed <= 86_400 {
+    if parsed <= 86_400.0 {
         return Err(format!(
             "X-OC-MTime header must be a valid positive unix timestamp greater than one day, got \"{}\".",
             raw
         ));
     }
 
-    Ok(Some(parsed))
+    // PHP casts with (int) — truncates toward zero (same as `as i64`)
+    Ok(Some(parsed as i64))
 }
 
 #[cfg(test)]
@@ -114,10 +122,10 @@ mod tests {
     }
 
     #[test]
-    fn decimal_rejected() {
-        // "123.45" is not a valid integer
-        let err = sanitize_mtime(Some("123.45")).unwrap_err();
-        assert!(err.contains("valid integer"));
+    fn decimal_accepted_truncated() {
+        // PHP's is_numeric() accepts floats; (int) cast truncates.
+        // "123.45" → truncates to 123 (rejected by bounds anyway, but parse succeeds)
+        assert_eq!(sanitize_mtime(Some("1234567890.8558369")).unwrap(), Some(1234567890));
     }
 
     // ── Bounds rejection ─────────────────────────────────────────────────
