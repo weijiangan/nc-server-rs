@@ -20,6 +20,7 @@ Each phase lives in its own file for context-size management:
 | 9 — Cross-Cutting Filesystem Concerns (Requirement-Gap Remediation) | [phase-9.md](phase-9.md) | ⬜ Not started |
 | 10 — PHP-Parity Discrepancy Remediation | [phase-10.md](phase-10.md) | ⬜ Not started |
 | 11 — Native Preview / Thumbnail Fast Path | [phase-11.md](phase-11.md) | ⬜ Not started |
+| 16 — Differential Integration-Test Harness | [phase-16.md](phase-16.md) | ⬜ Not started |
 
 | Deferred improvements (nice-to-have) | [../02-specifications/improvements.md](../02-specifications/improvements.md) | ⬜ |
 

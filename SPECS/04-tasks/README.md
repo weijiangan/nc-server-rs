@@ -17,6 +17,7 @@ Phase-by-phase execution tracking. Each phase is intentionally kept as a single 
   - [`phase-9.md`](phase-9.md) — Cross-Cutting Filesystem Concerns (Requirement-Gap Remediation) — ⬜
   - [`phase-10.md`](phase-10.md) — PHP-Parity Discrepancy Remediation — ⬜
   - [`phase-11.md`](phase-11.md) — Native Preview / Thumbnail Fast Path — ⬜
+  - [`phase-16.md`](phase-16.md) — Differential Integration-Test Harness — ⬜
 
 ## Related
 - How to write/track tasks: [`../05-llm-playbooks/README.md`](../05-llm-playbooks/README.md)

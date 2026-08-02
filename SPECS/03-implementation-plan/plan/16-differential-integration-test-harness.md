@@ -17,16 +17,36 @@ state **and** the on-disk file tree. Any divergence is a bug signal. It runs
 before deploy and in CI as the equivalence gate.
 
 ### Key facts that make this cheap to build (verified)
-- The stack already ships **two isolated instances on one Postgres server**. The
-  container bootstrap derives the DB name from `VIRTUAL_HOST`
-  (`docker/bin/bootstrap.sh:240`): service `nextcloud` → DB `nextcloud`,
-  service `nextcloud2` → DB `nextcloud2`. Both auto-install with `admin/admin`,
-  the same app set, and the same skeleton.
+- The stack runs **two isolated instances on one Postgres server**. The container
+  bootstrap derives the DB name from `VIRTUAL_HOST`
+  (`docker/bin/bootstrap.sh:239`): service `nextcloud` → DB `nextcloud`, and a
+  new `oracle` service (`VIRTUAL_HOST=oracle.local`) → DB `oracle`. Both
+  auto-install with `admin/admin`, the same app set, and the same skeleton —
+  because `oracle` is a clone of `nextcloud` (below), **not** the stock
+  `nextcloud2`.
 - `nextcloud` is the **System Under Test** (Rust `nc-server` fronting PHP-FPM,
   host port `127.0.0.1:8080` via the `proxy` nginx).
-- `nextcloud2` is the stock `nextcloud-dev-phpNN` image (nginx + php-fpm, **no
-  Rust**), mounting the *same* source tree → a ready **pure-PHP Oracle**
-  (host port `127.0.0.1:8211`, `PORTBASE 821 + 1`).
+- The **pure-PHP Oracle** is a NEW `oracle` compose service **cloned from
+  `nextcloud`** — same local `php84/Dockerfile` image (PHP 8.4), same env
+  (`WITH_REDIS`, `PRIMARY`, autoinstall apps), same `additional.config.php` and
+  skeleton — but with its own named volumes and `VIRTUAL_HOST=oracle.local`, so
+  the bootstrap derives a **separate DB `oracle`**. The image has no nginx and
+  `bootstrap.sh:451` starts `nc-server` (Rust) on `:80` unconditionally, so the
+  oracle is reached as pure PHP through a new `proxy` vhost (`:9091`) that
+  fastcgi-passes to the oracle's php-fpm **TCP** pool (`oracle:9000`, the same
+  `docker/configs/php-fpm-tcp.conf` the SUT mounts) — exactly the mechanism of
+  the existing `:9090` PHP path, but on the oracle's own DB. `nc-server` still
+  boots in the oracle container but is never routed to.
+  - **Why not `nextcloud2`:** `nextcloud2` is the **stock**
+    `nextcloud-dev-php${PHP_VERSION}` image — the *same* PHP major (`.env` sets
+    `PHP_VERSION=84`) but a **different image** than the SUT's local
+    `php84/Dockerfile`. It ships its **own** entrypoint/bootstrap/nginx, and its
+    service env omits `WITH_REDIS`, `NEXTCLOUD_AUTOINSTALL`, and
+    `NEXTCLOUD_AUTOINSTALL_APPS`, so it gets a different caching backend and a
+    different auto-installed app set, no php-shim, no php-fpm-tcp pool, and the
+    stock bootstrap's own user/config provisioning — even though its skeleton and
+    `additional.config.php` mounts match. Using it as the oracle would flood the
+    differential with this config drift, unrelated to Rust.
 - Postgres is exposed at `127.0.0.1:8212`, `postgres/postgres`
   (container `master-database-pgsql-1`).
 - Rust writes to DB itself only on the **native** paths: WebDAV file ops
@@ -91,7 +111,7 @@ Reuses existing workspace deps (`reqwest` 0.12 rustls, `sqlx` 0.8, `tokio` 1,
 ### Invocation
 Add to repo-root `Makefile`:
 ```make
-diff-up:    docker compose up -d nextcloud nextcloud2 database-pgsql redis  # + wait-healthy
+diff-up:    docker compose up -d nextcloud oracle database-pgsql redis proxy  # + wait-healthy
 diff-test:  cd docker/nc-server-core/core-rs && cargo test -p nc-difftest --release -- --ignored
 diff-one:   cd ... && cargo test -p nc-difftest --release -- --ignored $(S)
 ```
@@ -179,12 +199,14 @@ alphabet, seeded, with failure-shrinking.
 - Run each scenario twice; a diff that appears only on the second run flags
   residual flakiness to investigate, not to mask.
 - **File tree**: compare `data/{user}/files/**` by relative path+size+sha256 via
-  `docker exec master-nextcloud-1` / `master-nextcloud2-1`; exclude volatile
+  `docker exec master-nextcloud-1` / `master-oracle-1`; exclude volatile
   `files_versions/`, `cache/`, `appdata_*/`, in-flight `*.part`.
 
 ## 6. Phasing (get a green end-to-end slice first, then broaden)
-1. **Stand up + sanity**: `make diff-up`; curl a WebDAV PUT against both
-   `:8080` and `:8211`; confirm DBs `nextcloud`/`nextcloud2` both exist.
+1. **Stand up + sanity**: add the `oracle` service + proxy vhost (see *Key
+   facts*), `make diff-up`; curl a WebDAV PUT against both `:8080` (SUT) and
+   `:9091` (Oracle); confirm DBs `nextcloud`/`oracle` both exist and report the
+   same `oc_version` and enabled-app set.
 2. **Pipeline skeleton**: crate scaffold, `client.rs`, `db.rs` snapshot,
    minimal `canonicalize.rs`/`delta.rs`/`report.rs`. Get `10_put_get_delete`
    green end-to-end (validates the whole chain).
@@ -198,17 +220,21 @@ alphabet, seeded, with failure-shrinking.
 ## 7. Risks & mitigations
 - **Over/under-masking** → unit-test `canonicalize.rs` with hand-built fixtures;
   prefer preserving relationships over blanket masking; keep the registry explicit.
-- **Two-instance config drift** (apps/version/skeleton, or PHP 8.2-vs-8.4) →
-  precondition checks fail fast; pin the Oracle image to the **same PHP major as
-  the SUT (8.4)** in the harness config (fall back to 82 if no 84 image).
+- **Two-instance config drift** (apps/caching/version/skeleton) → resolved by
+  construction: the Oracle is a clone of the `nextcloud` service (same local
+  php84 image, env, `additional.config.php`, skeleton), **not** the stock
+  `nextcloud2` image, whose own bootstrap/env would install a different app set
+  and caching backend even at the same PHP major. Residual drift (enabled-app
+  set, redis/cache state) is still caught by the precondition checks, which fail
+  fast.
 - **fileid sequence offset** → natural-key bijection (the design centerpiece).
 - **Residual background writes** → §5 quiescing + double-run flake detection.
 - **Rust's thinner diff ecosystem** → hand-roll carefully, test it, use `similar`.
 
 ## Verification
-- `make diff-up` → both `http://127.0.0.1:8080` (SUT) and `:8211` (Oracle)
+- `make diff-up` → both `http://127.0.0.1:8080` (SUT) and `:9091` (Oracle)
   answer `GET /status.php` with `installed:true`; `psql -h 127.0.0.1 -p 8212`
-  lists both `nextcloud` and `nextcloud2`.
+  lists both `nextcloud` and `oracle`.
 - `cargo test -p nc-difftest` (unit, un-gated) — canonicalizer/delta fixtures pass.
 - `make diff-test` — all scenarios report **identical** on a known-good build.
 - **Negative control** (proves the harness catches bugs): temporarily introduce a
