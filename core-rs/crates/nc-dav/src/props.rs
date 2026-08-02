@@ -46,8 +46,9 @@ pub const OCM_NS: &str = "http://open-cloud-mesh.org/ns";
 /// returned — this is used for `allprop` and `propname` requests.
 ///
 /// - `data_fingerprint`: value of `core/data-fingerprint` from `oc_appconfig`.
-/// - `owner_display_name`: resolved from `oc_users.displayname`; falls back to
-///   `uid` when no display name is set.  Used for `{oc:}owner-display-name`.
+/// - `owner_display_name`: resolved from `oc_users.displayname` (PHP
+///   `User::getDisplayName`), with `oc_accounts.data` and then the UID as
+///   fallbacks.  Used for `{oc:}owner-display-name`.
 /// - `child_dir_count` / `child_file_count`: count of direct child directories
 ///   and files; pass 0 for non-directories.
 /// - `is_mounted`: `true` when the file lives on a non-home mount (i.e.
@@ -156,7 +157,7 @@ pub fn build_props(
         make_prop("permissions", "oc", OC_NS, &perms_str),
         make_prop("size", "oc", OC_NS, &meta.size.to_string()),
         make_prop("owner-id", "oc", OC_NS, uid),
-        // {oc:}owner-display-name — resolved from oc_users.displayname (REQ §6.5 / §4.8)
+        // {oc:}owner-display-name — oc_users.displayname, then oc_accounts, then UID (REQ §6.5 / §4.8)
         make_prop("owner-display-name", "oc", OC_NS, owner_display_name),
         // NOTE: {oc:}etag is deliberately NOT emitted — PHP has no registration
         // for {http://owncloud.org/ns}etag on the files endpoint and never

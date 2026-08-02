@@ -1824,7 +1824,7 @@ impl DavFileSystem for NcFileSystem {
                 (0, 0)
             };
 
-            // Resolve {oc:}owner-display-name from oc_users.displayname (REQ §6.5 / §4.8).
+            // Resolve {oc:}owner-display-name: oc_users.displayname, then oc_accounts, then UID (REQ §6.5 / §4.8).
             // Falls back to the raw UID when no display name is set.
             let owner_display_name = row::lookup_user_display_name(
                 &self.state.pool,
@@ -1880,6 +1880,21 @@ impl DavFileSystem for NcFileSystem {
             // `ocm:share-permissions` = ["share","read","write"].  The unconditional
             // `& !16` is therefore removed; only the genuine sharing-disabled mask
             // above applies.
+            //
+            // How PHP can still produce GDNVCK / 15 (observed reproducibly, but
+            // transient): when `Root::getUserFolder()` runs before the user's
+            // filesystem is set up (`isSetupComplete` false — cold OPCache, right
+            // after php-fpm restart, or first touch of the user folder), it returns
+            // an *unresolved* `LazyUserFolder`, whose constructor caches
+            // `permissions = PERMISSION_ALL ^ PERMISSION_SHARE = 15`
+            // (lib/private/Files/Node/LazyUserFolder.php: "Sharing user root folder
+            // is not allowed").  `LazyFolder::getPermissions()` returns that cached
+            // 15 *only until the folder is resolved*; the first access runs the
+            // resolution closure, after which the real home-root permissions (31 →
+            // RGDNVCK) are reported.  It is therefore a cold-start window, not the
+            // steady state.  We deliberately target the steady state: Rust reads the
+            // resolved `oc_filecache` row directly, so it cannot observe that window
+            // and does not replicate the transient 15.
 
             // Update meta so build_props() uses the masked permissions for {oc:}permissions.
             meta.permissions = effective_permissions;

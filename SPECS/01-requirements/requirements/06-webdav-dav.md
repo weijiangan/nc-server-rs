@@ -117,10 +117,10 @@ All the following are **read-only** (protected) unless noted:
 |---|---|
 | `{oc:}id` | Global file ID: `fileid` zero-padded to 8 chars + instance ID |
 | `{oc:}fileid` | Raw numeric `oc_filecache.fileid` |
-| `{oc:}permissions` | Encoded permissions string built by `DavUtil::getDavPermissions()` (`lib/public/Files/DavUtil.php`), appended in order: `S` shared, `R` shareable (`PERMISSION_SHARE`), `M` mounted, `G` readable (`PERMISSION_READ`), `D` deletable, `NV` renameable+movable (`PERMISSION_UPDATE`), then `W` for a writable **file** (`PERMISSION_UPDATE`) or `CK` for a creatable **folder** (`PERMISSION_CREATE`). `FilesPlugin` strips `S` and `M` for public-link shares. |
+| `{oc:}permissions` | Encoded permissions string built by `DavUtil::getDavPermissions()` (`lib/public/Files/DavUtil.php`), appended in order: `S` shared, `R` shareable (`PERMISSION_SHARE`), `M` mounted, `G` readable (`PERMISSION_READ`), `D` deletable, `NV` renameable+movable (`PERMISSION_UPDATE`), then `W` for a writable **file** (`PERMISSION_UPDATE`) or `CK` for a creatable **folder** (`PERMISSION_CREATE`). `FilesPlugin` strips `S` and `M` for public-link shares. In **steady state** the home root reports `RGDNVCK` (`31`). PHP reports `GDNVCK` (`15`) for the home root only transiently, while serving an *unresolved* `LazyUserFolder` (cold start / first touch of the user folder — `lib/private/Files/Node/LazyUserFolder.php` caches `permissions = PERMISSION_ALL ^ PERMISSION_SHARE`, and `LazyFolder::getPermissions()` returns it until the folder is resolved). |
 | `{oc:}size` | Recursive size (directories include children) |
 | `{oc:}owner-id` | UID of file owner |
-| `{oc:}owner-display-name` | Display name of owner (omitted or null for public links unless scope is published) |
+| `{oc:}owner-display-name` | Display name of owner, resolved via `$owner->getDisplayName()` → `User::getDisplayName()` (`lib/private/User/User.php`) — i.e. the user **backend** (`oc_users.displayname`). `oc_accounts.data` is an `AccountManager` copy synced from that value (`lib/private/Accounts/AccountManager.php`) and can lag a recent rename, so it is not the authoritative source. Omitted or null for public links unless scope is published. |
 | `{oc:}checksums` | `ALGORITHM:hash` list XML element |
 | `{oc:}data-fingerprint` | Config value `data-fingerprint` |
 | `{oc:}downloadURL` | Direct download URL (storage-specific) |
@@ -165,6 +165,15 @@ The web Files app's default PROPFIND (`getDefaultPropfind()` in `@nextcloud/file
 | `{nc:}system-tags` | `apps/dav/lib/SystemTag/SystemTagPlugin.php` | `oc_systemtag` + `oc_systemtag_object_mapping` (owned by the PHP `systemtags` app). Read-only list; Rust may query read-only. All tag **management** stays on PHP-FPM. |
 
 > **Delegation note:** `comments` and `systemtags` remain PHP-FPM apps for all writes and management UIs. Only the read-only PROPFIND enrichment above is served by Rust, because the PROPFIND request itself is Rust-native and cannot be partially delegated. The property handlers in `apps/dav` are registered unconditionally for logged-in users, so these properties are always returned (a `0`/empty value when there is no data) — they are not gated on the `comments`/`systemtags` apps being enabled.
+
+#### 6.5.2 PROPFIND response envelope
+
+PHP (SabreDAV `CorePlugin::httpPropFind`) serializes the PROPFIND response as follows:
+
+- **Namespace prefix:** all `{DAV:}`-namespace elements — `d:multistatus`, `d:response`, `d:propstat`, `d:prop`, `d:resourcetype`, `d:collection`, and the standard properties (`d:getetag`, `d:displayname`, `d:quota-available-bytes`, …) — use the **lowercase `d:`** prefix, declared once on the root element (no per-element `xmlns` re-declarations).
+- **Propstat discipline (RFC 4918 §9.1):** only properties named in the client's `<d:prop>` request are emitted (`allprop`/`propname` use their own sets). A requested property with no value is placed in a second `<d:propstat>` carrying `<d:status>HTTP/1.1 404 Not Found</d:status>` — never as an empty string or `0` in the 200 propstat, and never omitted.
+- **Headers:** `Vary: Brief,Prefer` (no space after the comma). PHP sets **no** `Cache-Control` on PROPFIND responses. The `DAV` compliance header is `1, 3, extended-mkcol, access-control, calendarserver-principal-property-search, nc-paginate, nextcloud-checksum-update, nc-calendar-search, nc-enable-birthday-calendar, 2` — the trailing `2` advertises Class 2 locking, which SabreDAV satisfies with its `FakeLockerPlugin` (no real lock state; §6.3).
+- **XML declaration:** `<?xml version="1.0"?>` — no `encoding` attribute. Empty elements are self-closing (e.g. `<d:collection/>`).
 
 ### 6.6 PROPPATCH writable properties
 

@@ -322,29 +322,20 @@ pub async fn count_children(
 }
 
 /// Look up the display name for a user, matching PHP's
-/// `$owner->getDisplayName()` → `IAccountManager` → `oc_accounts.data`,
-/// falling back to `oc_users.displayname`, and finally to the UID itself.
+/// `$owner->getDisplayName()` → `User::getDisplayName()`
+/// (`lib/private/User/User.php:84`), which reads the user backend —
+/// `oc_users.displayname` — and falls back to the UID.
 ///
-/// PHP's `oc_accounts` table stores account data as JSON in the `data` column:
-/// `{"displayname":{"value":"Tan Siew Kin",...},...}`.  The display name is
-/// resolved from `data->>'displayname'->>'value'` first, then from
-/// `oc_users.displayname` as a fallback.
+/// `oc_accounts.data` (JSON `{"displayname":{"value":…}}`) is consulted only
+/// as a secondary source: the AccountManager populates it from
+/// `$user->getDisplayName()` via an event-driven sync
+/// (`lib/private/Accounts/AccountManager.php:665-666`), so it can lag the
+/// backend (e.g. right after `occ user:setting … displayName`). Reading it
+/// first — as an earlier revision did — serves the stale value and diverges
+/// from PHP.
 pub async fn lookup_user_display_name(pool: &DbPool, prefix: &str, uid: &str) -> String {
-    // 1. Try oc_accounts first (PHP IAccountManager path).
-    let accounts_sql = format!("SELECT data FROM {prefix}accounts WHERE uid = $1");
-    let accounts_data: Option<String> = sqlx::query_scalar(&accounts_sql)
-        .bind(uid)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-    if let Some(ref data) = accounts_data {
-        if let Some(dn) = extract_displayname_from_accounts_json(data) {
-            return dn;
-        }
-    }
-
-    // 2. Fall back to oc_users.displayname.
+    // 1. oc_users.displayname — PHP's primary source (User::getDisplayName →
+    //    backend GET_DISPLAYNAME).
     let users_sql = format!("SELECT displayname FROM {prefix}users WHERE uid = $1");
     if let Ok(Some(dn)) = sqlx::query_scalar::<_, Option<String>>(&users_sql)
         .bind(uid)
@@ -355,6 +346,21 @@ pub async fn lookup_user_display_name(pool: &DbPool, prefix: &str, uid: &str) ->
             if !dn.is_empty() {
                 return dn;
             }
+        }
+    }
+
+    // 2. Fall back to oc_accounts.data (PHP IAccountManager), which the
+    //    AccountManager syncs from the backend but which can lag it.
+    let accounts_sql = format!("SELECT data FROM {prefix}accounts WHERE uid = $1");
+    let accounts_data: Option<String> = sqlx::query_scalar(&accounts_sql)
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    if let Some(ref data) = accounts_data {
+        if let Some(dn) = extract_displayname_from_accounts_json(data) {
+            return dn;
         }
     }
 
@@ -948,47 +954,41 @@ async fn batch_lookup_display_names(
         std::collections::HashMap::new();
     let mut unresolved: Vec<&String> = Vec::new();
 
-    // 1. Batch-query oc_accounts first (PHP IAccountManager path).
-    //    oc_accounts stores display names in JSON under data->'displayname'->>'value'.
+    // 1. Batch-query oc_users.displayname first — PHP's primary source
+    //    (User::getDisplayName → backend); see lookup_user_display_name for
+    //    why oc_accounts is only a (potentially stale) fallback.
     let placeholders = uids
         .iter()
         .enumerate()
         .map(|(i, _)| format!("${}", i + 1))
         .collect::<Vec<_>>()
         .join(", ");
-    let accounts_sql = format!(
-        "SELECT uid, data FROM {prefix}accounts WHERE uid IN ({placeholders})",
+    let users_sql = format!(
+        "SELECT uid, displayname FROM {prefix}users WHERE uid IN ({placeholders})",
         prefix = prefix
     );
-    let mut query = sqlx::query(&accounts_sql);
+    let mut query = sqlx::query(&users_sql);
     for uid in uids {
         query = query.bind(uid);
     }
-    let account_rows: Vec<(String, String)> = query
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| {
-            let uid: String = r.get("uid");
-            let data: String = r.get("data");
-            (uid, data)
-        })
-        .collect();
-    for (uid, data) in &account_rows {
-        if let Some(dn) = extract_displayname_from_accounts_json(data) {
-            display_names.insert(uid.clone(), dn);
+    let user_rows = query.fetch_all(pool).await.unwrap_or_default();
+    for row in user_rows {
+        let uid: String = row.get("uid");
+        let dn: Option<String> = row.get("displayname");
+        if let Some(dn) = dn.filter(|s| !s.is_empty()) {
+            display_names.insert(uid, dn);
         }
     }
 
-    // Collect UIDs not found in oc_accounts for the oc_users fallback.
+    // Collect UIDs with no oc_users displayname for the oc_accounts fallback.
     for uid in uids {
         if !display_names.contains_key(uid.as_str()) {
             unresolved.push(uid);
         }
     }
 
-    // 2. Batch-query oc_users for remaining UIDs.
+    // 2. Batch-query oc_accounts for the remaining UIDs (display names in
+    //    JSON under data->'displayname'->>'value').
     if !unresolved.is_empty() {
         let users_placeholders = unresolved
             .iter()
@@ -996,20 +996,28 @@ async fn batch_lookup_display_names(
             .map(|(i, _)| format!("${}", i + 1))
             .collect::<Vec<_>>()
             .join(", ");
-        let users_sql = format!(
-            "SELECT uid, displayname FROM {prefix}users WHERE uid IN ({users_placeholders})",
+        let accounts_sql = format!(
+            "SELECT uid, data FROM {prefix}accounts WHERE uid IN ({users_placeholders})",
             prefix = prefix
         );
-        let mut query = sqlx::query(&users_sql);
+        let mut query = sqlx::query(&accounts_sql);
         for uid in &unresolved {
             query = query.bind(uid);
         }
-        let user_rows = query.fetch_all(pool).await.unwrap_or_default();
-        for row in &user_rows {
-            let uid: String = row.get("uid");
-            let dn: Option<String> = row.get("displayname");
-            if let Some(dn) = dn.filter(|s| !s.is_empty()) {
-                display_names.entry(uid).or_insert(dn);
+        let account_rows: Vec<(String, String)> = query
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                let uid: String = r.get("uid");
+                let data: String = r.get("data");
+                (uid, data)
+            })
+            .collect();
+        for (uid, data) in &account_rows {
+            if let Some(dn) = extract_displayname_from_accounts_json(data) {
+                display_names.entry(uid.clone()).or_insert(dn);
             }
         }
         // 3. For any UIDs still unresolved, fall back to the UID itself.
@@ -1018,7 +1026,7 @@ async fn batch_lookup_display_names(
         }
     }
 
-    // 4. For UIDs that had no oc_accounts row and no oc_users row, fall back to UID.
+    // 4. For UIDs that had no oc_users row and no oc_accounts row, fall back to UID.
     for uid in uids {
         display_names.entry(uid.clone()).or_insert_with(|| uid.clone());
     }
