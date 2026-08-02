@@ -35,6 +35,23 @@
 
 7. **Beware of read operations that write.** Methods named `getVersionsForFile`, `listX`, `findY` sound like pure reads — but they often INSERT missing rows or DELETE orphaned ones as a "sync" side effect. PHP's `getVersionsForFile` inserts `oc_files_versions` rows with `metadata=[]` for any filesystem version that lacks a DB row. These hidden writes collide with Rust's inserts and create the exact kind of silent data mismatch that takes hours to debug. When PHP "syncs" during a read, Rust must either replicate the sync or ensure the data is already consistent. [[beware-read-operations-that-write]]
 
+## Documentation Conventions
+
+**Phase task docs (`SPECS/04-tasks/phase-*.md`):**
+
+1. **Never modify original task descriptions.** The PHP/Rust-gap/Verify text is written as a best-effort spec up front and stays verbatim — even when it later proves wrong (a stale capture, a misidentified call site). Correct it with a note *below* the task, never by editing the task body.
+2. **Mark done / not done via the checkboxes only.** That is the status signal; don't rewrite a task to reflect its outcome.
+3. **A deviation = a departure from the original task description** (what it claimed or expected), *not* a divergence from PHP. If a fix simply makes Rust match PHP, there is no deviation — don't write one.
+4. **No redundant notes.** A note that just repeats what the task already asks for is dead weight — remove it. Keep a deviation only where it genuinely departs from the task text.
+5. **History lives in the per-phase `## Changes` log at the bottom**, not in the task body: what was tried, what was reverted and why, root causes, superseded analyses.
+6. **Ground claims before writing them.** Verify against the PHP source and/or the live A/B harness; do not carry a handover doc's assertions forward unverified — and never present an unconfirmed finding as a confirmed requirement.
+
+**Specifications (`SPECS/01-requirements/`):**
+
+1. **They specify the PHP server's behavior — the target.** Describe exactly what PHP does (headers, XML shape, status codes, DB writes, edge cases), grounded in PHP source with `file:line` (or `file:function`) citations.
+2. **No implementation information.** No Rust state, commit hashes, vendored-crate internals, "what we tried / ruled out / matched for parity", testing narratives, or harness details. (Stating *which sub-tree Rust serves vs. delegates* is fine — that is architecture, not implementation state.)
+3. **Spec = PHP behavior even where we intentionally diverge.** If Rust deliberately differs, that decision belongs in `SPECS/02-specifications/improvements.md` and the phase docs — the requirement still records what PHP does.
+
 ## Project Context
 
 - **Workspace**: `~/Git/nextcloud-rewrite/nextcloud-docker-dev/workspace/server/` contains the PHP reference implementation. All PHP source references in this codebase were originally based on commit `e2dc439c7157e6864313d19e90e626a5db7f20bf`; the workspace is now at `1a0ccac96f9b4a0682c60eac550c0eb03294626b` — verify against the current state when tracing PHP behavior.
@@ -42,3 +59,28 @@
 - **Migrations**: `core-rs/migrations/` are exercised against SQLite in tests; production PostgreSQL schemas are created by PHP Doctrine migrations
 - **Packaging**: `core-rs/packaging/` contains an Arch Linux PKGBUILD that copies the real source tree at build time (`prepare()` copies from the parent `core-rs/` directory).  The `packaging/src/` subtree is a stale build artifact — **do not** update it after code changes; it will be refreshed on the next package build.
 - **Test scope**: `cargo test --lib` for unit tests; integration tests (`cargo test`) may fail on pre-existing issues
+
+## Dev Docker — A/B Testing & Rebuilds
+
+The only verification target is the local dev docker (`master-*` containers, podman with the docker CLI shim). `master-nextcloud-1` runs **both** the Rust `nc-server` (`:80`) and php-fpm; `master-proxy-1` exposes a clean A/B on the same database/instance — the two share `master-database-pgsql-1`, so responses are directly comparable:
+
+| entry | URL | path |
+|---|---|---|
+| Rust | `http://<lan-ip>:8080` | proxy `default_server` → `nextcloud:80` |
+| PHP  | `http://<lan-ip>:9090` | nginx vhost → php-fpm TCP `nextcloud:9000` (bypasses Rust) |
+
+**Comparing an endpoint** (same creds, same DB):
+```bash
+curl -s -u admin:admin "http://127.0.0.1:8080/<path>"   # Rust
+curl -s -u admin:admin "http://127.0.0.1:9090/<path>"   # PHP
+```
+For `oc:`/`nc:` DAV properties, send an **explicit** `<d:propfind><d:prop>…` body — an allprop/bare PROPFIND does not emit them.
+
+**Rebuilding** (run from `nextcloud-docker-dev/`; Docker is podman):
+```bash
+docker compose up -d --build nextcloud   # after Rust or php-shim changes (rebuilds nc-server, re-copies the shim)
+docker compose up -d --build proxy       # after proxy/nginx config or compose port changes
+docker compose restart proxy             # REQUIRED after recreating nextcloud: the proxy caches the old upstream IP and 502s otherwise
+```
+- Logs: `docker logs master-nextcloud-1` · DB: `docker exec master-database-pgsql-1 psql -U postgres -d nextcloud`
+- The php-shim is baked into the image at `/usr/local/share/nc-server/php-shim/index.php`. For a quick live test, `docker cp core-rs/php-shim/index.php master-nextcloud-1:/usr/local/share/nc-server/php-shim/index.php` (PHP reads it per-request, no restart) — rebuild to persist.
