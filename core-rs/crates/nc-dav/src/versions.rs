@@ -488,8 +488,9 @@ pub(crate) async fn insert_version_entity(
     mimetype: i64,
     author_uid: &str,
 ) {
-    // Build metadata JSON: {"author": "uid"}
-    let metadata_json = format!("{{\"author\": \"{author_uid}\"}}");
+    // Build metadata JSON matching PHP `json_encode(['author' => $uid])` — compact,
+    // no space after the colon (see finding #4 / phase-16.4).
+    let metadata_json = version_metadata_json(author_uid);
 
     let insert_sql = format!(
         "INSERT INTO {prefix}files_versions (file_id, \"timestamp\", size, mimetype, metadata) \
@@ -508,9 +509,42 @@ pub(crate) async fn insert_version_entity(
     }
 }
 
+/// Build the `oc_files_versions.metadata` JSON for a write by `author_uid`.
+///
+/// Must match PHP `json_encode(['author' => $uid])` exactly — the compact form
+/// with **no space** after the colon (`VersionEntity` maps `metadata` to
+/// `Types::JSON`, serialized by `json_encode`). A space here is a real,
+/// diff-visible divergence (finding #4 / phase-16.4). `serde_json`'s default
+/// `to_string` is compact and escapes the same characters PHP does.
+pub(crate) fn version_metadata_json(author_uid: &str) -> String {
+    serde_json::json!({ "author": author_uid }).to_string()
+}
+
 fn current_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_metadata_json_is_compact() {
+        // PHP json_encode(['author' => 'admin']) -> {"author":"admin"}
+        assert_eq!(version_metadata_json("admin"), r#"{"author":"admin"}"#);
+    }
+
+    #[test]
+    fn version_metadata_json_escapes_special_chars() {
+        // json_encode escapes quotes/backslashes/control chars; serde_json matches.
+        assert_eq!(
+            version_metadata_json(r#"a"b"#),
+            r#"{"author":"a\"b"}"#
+        );
+    }
 }

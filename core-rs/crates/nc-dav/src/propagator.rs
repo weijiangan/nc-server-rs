@@ -10,6 +10,7 @@
 //! - `lib/private/Files/Cache/Propagator.php` (propagateChange)
 
 use nc_db::pool::DbPool;
+use sqlx::Row as _;
 use tracing::warn;
 
 use crate::row;
@@ -272,6 +273,132 @@ impl Propagator {
             self.propagate_change(fc_path, new_size, size_delta)
                 .await?;
         }
+
+        Ok(())
+    }
+
+    // ── Parent storage_mtime correction (§21.1.1 step 6) ────────────────────
+
+    /// Mirror PHP `Updater::correctParentStorageMtime()` (`Updater.php:225-241`).
+    ///
+    /// Sets the **direct parent**'s `storage_mtime` to the parent **directory's
+    /// disk mtime** (`storage->filemtime($parent)` in PHP). Because PHP's
+    /// `Cache::normalizeData` copies `storage_mtime` → `mtime` when no explicit
+    /// `mtime` is supplied (`Cache.php:468-471`), both columns take the same value.
+    /// The subsequent `propagate_change` then applies `GREATEST(mtime, time)`,
+    /// matching PHP's ordering (correctParentStorageMtime runs before propagateChange).
+    ///
+    /// Failures are logged but non-fatal: PHP swallows the `DeadlockException` here
+    /// ("at worst the storage_mtime isn't updated … only trigger an extra rescan").
+    pub async fn correct_parent_storage_mtime(
+        &self,
+        parent_fc_path: &str,
+        parent_disk_path: &std::path::Path,
+    ) -> Result<(), String> {
+        // Parent directory's on-disk mtime, truncated to whole seconds (PHP
+        // `filemtime` returns int seconds).
+        let disk_mtime = match std::fs::metadata(parent_disk_path)
+            .and_then(|m| m.modified())
+        {
+            Ok(t) => t
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            Err(e) => {
+                warn!(
+                    parent = %parent_fc_path,
+                    error = %e,
+                    "correct_parent_storage_mtime: cannot read parent dir mtime"
+                );
+                return Err(format!("correct_parent_storage_mtime: {e}"));
+            }
+        };
+
+        let hash = row::path_hash(parent_fc_path);
+        let sql = format!(
+            "UPDATE {prefix}filecache \
+             SET storage_mtime = $1, mtime = $1 \
+             WHERE storage = $2 AND path_hash = $3",
+            prefix = self.prefix
+        );
+        sqlx::query(&sql)
+            .bind(disk_mtime)
+            .bind(self.storage_id)
+            .bind(&hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("correct_parent_storage_mtime UPDATE failed: {e}"))?;
+
+        Ok(())
+    }
+
+    // ── Folder-size recalculation chain (§21.1.1 step 5) ────────────────────
+
+    /// Mirror PHP `Cache::correctFolderSize()` (`Cache.php:956-977`) for a file
+    /// path: recompute the size of **every ancestor** from the sum of its direct
+    /// children, walking from the immediate parent up to (and including) the
+    /// storage root. Used for a **new** file, where PHP has no `oldSize` and falls
+    /// back to recalculation instead of a signed size delta.
+    ///
+    /// Per-folder semantics match `calculateFolderSizeInner` (`Cache.php:1023-1101`):
+    /// the folder size is `-1` when **any** child is unscanned (`size = -1`), else
+    /// the sum of child sizes (`0` when there are no children); the row is updated
+    /// only when the value actually changes.
+    pub async fn correct_folder_size_chain(&self, fc_path: &str) -> Result<(), String> {
+        // get_parents returns root-first ("", "files", …); recompute deepest-first so
+        // each level sees its children's freshly-updated sizes.
+        let mut parents = Self::get_parents(fc_path);
+        parents.reverse();
+        for p in parents {
+            self.recompute_folder_size(&p).await?;
+        }
+        Ok(())
+    }
+
+    /// Recompute a single folder's `size` from its direct children (PHP
+    /// `calculateFolderSizeInner`). No-op when the folder row is absent or its size
+    /// is already correct.
+    async fn recompute_folder_size(&self, folder_path: &str) -> Result<(), String> {
+        let folder = match row::lookup_by_path(&self.pool, &self.prefix, self.storage_id, folder_path)
+            .await
+        {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+
+        // Single round-trip: SUM of child sizes and MIN to detect an unscanned child.
+        let sql = format!(
+            "SELECT COALESCE(SUM(size), 0) AS total, COALESCE(MIN(size), 0) AS minsize \
+             FROM {prefix}filecache \
+             WHERE parent = $1 AND storage = $2",
+            prefix = self.prefix
+        );
+        let r = sqlx::query(&sql)
+            .bind(folder.fileid)
+            .bind(self.storage_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| format!("recompute_folder_size SUM/MIN query failed: {e}"))?;
+        let total: i64 = r.get("total");
+        let minsize: i64 = r.get("minsize");
+
+        // Any unscanned child (size = -1) marks the folder unscanned too.
+        let new_size = if minsize == -1 { -1 } else { total };
+
+        if new_size == folder.size {
+            return Ok(());
+        }
+
+        let update_sql = format!(
+            "UPDATE {prefix}filecache SET size = $1 WHERE fileid = $2",
+            prefix = self.prefix
+        );
+        sqlx::query(&update_sql)
+            .bind(new_size)
+            .bind(folder.fileid)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("recompute_folder_size UPDATE failed: {e}"))?;
 
         Ok(())
     }
@@ -682,5 +809,90 @@ mod tests {
         let (_size, etag, mtime, _) = get_row(&pool, &prefix, storage_id, "").await;
         assert_ne!(etag, "root_old", "root etag should change");
         assert!(mtime >= 20, "root mtime should be >= 20");
+    }
+
+    // ── correct_parent_storage_mtime tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn correct_parent_storage_mtime_sets_parent_columns() {
+        let (pool, prefix, storage_id) = fresh_db().await;
+        let prop = Propagator::new(pool.clone(), prefix.clone(), storage_id);
+
+        // Create a real directory and pin its mtime to a known value so the
+        // assertion is deterministic.
+        let dir = std::env::temp_dir().join(format!("nc_prop_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let ft = filetime::FileTime::from_unix_time(1_700_000_123, 0);
+        filetime::set_file_times(&dir, ft, ft).expect("set dir mtime");
+
+        prop.correct_parent_storage_mtime("files/A", &dir)
+            .await
+            .expect("correct_parent_storage_mtime");
+
+        let (_, _, mtime, storage_mtime) = get_row(&pool, &prefix, storage_id, "files/A").await;
+        assert_eq!(storage_mtime, 1_700_000_123, "parent storage_mtime = dir disk mtime");
+        assert_eq!(mtime, 1_700_000_123, "mtime copied from storage_mtime");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── correct_folder_size_chain tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn correct_folder_size_chain_recomputes_ancestors() {
+        let (pool, prefix, storage_id) = fresh_db().await;
+        let prop = Propagator::new(pool.clone(), prefix.clone(), storage_id);
+
+        // Insert a new file (size 30) under files/A — simulates the row a fresh
+        // PUT commits before the size chain runs.
+        sqlx::query(&format!(
+            "INSERT INTO {prefix}filecache (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, size, mtime, storage_mtime, etag, permissions, checksum) \
+             VALUES (5, $1, 'files/A/new.txt', $2, 3, 'new.txt', 0, 0, 30, 20, 20, 'new_old', 27, '')"
+        ))
+        .bind(storage_id)
+        .bind(row::path_hash("files/A/new.txt"))
+        .execute(&pool)
+        .await
+        .expect("insert new file");
+
+        prop.correct_folder_size_chain("files/A/new.txt")
+            .await
+            .expect("correct_folder_size_chain");
+
+        let (size_a, _, _, _) = get_row(&pool, &prefix, storage_id, "files/A").await;
+        assert_eq!(size_a, 80, "files/A = 50 (file.txt) + 30 (new.txt)");
+        let (size_files, _, _, _) = get_row(&pool, &prefix, storage_id, "files").await;
+        assert_eq!(size_files, 80, "files = files/A (80)");
+        let (size_root, _, _, _) = get_row(&pool, &prefix, storage_id, "").await;
+        assert_eq!(size_root, 80, "root = files (80); was -1 unscanned");
+    }
+
+    #[tokio::test]
+    async fn correct_folder_size_chain_propagates_unscanned_child() {
+        let (pool, prefix, storage_id) = fresh_db().await;
+        let prop = Propagator::new(pool.clone(), prefix.clone(), storage_id);
+
+        // Mark files/A/file.txt unscanned (size = -1).
+        sqlx::query(&format!(
+            "UPDATE {prefix}filecache SET size = -1 WHERE path_hash = $1",
+            prefix = prefix
+        ))
+        .bind(row::path_hash("files/A/file.txt"))
+        .execute(&pool)
+        .await
+        .expect("set size=-1");
+
+        prop.correct_folder_size_chain("files/A/file.txt")
+            .await
+            .expect("correct_folder_size_chain");
+
+        // Any unscanned child marks the folder (and, transitively, its ancestors)
+        // unscanned: size = -1.
+        let (size_a, _, _, _) = get_row(&pool, &prefix, storage_id, "files/A").await;
+        assert_eq!(size_a, -1, "files/A has an unscanned child");
+        let (size_files, _, _, _) = get_row(&pool, &prefix, storage_id, "files").await;
+        assert_eq!(size_files, -1, "files/A is now unscanned");
+        let (size_root, _, _, _) = get_row(&pool, &prefix, storage_id, "").await;
+        assert_eq!(size_root, -1, "files is now unscanned");
     }
 }

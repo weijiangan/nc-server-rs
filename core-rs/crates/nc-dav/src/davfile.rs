@@ -364,7 +364,11 @@ impl DavFile for NcDavFile {
                 .unwrap_or_default()
                 .as_secs() as i64;
             let use_mtime        = ctx.x_oc_mtime.unwrap_or(now);
-            let use_creation_time = ctx.x_oc_ctime.unwrap_or(now);
+            // PHP writes `creation_time` only when the client sent `X-OC-CTime`;
+            // otherwise the column keeps its default `0` (finding #3 / phase-16.4,
+            // resolved against `File.php:354-366` + `Cache::normalizeData`'s
+            // array_filter drop of falsy extension fields).
+            let use_creation_time = ctx.x_oc_ctime.unwrap_or(0);
             let mtime_accepted   = ctx.x_oc_mtime.is_some();
             let ctime_accepted   = ctx.x_oc_ctime.is_some();
 
@@ -501,11 +505,13 @@ impl DavFile for NcDavFile {
                 });
             }
 
-            // ── Upsert oc_filecache_extended (REQ §4.4) ──────────────────────
-            // Always update upload_time = use_mtime (the effective mtime of this
-            // upload).  On INSERT (new row): also set creation_time from the
-            // client-supplied X-OC-CTime or current time.  On CONFLICT (existing
-            // row): only upload_time is updated; creation_time is preserved.
+            // ── Upsert oc_filecache_extended (REQ §4.4 / §21.1.4) ─────────────
+            // `upload_time` is always the **request time** (`File.php:355`
+            // `'upload_time' => time()`), independent of any `X-OC-MTime`.
+            // `creation_time` is the client-supplied `X-OC-CTime` when present,
+            // else the column default `0`.  On CONFLICT (existing row) only
+            // `upload_time` is updated; `creation_time` is preserved — matching
+            // PHP's `putFileInfo(['upload_time' => time()])`.
             let extended_sql = format!(
                 "INSERT INTO {prefix}filecache_extended \
                  (fileid, creation_time, upload_time, metadata_etag) \
@@ -516,17 +522,47 @@ impl DavFile for NcDavFile {
             if let Err(e) = sqlx::query(&extended_sql)
                 .bind(fileid)
                 .bind(use_creation_time)
-                .bind(use_mtime)
+                .bind(now)
                 .execute(pool)
                 .await
             {
                 tracing::warn!(fileid = fileid, error = %e, "PUT: failed to upsert oc_filecache_extended");
             }
 
-            // §9.2: propagate size/etag/mtime to the parent chain.
-            // PHP Updater::update computes sizeDifference = newSize - oldSize
-            // from a shallow scan (Updater.php:76-80).
-            let size_diff = (size as i64) - ctx.old_size;
+            // §9.2 / §21.1.1: propagate to the parent chain, mirroring PHP
+            // `Updater::update()` (Updater.php:68-94).  A **new** file has no
+            // `oldSize`, so PHP recomputes ancestor sizes (`correctFolderSize`) and
+            // then propagates ETag/mtime only (`sizeDifference = 0`).  An
+            // **overwrite** knows `oldSize`, so PHP propagates the signed size delta.
+            // In both cases `correctParentStorageMtime` runs before `propagateChange`.
+            let is_new = ctx.initial_fileid.is_none();
+            if is_new {
+                if let Err(e) = ctx.propagator.correct_folder_size_chain(&ctx.fc_path).await {
+                    tracing::warn!(path = %ctx.fc_path, error = %e, "PUT: folder-size chain failed");
+                }
+            }
+
+            // Parent's `storage_mtime` (+`mtime`) ← parent directory disk mtime.
+            let parent_fc_path = ctx
+                .fc_path
+                .rsplit_once('/')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_default();
+            if let Some(parent_disk) = ctx.final_path.parent() {
+                if let Err(e) = ctx
+                    .propagator
+                    .correct_parent_storage_mtime(&parent_fc_path, parent_disk)
+                    .await
+                {
+                    tracing::warn!(
+                        parent = %parent_fc_path,
+                        error = %e,
+                        "PUT: parent storage_mtime correction failed"
+                    );
+                }
+            }
+
+            let size_diff = if is_new { 0 } else { (size as i64) - ctx.old_size };
             if let Err(e) = ctx
                 .propagator
                 .propagate_change(&ctx.fc_path, use_mtime, size_diff)
@@ -589,6 +625,19 @@ impl DavFile for NcDavFile {
                 &ctx.uid,
             )
             .await;
+
+            // Finding #5 / phase-16.4: PHP's `previewgenerator` PostWriteListener
+            // queues preview generation on every write (NodeWrittenEvent).  Reproduce
+            // the side effect so the differential oracle finds the queue row.
+            crate::preview_queue::queue_preview_generation(
+                &ctx.pool,
+                &ctx.prefix,
+                &ctx.uid,
+                fileid,
+                now,
+            )
+            .await;
+
             Ok(())
         }
         .boxed()
