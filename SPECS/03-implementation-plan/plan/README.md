@@ -21,5 +21,7 @@ Split from the original `IMPL_PLAN.md` (Rust Nextcloud Core+Files Implementation
 - [`13-future-considerations-architectural-evolution.md`](13-future-considerations-architectural-evolution.md) — Future Considerations: Architectural Evolution
 - [`14-native-preview-thumbnail-fast-path.md`](14-native-preview-thumbnail-fast-path.md) — 9) Native preview / thumbnail fast path
 - [`15-edge-security-hardening.md`](15-edge-security-hardening.md) — 10) Edge security hardening (PHP-FPM forwarding path)
+- [`16-differential-integration-test-harness.md`](16-differential-integration-test-harness.md) — Differential integration-test harness (Rust core vs. PHP reference)
+- [`17-caldav-carddav-build-vs-adopt.md`](17-caldav-carddav-build-vs-adopt.md) — CalDAV/CardDAV: build-vs-adopt exploration
 
 Back: [`../README.md`](../README.md)

@@ -8,6 +8,7 @@ members = [
     "crates/nc-files",
     "crates/nc-fastcgi",
     "crates/nc-preview",
+    "crates/nc-difftest",
 ]
 resolver = "2"
 
@@ -105,6 +106,11 @@ filetime = "0.2"
 # FastCGI client (async, Tokio-native) — used by nc-fastcgi (Phase 7.1)
 # No explicit registry: resolved via crates-io → artifactory-remote replacement.
 fastcgi-client = { version = "0.11", features = ["runtime-tokio"] }
+
+# Differential-test harness (Phase 16): YAML scenarios/column-registry + unified diffs.
+serde_yaml = "0.9"
+similar = "2"
+pretty_assertions = "1"
 
 # Internal crates
 nc-db = { path = "crates/nc-db" }

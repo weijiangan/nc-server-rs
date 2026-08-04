@@ -1,0 +1,23 @@
+# Phase 16.10 — rejection parity: quota exceeded. Set a 100-byte quota (OCS
+# provisioning — proxied to PHP on the SUT, so both sides run identical
+# provisioning code), then PUT 200 bytes: both sides must answer 507 with the
+# same error shape, and leave no partial state behind (the delta proves it).
+# Cleanup restores quota=none. Existing usage already exceeds 100 bytes, so
+# the PUT is guaranteed to trip the check deterministically.
+name: 23_quota_exceeded
+ops:
+  - op: ocs_user_quota
+    user: admin
+    quota: "100"
+  - op: put
+    path: /remote.php/dav/files/admin/over-quota.txt
+    # 114 bytes — MUST stay > 100 (the quota set above): the rejection check
+    # is length-vs-free-space, and the body's own length is part of the test.
+    body: "this body is deliberately longer than one hundred bytes so that it exceeds the tiny quota set above — by design\n"
+    compare_body: true
+cleanup:
+  - op: ocs_user_quota
+    user: admin
+    quota: "none"
+  - op: delete
+    path: /remote.php/dav/files/admin/over-quota.txt

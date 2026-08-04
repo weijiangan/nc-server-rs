@@ -1,0 +1,20 @@
+# Phase 16.11 — the negative case: a non-previewable type must produce NO
+# oc_previews rows on either side, and the preview request must be rejected
+# identically (status AND body). .zip detects as application/zip on BOTH
+# sides (PHP mimetypemapping + Rust mime_guess, verified) and has no preview
+# provider. (.bin was rejected for this role: PHP detects application/x-bin
+# but Rust application/octet-stream — a real detection divergence recorded in
+# the 16.11 notes, not wanted as noise here.)
+name: 26_preview_unpreviewable
+ops:
+  - op: put
+    path: /remote.php/dav/files/admin/no-preview-target.zip
+    body_file: no-preview.zip
+  - op: get
+    path: /core/preview.png?file=no-preview-target.zip&x=64&y=64
+    compare_body: true
+cleanup:
+  - op: delete
+    path: /remote.php/dav/files/admin/no-preview-target.zip
+    headers:
+      X-NC-Skip-Trashbin: "true"

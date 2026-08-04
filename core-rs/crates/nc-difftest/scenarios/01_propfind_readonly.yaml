@@ -1,0 +1,9 @@
+# Read-only baseline: PROPFIND writes nothing to the diff-set tables, so both
+# deltas must be empty and the report IDENTICAL. This exercises the green path
+# (client -> snapshot -> delta -> canonicalize -> report -> "identical") and is
+# the standing sanity check that the harness does not false-positive on reads.
+name: 01_propfind_readonly
+ops:
+  - op: propfind
+    path: /remote.php/dav/files/admin/
+    depth: 1

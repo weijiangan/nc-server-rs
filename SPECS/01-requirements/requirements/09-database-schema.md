@@ -100,7 +100,7 @@ The Rust server manages the following tables (minimum required for core + files)
 - `permissions` INT — CRUDS bitmask
 - `checksum` VARCHAR(255)
 
-> **Note:** `creation_time` and `upload_time` are **not** columns of `oc_filecache`. They live exclusively in `oc_filecache_extended` (added in NC 17 via `Version17000Date20190514105811`). Do not SELECT them from `oc_filecache`.
+> **Note:** `creation_time` and `upload_time` are **not** columns of `oc_filecache`. They live exclusively in `oc_filecache_extended` (added in NC 17 via `Version17000Date20190514105811`). Do not SELECT them from `oc_filecache`. Write semantics, column defaults (`0`), and which code path sets each column are specified in §21 (in particular §21.2.5).
 
 **`oc_mimetypes`**
 - `id` BIGINT PK AI

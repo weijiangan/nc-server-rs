@@ -1,6 +1,11 @@
 //! Handler for chunked upload v2 endpoints.
 //!
-//! Per PHASE-5.5: MKCOL /dav/uploads/{userId}/{upload_id} with Destination header required.
+//! - MKCOL /dav/uploads/{userId}/{upload_id} — create the upload folder.
+//!   No `Destination` header: PHP (sabre + `ChunkingV2Plugin`) never requires
+//!   or reads one here — the destination arrives with the assembly MOVE
+//!   (`ChunkingV2Plugin::beforeMove`). The old PHASE-5.5 claim that MKCOL
+//!   requires `Destination` was wrong and broke every standard chunked upload
+//!   (finding #23, live-verified 2026-08-05).
 //! Per PHASE-5.6: PUT /dav/uploads/{userId}/{upload_id}/{part_id}
 //! Per PHASE-5.7: MOVE /dav/uploads/{userId}/{upload_id}/.file
 //! Per PHASE-5.8: DELETE /dav/uploads/{userId}/{upload_id}
@@ -87,14 +92,18 @@ async fn handle_mkcol(state: NcDavState, req: Request, upload_id: Option<&str>) 
         }
     };
 
-    // Destination header is required per spec (PHASE-5.5)
-    let destination = match req.headers().get("destination") {
-        Some(h) => h.to_str().unwrap_or(""),
-        None => return bad_request_response("Destination header required"),
-    };
-
-    // Parse the destination URL to extract target path
-    let target_path = parse_destination_path(destination, &req.uri().path().to_string());
+    // PHP does not require (or read) a Destination header on MKCOL — the
+    // assembly MOVE carries the authoritative destination
+    // (ChunkingV2Plugin::beforeMove), and this session's stored target_path is
+    // never consumed (handle_move re-derives it from the MOVE's own header).
+    // Accept a client-supplied Destination leniently, but never demand one:
+    // requiring it rejected every standard chunked upload with 400 (#23).
+    let target_path = req
+        .headers()
+        .get("destination")
+        .and_then(|h| h.to_str().ok())
+        .map(|d| parse_destination_path(d, &req.uri().path().to_string()))
+        .unwrap_or_default();
 
     // Parse OC-Total-Length header if present (PHASE-5.7)
     let expected_size: Option<u64> = req

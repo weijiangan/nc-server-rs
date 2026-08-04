@@ -1,0 +1,24 @@
+# Phase 16.9 — COPY. Exercises oc_filecache row creation for the destination
+# (new fileid, same size/content), parent etag propagation on the destination
+# parent, and any copy-time side effects (extended/metadata rows). Two copies:
+# same dir and into a subdir.
+name: 13_copy
+ops:
+  - op: put
+    path: /remote.php/dav/files/admin/copy-src.txt
+    body: "copy me\n"
+  - op: copy
+    from: /remote.php/dav/files/admin/copy-src.txt
+    to: /remote.php/dav/files/admin/copy-dst.txt
+  - op: mkcol
+    path: /remote.php/dav/files/admin/copy-dir
+  - op: copy
+    from: /remote.php/dav/files/admin/copy-src.txt
+    to: /remote.php/dav/files/admin/copy-dir/copy2.txt
+cleanup:
+  - op: delete
+    path: /remote.php/dav/files/admin/copy-src.txt
+  - op: delete
+    path: /remote.php/dav/files/admin/copy-dst.txt
+  - op: delete
+    path: /remote.php/dav/files/admin/copy-dir

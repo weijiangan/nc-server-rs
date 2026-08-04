@@ -250,6 +250,15 @@ mod tests {
     }
 
     #[test]
+    fn bare_bytes_unit() {
+        // The OCS provisioning API stores an integer quota as "<n> B"
+        // (live-verified: PUT /ocs/v2.php/cloud/users/{uid} key=quota value=100
+        // lands in oc_preferences as "100 B").
+        assert_eq!(parse_quota_string("100 B"), Some(100));
+        assert_eq!(parse_quota_string("0 B"), Some(0));
+    }
+
+    #[test]
     fn human_readable_fractional() {
         // 1.5 GB = 1.5 * 2^30 = 1_610_612_736
         let expected = (1.5_f64 * (1u64 << 30) as f64) as i64;

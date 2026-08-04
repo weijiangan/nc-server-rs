@@ -1,0 +1,18 @@
+# Phase 16.10 — chunked upload v2 (native on both paths: nc-dav
+# upload_handler vs PHP ChunkingV2Plugin). MKCOL the upload dir → PUT chunks
+# → MOVE .file to the destination. The SAME upload_id goes to both sides so
+# any rows keyed on it are comparable; the server removes the upload dir on
+# successful assembly, keeping the scenario re-runnable.
+name: 20_chunked_upload_v2
+ops:
+  - op: chunked_upload_v2
+    upload_dir: /remote.php/dav/uploads/admin/difftest-chunked-1
+    destination: /remote.php/dav/files/admin/chunked.txt
+    chunks:
+      - body: "first chunk of the upload\n"
+      - body: "second chunk completes it\n"
+  - op: get
+    path: /remote.php/dav/files/admin/chunked.txt
+cleanup:
+  - op: delete
+    path: /remote.php/dav/files/admin/chunked.txt

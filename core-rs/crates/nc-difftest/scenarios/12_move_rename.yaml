@@ -1,0 +1,23 @@
+# Phase 16.9 — MOVE (rename + move into subdir). Exercises oc_filecache path
+# rewrite (row removed under the old path, added under the new), parent etag
+# propagation on BOTH parents, and mtime/storage_mtime semantics. The PUT
+# setup inherits any known PUT divergences (16.4 record) — the report
+# attributes them separately from the MOVE effects.
+name: 12_move_rename
+ops:
+  - op: put
+    path: /remote.php/dav/files/admin/move-src.txt
+    body: "move me\n"
+  - op: mkcol
+    path: /remote.php/dav/files/admin/move-dir
+  - op: move
+    from: /remote.php/dav/files/admin/move-src.txt
+    to: /remote.php/dav/files/admin/move-dir/moved.txt
+  - op: move
+    from: /remote.php/dav/files/admin/move-dir/moved.txt
+    to: /remote.php/dav/files/admin/renamed.txt
+cleanup:
+  - op: delete
+    path: /remote.php/dav/files/admin/renamed.txt
+  - op: delete
+    path: /remote.php/dav/files/admin/move-dir

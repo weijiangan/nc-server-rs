@@ -1,0 +1,37 @@
+# Phase 16.9 — PROPPATCH favorite + tags. Rust serves PROPPATCH natively
+# (nc-dav handles {http://owncloud.org/ns}favorite and tags), so this is a
+# true native differential. PHP writes the legacy ITags tables (verified live
+# 2026-08-04): oc_vcategory + oc_vcategory_to_object — the favorite is the
+# special tag `_$!<Favorite>!$_`; oc_properties is NOT written.
+#
+# Target is the skeleton folder /Media (no PUT setup → no inherited PUT
+# divergences). Known re-run caveat: \OC\Tags never deletes oc_vcategory rows
+# and PHP 500s on an empty <oc:tags/> element (TagsPlugin getTags() on null —
+# live-observed), so the tags cannot be fully cleaned up over DAV; a fresh
+# first run needs a pristine instance (same class of caveat as the trash).
+name: 15_proppatch_favorite_tags
+ops:
+  - op: proppatch
+    path: /remote.php/dav/files/admin/Media
+    body: |
+      <?xml version="1.0" encoding="utf-8" ?>
+      <d:propertyupdate xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+        <d:set>
+          <d:prop>
+            <oc:favorite>1</oc:favorite>
+            <oc:tags><oc:tag>alpha</oc:tag><oc:tag>beta</oc:tag></oc:tags>
+          </d:prop>
+        </d:set>
+      </d:propertyupdate>
+cleanup:
+  - op: proppatch
+    path: /remote.php/dav/files/admin/Media
+    body: |
+      <?xml version="1.0" encoding="utf-8" ?>
+      <d:propertyupdate xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+        <d:set>
+          <d:prop>
+            <oc:favorite>0</oc:favorite>
+          </d:prop>
+        </d:set>
+      </d:propertyupdate>

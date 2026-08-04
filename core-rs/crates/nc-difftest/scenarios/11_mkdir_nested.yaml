@@ -1,0 +1,18 @@
+# Phase 16.9 — nested MKCOL. Exercises directory-row creation in oc_filecache
+# (three levels), oc_filecache_extended rows for new dirs, and etag/mtime
+# propagation up the parent chain (§9.2). Distinct dir name so repeated suite
+# runs don't collide with other scenarios in the trash.
+name: 11_mkdir_nested
+ops:
+  - op: mkcol
+    path: /remote.php/dav/files/admin/nested_dir
+  - op: mkcol
+    path: /remote.php/dav/files/admin/nested_dir/inner
+  - op: mkcol
+    path: /remote.php/dav/files/admin/nested_dir/inner/deep
+  - op: propfind
+    path: /remote.php/dav/files/admin/nested_dir/
+    depth: 1
+cleanup:
+  - op: delete
+    path: /remote.php/dav/files/admin/nested_dir

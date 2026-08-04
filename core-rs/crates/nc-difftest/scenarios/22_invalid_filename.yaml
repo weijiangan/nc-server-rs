@@ -1,0 +1,10 @@
+# Phase 16.10 — rejection parity: invalid filename. A backslash is an invalid
+# filename component; both sides must reject with the SAME status AND the same
+# error body shape (compare_body) — "both failed" is not enough (gate S5a).
+# %5C is the percent-encoded backslash in the request path.
+name: 22_invalid_filename
+ops:
+  - op: put
+    path: /remote.php/dav/files/admin/bad%5Cname.txt
+    body: "should be rejected\n"
+    compare_body: true

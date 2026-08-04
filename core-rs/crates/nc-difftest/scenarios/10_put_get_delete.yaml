@@ -1,0 +1,18 @@
+# Phase 16 first green slice: a single file PUT, read back, then DELETE (to
+# trash). Exercises oc_filecache (+ parent etag bump), oc_filecache_extended,
+# oc_files_metadata, oc_storages.size, and oc_files_trash.
+#
+# Note on re-runs: DELETE goes to trash, keyed by a stable natural key; deleting
+# the same path repeatedly accumulates trash rows that collide on that key. This
+# masks the trash delta equally on both sides on runs 2+ (no false-positive, but
+# the trash row is only verified on the first run). For clean repeated runs,
+# reset the instances (docker compose down -v && make diff-up) or vary the path.
+name: 10_put_get_delete
+ops:
+  - op: put
+    path: /remote.php/dav/files/admin/hello.txt
+    body_file: hello.txt
+  - op: get
+    path: /remote.php/dav/files/admin/hello.txt
+  - op: delete
+    path: /remote.php/dav/files/admin/hello.txt

@@ -1,0 +1,176 @@
+# Column classification registry for the differential harness (Phase 16.4/16.5).
+#
+# Keyed `table.column`. Classes:
+#   stable               — compare verbatim (path, name, size, permissions, …)
+#   id_pk / id_fk        — remap through the natural-key id-bijection
+#   timestamp_wall       — mask absolute value, PRESERVE equality/ordering in-row
+#   volatile_value       — equality meaningful (etag); per-snapshot sentinels
+#   volatile_independent — per-row random (share token); mask to a constant
+#   ignore               — known irrelevant (e.g. oc_storages.last_checked)
+#
+# Every classification was verified against the live Postgres schema on
+# 2026-08-03 (CLAUDE.md principles 3 & 6) — not the SQLite fixture. Natural keys
+# + the FK graph are encoded in canonicalize.rs; this file classifies columns.
+
+oc_storages:
+  numeric_id: id_pk
+  id: stable            # natural key (e.g. "home::admin")
+  available: stable
+  last_checked: ignore  # per-request wall time, plan §3
+
+oc_mimetypes:
+  id: id_pk
+  mimetype: stable      # natural key
+
+oc_filecache:
+  fileid: id_pk
+  storage: id_fk        # -> oc_storages.numeric_id
+  path: stable          # natural key component (the true natural key)
+  path_hash: stable     # md5(path); deterministic for equal path
+  parent: id_fk         # -> oc_filecache.fileid
+  name: stable
+  mimetype: id_fk       # -> oc_mimetypes.id
+  mimepart: id_fk       # -> oc_mimetypes.id
+  size: stable
+  mtime: timestamp_wall
+  storage_mtime: timestamp_wall
+  encrypted: stable
+  unencrypted_size: stable
+  etag: volatile_value
+  permissions: stable
+  checksum: stable
+
+oc_filecache_extended:
+  fileid: id_fk         # == oc_filecache.fileid; also the natural key
+  metadata_etag: volatile_independent
+  creation_time: timestamp_wall
+  upload_time: timestamp_wall
+
+oc_files_metadata:
+  id: id_pk
+  file_id: id_fk        # -> oc_filecache.fileid; natural key
+  json: stable
+  sync_token: volatile_independent
+  last_update: timestamp_wall
+
+oc_files_trash:
+  auto_id: id_pk
+  # `id` is "{filename}.d{deletion-timestamp}" — the timestamp suffix is
+  # volatile, so it is masked to preserve only the filename identity; the row is
+  # keyed on the stable columns (user, location, type, mime).
+  id: volatile_independent
+  user: stable          # natural key component
+  timestamp: volatile_independent  # deletion wall-time
+  location: stable      # natural key component (original path)
+  type: stable          # natural key component
+  mime: stable          # natural key component
+  deleted_by: stable
+
+oc_properties:
+  id: id_pk
+  userid: stable        # natural key component
+  propertypath: stable  # natural key component
+  propertyname: stable  # natural key component
+  propertyvalue: stable
+  valuetype: stable
+
+oc_files_versions:
+  id: id_pk
+  file_id: id_fk        # -> oc_filecache.fileid; natural key
+  timestamp: volatile_independent  # version wall-time
+  size: stable
+  mimetype: id_fk       # -> oc_mimetypes.id
+  metadata: stable      # JSON; a formatting divergence here is REAL (vs PHP json_encode)
+
+oc_preview_generation:
+  id: id_pk
+  uid: stable
+  file_id: id_fk        # -> oc_filecache.fileid; natural key
+  queued_at: volatile_independent
+
+# Shares (Phase 16.7 self-check). Share creation is proxied to PHP on the SUT
+# (nc-ocs only serves /config + /cloud/capabilities natively), so both sides
+# execute identical PHP — this table is a harness self-check surface.
+# Live schema verified 2026-08-04. A group share writes TWO rows: the
+# TYPE_GROUP(1) parent plus one TYPE_USERGROUP(2) child per group member
+# (DefaultShareProvider::createUserSpecificGroupShare), parent -> parent id.
+oc_share:
+  id: id_pk
+  share_type: stable    # natural key component (0 user, 1 group, 2 usergroup, 3 link)
+  share_with: stable    # natural key component; NULL on link shares
+  password: volatile_independent  # per-share salted hash when set; NULL in the scenarios
+  uid_owner: stable     # natural key component
+  uid_initiator: stable # natural key component
+  parent: id_fk         # -> oc_share.id (USERGROUP child of a group share)
+  item_type: stable     # natural key component ("file"/"folder")
+  item_source: id_fk    # -> oc_filecache.fileid (legacy fileid-as-string); natural key
+  item_target: stable   # legacy; NULL on modern writes
+  file_source: id_fk    # -> oc_filecache.fileid
+  file_target: stable   # natural key component
+  permissions: stable
+  stime: timestamp_wall
+  accepted: stable      # 0 on the group parent, 1 on auto-accepted USERGROUP children
+  expiration: timestamp_wall  # NULL in the scenarios
+  token: volatile_independent  # random per link share; the S3b sensitivity surface
+  mail_send: stable     # post-notification UPDATE settles it to 0 on both sides
+  share_name: stable
+  password_by_talk: stable
+  note: stable
+  hide_download: stable
+  label: stable
+  attributes: stable
+  password_expiration_time: timestamp_wall
+  reminder_sent: stable
+
+# Previews (Phase 16.11). Live schema + row semantics verified 2026-08-05 on
+# both instances: ids are snowflakes; etag IS the source file's etag; mtime is
+# the GENERATION wall-time, not the source mtime (proven with an X-OC-Mtime
+# 1700000000 probe — both sides wrote now()); size is the preview byte size.
+# version_id is -1 for current-file previews; location_id/old_file_id NULL.
+oc_previews:
+  id: id_pk                     # snowflake; natural-key matching only
+  file_id: id_fk                # -> oc_filecache.fileid; natural key
+  storage_id: id_fk             # -> oc_storages.numeric_id
+  old_file_id: id_fk            # -> oc_filecache.fileid; NULL in the scenarios
+  location_id: id_fk            # -> oc_preview_locations.id; NULL in the scenarios
+  width: stable                 # natural key component
+  height: stable                # natural key component
+  mimetype_id: id_fk            # -> oc_mimetypes.id (preview mime); natural key
+  source_mimetype_id: id_fk     # -> oc_mimetypes.id
+  max: stable
+  cropped: stable               # natural key component
+  encrypted: stable
+  etag: volatile_value          # the SOURCE etag; equality meaningful
+  mtime: timestamp_wall         # generation wall-time; in-row equality preserved
+  size: stable                  # preview bytes; same generator -> equal
+  version_id: stable            # -1 for current-file previews; revisit if versioned previews enter a scenario
+
+oc_preview_locations:
+  id: id_pk
+  bucket_name: stable           # natural key component (live unique index)
+  object_store_name: stable     # natural key component
+
+oc_preview_versions:
+  id: id_pk
+  file_id: id_fk                # -> oc_filecache.fileid; natural key
+  version: stable               # natural key component
+
+# Legacy ITags (Phase 16.9): DAV PROPPATCH {oc:}favorite / {oc:}tags →
+# TagsPlugin → \OC\Tags → these two tables. Live-verified 2026-08-04: the
+# favorite is the special tag `_$!<Favorite>!$_`; `oc_properties` is NOT
+# written for either property.
+oc_vcategory:
+  id: id_pk
+  uid: stable       # natural key component
+  type: stable      # natural key component ("files")
+  category: stable  # natural key component (the tag name)
+
+oc_vcategory_to_object:
+  # Composite PK (categoryid, objid, type); leaf table (no FK references it).
+  objid: id_fk      # -> oc_filecache.fileid; natural key
+  categoryid: id_fk # -> oc_vcategory.id; natural key
+  type: stable      # natural key component
+
+# oc_preferences is in db.rs SKIP_TABLES: per-user runtime/UI state the PHP path
+# writes on nearly every request (lastLogin, lastSeenQuotaUsage, ...) while the
+# SUT serves those paths natively — pure noise for a file-behavior differential.

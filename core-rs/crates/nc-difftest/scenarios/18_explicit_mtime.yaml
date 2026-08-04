@@ -1,0 +1,28 @@
+# Phase 16.9 — explicit X-OC-Mtime. The client dictates the mtime, so the
+# stored values are DETERMINISTIC — the scenario promotes oc_filecache.mtime
+# and .storage_mtime to `stable` (stable_overrides) and compares them
+# verbatim despite the registry's timestamp masking. 1700000000/1700000123
+# are fixed past timestamps: any side that ignores the header (storing
+# request time instead) diverges on the absolute value. The second PUT makes
+# the overwrite path version the file under the explicit mtime
+# (files_versions/{name}.v1700000000 — deterministic name).
+name: 18_explicit_mtime
+stable_overrides:
+  - oc_filecache.mtime
+  - oc_filecache.storage_mtime
+ops:
+  - op: put
+    path: /remote.php/dav/files/admin/mtime.txt
+    body: "explicit mtime, first write\n"
+    headers:
+      X-OC-Mtime: "1700000000"
+  - op: get
+    path: /remote.php/dav/files/admin/mtime.txt
+  - op: put
+    path: /remote.php/dav/files/admin/mtime.txt
+    body: "explicit mtime, second write\n"
+    headers:
+      X-OC-Mtime: "1700000123"
+cleanup:
+  - op: delete
+    path: /remote.php/dav/files/admin/mtime.txt

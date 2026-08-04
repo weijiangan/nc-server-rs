@@ -1,0 +1,11 @@
+# Clean write happy-path: PUT a new file, read it back. No DELETE, so no
+# trash/volatile-timestamp paths. Isolates the core PUT side-effects
+# (oc_filecache + parent etag, oc_filecache_extended, oc_files_metadata,
+# oc_storages.size) from the trash flow (see 10_put_get_delete).
+name: 10_put_get
+ops:
+  - op: put
+    path: /remote.php/dav/files/admin/hello.txt
+    body_file: hello.txt
+  - op: get
+    path: /remote.php/dav/files/admin/hello.txt

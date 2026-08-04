@@ -1,0 +1,38 @@
+[package]
+name = "nc-difftest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Differential integration-test harness (Phase 16). BLACK-BOX: it speaks HTTP to
+# the two live instances and SQL to their two databases. It deliberately links
+# NO `nc-*` crate so it stays an independent oracle for their behavior.
+#
+# The integration tests in `tests/` are `#[ignore]`-gated (need a live stack via
+# `make diff-up`), so the project's default `cargo test --lib` is unaffected.
+
+[lib]
+name = "nc_difftest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "difftest"
+path = "src/bin/difftest.rs"
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+similar = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+# Native Postgres driver (in addition to the workspace `any` feature) so the
+# preconditions/snapshot code can open the two databases directly.
+sqlx = { workspace = true, features = ["postgres"] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

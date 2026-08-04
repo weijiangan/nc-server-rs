@@ -1,0 +1,17 @@
+# Phase 16.9 — overwrite PUT (copy-on-write/versioning path). The second PUT
+# replaces the content; PHP moves the old content to a version
+# (files_versions/{name}.v{old-mtime} + oc_files_versions row), Rust must
+# match. Distinct filename for suite isolation.
+name: 16_overwrite_put
+ops:
+  - op: put
+    path: /remote.php/dav/files/admin/overwrite.txt
+    body: "version one\n"
+  - op: put
+    path: /remote.php/dav/files/admin/overwrite.txt
+    body: "version two — longer content\n"
+  - op: get
+    path: /remote.php/dav/files/admin/overwrite.txt
+cleanup:
+  - op: delete
+    path: /remote.php/dav/files/admin/overwrite.txt

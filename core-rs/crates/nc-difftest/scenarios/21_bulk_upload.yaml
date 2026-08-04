@@ -1,0 +1,17 @@
+# Phase 16.10 — bulk upload (native: nc-dav bulk_handler vs PHP
+# BulkUploadPlugin). One multipart/related POST with per-part X-File-Path
+# headers (format grounded in apps/dav/lib/BulkUpload/BulkUploadPlugin.php +
+# MultipartRequestParser.php). Distinct filenames for suite isolation.
+name: 21_bulk_upload
+ops:
+  - op: bulk
+    files:
+      - path: /bulk-a.txt
+        body: "bulk file A\n"
+      - path: /bulk-b.txt
+        body: "bulk file B — slightly longer\n"
+cleanup:
+  - op: delete
+    path: /remote.php/dav/files/admin/bulk-a.txt
+  - op: delete
+    path: /remote.php/dav/files/admin/bulk-b.txt

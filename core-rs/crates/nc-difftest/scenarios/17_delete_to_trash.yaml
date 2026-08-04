@@ -1,0 +1,17 @@
+# Phase 16.9 — DELETE to trash. Exercises oc_files_trash (natural key
+# (user, location, type, mime)), the trashbin filecache rows under
+# files_trashbin/, and the version/preview side effects of deletion. Distinct
+# filename: hello.txt is used by the 10_* scenarios and their trash rows
+# would collide on the stripped natural key.
+#
+# Known-red on the current build — see the delete-flow findings (#6–#12) in
+# the phase doc; the scenario records them precisely.
+name: 17_delete_to_trash
+ops:
+  - op: put
+    path: /remote.php/dav/files/admin/trash-me.txt
+    body: "trash me\n"
+  - op: get
+    path: /remote.php/dav/files/admin/trash-me.txt
+  - op: delete
+    path: /remote.php/dav/files/admin/trash-me.txt

@@ -1,0 +1,22 @@
+# Phase 16.10 — OC-Checksum parity. First PUT carries the correct SHA1 of the
+# body (precomputed) — the stored oc_filecache.checksum must match PHP's
+# verbatim (stable column). Second PUT carries a WRONG checksum — both sides
+# must reject identically (status + body), leaving no residue.
+name: 24_checksum_upload
+ops:
+  - op: put
+    path: /remote.php/dav/files/admin/checksummed.txt
+    body_file: checksum-body.txt
+    headers:
+      OC-Checksum: "SHA1:58e597785b43d69092f23da3c485cd9e56da97aa"
+  - op: get
+    path: /remote.php/dav/files/admin/checksummed.txt
+  - op: put
+    path: /remote.php/dav/files/admin/checksummed.txt
+    body_file: checksum-body.txt
+    headers:
+      OC-Checksum: "SHA1:0000000000000000000000000000000000000000"
+    compare_body: true
+cleanup:
+  - op: delete
+    path: /remote.php/dav/files/admin/checksummed.txt

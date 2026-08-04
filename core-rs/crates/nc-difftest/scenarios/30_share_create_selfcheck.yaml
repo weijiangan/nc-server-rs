@@ -1,0 +1,42 @@
+# Phase 16.7 standing health check (gate S3b).
+#
+# Share creation is PROXIED to PHP on the SUT (nc-ocs serves only /config and
+# /cloud/capabilities natively; everything else under /ocs/ falls through to
+# php-fpm), so SUT and Oracle execute the SAME PHP code against their own DBs.
+# This scenario must therefore ALWAYS match. If it ever fails, the HARNESS is
+# wrong (over-masking, snapshot inconsistency, oracle drift, registry drift) —
+# investigate the harness before suspecting the server.
+#
+# What it exercises:
+# - the group share writes TWO oc_share rows (verified live 2026-08-04): the
+#   TYPE_GROUP(1) parent + one TYPE_USERGROUP(2) child per group member
+#   (DefaultShareProvider::createUserSpecificGroupShare), parent -> parent id.
+#   share_with is the string "admin" in BOTH rows (gid == uid here) — the
+#   natural key needs share_type to keep them apart.
+# - the link share carries a random per-instance token (volatile_independent)
+#   — the sensitivity surface: misclassifying oc_share.token as stable makes
+#   this scenario fail.
+# - cleanup deletes both shares AFTER the after-snapshot (never diffed), so
+#   the scenario is re-runnable; deleting the group share cascades its child.
+#
+# The shared node is the skeleton folder /Media (present on both instances
+# from install) so the scenario needs no native write op — a PUT would inherit
+# the known phase-9/10 divergences and break the "always identical" contract.
+name: 30_share_create_selfcheck
+ops:
+  - op: share_create
+    path: /Media
+    share_type: 1
+    share_with: admin
+    capture:
+      group_share_id: ocs.data.id
+  - op: share_create
+    path: /Media
+    share_type: 3
+    capture:
+      link_share_id: ocs.data.id
+cleanup:
+  - op: share_delete
+    id: "{group_share_id}"
+  - op: share_delete
+    id: "{link_share_id}"

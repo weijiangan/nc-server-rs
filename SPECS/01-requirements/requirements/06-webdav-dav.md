@@ -257,6 +257,8 @@ When a file is deleted, PHP `Trashbin::retainVersions()` **moves** its versions 
 ### 6.8 Cache propagation on write (parent ETag / mtime / size)
 
 > **PHP source:** `lib/private/Files/Cache/Updater.php` (`update()`, `remove()`, `copyOrRenameFromStorage()`) → `lib/private/Files/Cache/Propagator.php` (`propagateChange()`).
+>
+> The full `oc_filecache` population lifecycle — the inline write path, read-time lazy scan and Watcher repair, background/CLI scans, and what the repair paths can and cannot reconstruct — is specified in §21.
 
 Every mutating operation on the files tree — `PUT`, `DELETE`, `MOVE`, `COPY`, `MKCOL`, chunked-upload assembly, `PROPPATCH` that changes mtime — must **propagate up the parent chain to the storage root**. This is core filecache mechanics (not an app), it is **performance-critical**, and it **must be implemented natively in Rust** — it cannot be delegated, because both the web client *and* every sync client detect changes by polling the ETag of parent folders. If propagation is missing, sync silently breaks (clients never see the change).
 

@@ -1,0 +1,13 @@
+# Phase 16.9 — PROPFIND Depth:1 (read-only). Writes nothing to the diff-set
+# tables, so both deltas must be empty and the report IDENTICAL — a second
+# green read baseline next to 01_propfind_readonly, this one over a subtree
+# with children. (Response-body parity — e.g. the 16.2 allprop over-emission —
+# is out of scope for the delta oracle; status codes are the secondary signal.)
+name: 14_propfind_depth1
+ops:
+  - op: propfind
+    path: /remote.php/dav/files/admin/
+    depth: 1
+  - op: propfind
+    path: /remote.php/dav/files/admin/Media
+    depth: 1
