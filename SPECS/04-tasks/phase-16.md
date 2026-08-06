@@ -1000,3 +1000,22 @@ The last two 16.9 findings are resolved, closing the whole #13–#22 group:
 **Verification:** `15_proppatch_favorite_tags` is now **IDENTICAL** (favorite mapping +
 tags + appconfig all match on a clean appconfig state); 14/30 IDENTICAL; 10/16/12/13 unchanged
 (no regressions). 305 nc-dav lib tests pass.
+
+### 2026-08-07 — Quota enforcement (`23_quota_exceeded`)
+
+The 16.10 quota divergence is resolved in `nc-dav` (`davfile.rs`, `row.rs`, vendored dav-server):
+
+- The PUT flush now mirrors PHP's `Quota` wrapper (`Quota.php:90-98`): the write is rejected
+  when the body size >= the free space (`max(quota - used, 0)`, the used = the home storage
+  root's cached size), answering 507 InsufficientStorage with no partial state (the temp file
+  is removed). The quota is read from `oc_preferences` (`files`/`quota`), with the human format
+  PHP's OCS provisioning stores (`"100 B"`, `"1.5 GB"`, … — the provisioning appends the unit;
+  a bare number is accepted too; `none`/`default` = unlimited).
+- The 507 response body matches PHP's sabre rejection: the vendored dav-server's error
+  rendering now emits the `<d:error>` XML (`Sabre\DAV\Exception\InsufficientStorage`,
+  "Insufficient space in {dav-path}") for InsufficientStorage instead of an empty body
+  (rejection parity; the dav-server previously answered `Content-Length: 0`).
+
+**Verification:** `23_quota_exceeded` is **IDENTICAL** (507 == 507, matching bodies, no DB or
+file-tree state on either side); 14/30/15 IDENTICAL; 10/16 unchanged (no regressions).
+`cargo test --lib -p nc-dav` → 305 passed.

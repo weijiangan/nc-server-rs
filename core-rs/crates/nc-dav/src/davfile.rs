@@ -405,10 +405,7 @@ impl DavFile for NcDavFile {
                 .await;
             }
 
-            // ── Blocking: flush OS buffer + get size + atomic rename ──────────
-            let temp_path  = ctx.temp_path.clone();
-            let final_path = ctx.final_path.clone();
-
+            // ── Blocking: flush OS buffer + get size ─────────────────────────
             let (sync_res, file_done) = blocking(move || {
                 let mut f = file;
                 if let Err(e) = f.flush() {
@@ -418,15 +415,36 @@ impl DavFile for NcDavFile {
                     Ok(m)  => m.len(),
                     Err(e) => return (Err(e), f),
                 };
-                if let Err(e) = std::fs::rename(&temp_path, &final_path) {
-                    return (Err(e), f);
-                }
                 (Ok(size), f)
             })
             .await;
 
             drop(file_done);
             let size = sync_res.map_err(io_to_fs)?;
+
+            // PHP's Quota wrapper rejects the write when the body size >= free
+            // space (Quota.php:90-98 — `quota - used`); the DAV answers 507
+            // InsufficientStorage and leaves no partial state (finding #24).
+            if let Some(free) =
+                crate::row::quota_free_space(&ctx.pool, &ctx.prefix, &ctx.uid, ctx.storage_id)
+                    .await
+            {
+                if (size as i64) >= free {
+                    let temp = ctx.temp_path.clone();
+                    let temp_display = temp.clone();
+                    if let Err(e) = blocking(move || std::fs::remove_file(&temp)).await {
+                        tracing::warn!(path = %temp_display.display(), error = %e, "Failed to remove temp file after quota rejection");
+                    }
+                    return Err(FsError::InsufficientStorage);
+                }
+            }
+
+            // ── Blocking: atomic rename ───────────────────────────────────────
+            let temp_path  = ctx.temp_path.clone();
+            let final_path = ctx.final_path.clone();
+            blocking(move || std::fs::rename(&temp_path, &final_path))
+                .await
+                .map_err(io_to_fs)?;
 
             // ── Async: upsert oc_filecache ────────────────────────────────────
             let new_etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
