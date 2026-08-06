@@ -408,6 +408,26 @@ pub async fn update_tags(
 /// ```
 ///
 /// Matches PHP `TagList::xmlDeserialize()`.
+/// Extract the inner TEXT of a PROPPATCH prop element.
+///
+/// The dav-server passes the FULL serialized element in `DavProp.xml`
+/// (`handle_props.rs::element_to_davprop_full`) — e.g.
+/// `<oc:favorite xmlns:oc="http://owncloud.org/ns">1</oc:favorite>` — while
+/// PHP's `TagsPlugin` compares the inner text (`"1"` / `"true"`).  Falls back
+/// to the raw bytes as a string when the element doesn't parse.
+pub fn prop_inner_text(xml: &[u8]) -> String {
+    if let Ok(elem) = xmltree::Element::parse(std::io::Cursor::new(xml)) {
+        let mut text = String::new();
+        for child in &elem.children {
+            if let xmltree::XMLNode::Text(t) = child {
+                text.push_str(t);
+            }
+        }
+        return text;
+    }
+    String::from_utf8_lossy(xml).to_string()
+}
+
 pub fn parse_tags_xml(xml: &[u8]) -> Vec<String> {
     let s = match std::str::from_utf8(xml) {
         Ok(s) => s,
@@ -463,6 +483,16 @@ pub fn format_tags_xml(tags: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prop_inner_text_extracts_text_value() {
+        // The dav-server passes the FULL serialized element (finding #15).
+        let xml = br#"<oc:favorite xmlns:oc="http://owncloud.org/ns">1</oc:favorite>"#;
+        assert_eq!(prop_inner_text(xml), "1");
+        let xml = br#"<oc:tags xmlns:oc="http://owncloud.org/ns"><oc:tag>a</oc:tag></oc:tags>"#;
+        assert_eq!(prop_inner_text(xml), "");
+        assert_eq!(prop_inner_text(b"not xml at all"), "not xml at all");
+    }
 
     #[test]
     fn parse_tag_info_no_favorite() {

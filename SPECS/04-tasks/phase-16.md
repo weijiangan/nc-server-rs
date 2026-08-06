@@ -960,3 +960,25 @@ compared side-by-side with the SUT) plus difftest runs.
 
 **Remaining in the #13–#22 group:** the PROPPATCH favorite bug (`15_proppatch_favorite_tags`),
 the lazy `files_metadata` appconfig registration, and the home-root mtime propagation.
+
+### 2026-08-07 — PROPPATCH favorite fix (`15_proppatch_favorite_tags`)
+
+The "broken text-valued PROPPATCH extraction" (16.9 finding) is resolved in `nc-dav`
+(`filesystem.rs`, `tags.rs`):
+
+- The dav-server passes the FULL serialized element in `DavProp.xml`
+  (`handle_props.rs::element_to_davprop_full` — `<oc:favorite xmlns:oc="…">1</oc:favorite>`), so
+  the favorite handler's naive `parse::<i64>()` over the whole element failed and `favorite=1`
+  executed an **un**-favorite. The handler now extracts the inner TEXT
+  (`tags::prop_inner_text` — xmltree-based, raw-string fallback) before the truthy test.
+- Verified: the `oc_vcategory_to_object` favorite mapping is identical on both sides after a
+  PROPPATCH; the remaining `oc_vcategory` category-row delta is the accumulated residue
+  (`\OC\Tags` never deletes categories — the scenario's known re-run caveat). The
+  `files_metadata` appconfig row is unchanged during the run (a pre-existing state difference —
+  the lazy-registration divergence, still open).
+- 305 nc-dav lib tests pass (1 new: `prop_inner_text_extracts_text_value`);
+  `14_propfind_depth1` / `30_share_create_selfcheck` IDENTICAL; 10/16/12/13 unchanged (no
+  regressions).
+
+**Remaining in the #13–#22 group:** the lazy `files_metadata` appconfig registration and the
+home-root mtime propagation.

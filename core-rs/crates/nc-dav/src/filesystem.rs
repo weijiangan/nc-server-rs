@@ -2722,11 +2722,20 @@ impl DavFileSystem for NcFileSystem {
                         // §9.5: {oc:}favorite — truthy test: (int)1 || 'true' → tagAs,
                         //                   falsy → unTag.  Returns 200.
                         ("http://owncloud.org/ns", "favorite") => {
-                            let state = prop.xml.as_ref().and_then(|xml| {
-                                std::str::from_utf8(xml).ok().map(|s| s.to_string())
-                            });
+                            // The dav-server passes the FULL serialized element
+                            // in prop.xml (handle_props.rs element_to_davprop_full:
+                            // `<oc:favorite xmlns:oc="…">1</oc:favorite>`), so the
+                            // inner TEXT must be extracted before the truthy test —
+                            // a naive parse of the whole element failed and
+                            // executed an un-favorite (finding #15, the "broken
+                            // text-valued PROPPATCH extraction").
+                            let state = prop
+                                .xml
+                                .as_deref()
+                                .map(|xml| crate::tags::prop_inner_text(xml));
                             let is_fav = state.as_deref().map_or(false, |s| {
-                                s.parse::<i64>().ok() == Some(1) || s == "true"
+                                let t = s.trim();
+                                t.parse::<i64>().ok() == Some(1) || t == "true"
                             });
                             let fileid = crate::row::lookup_by_path(
                                 &self.state.pool,
