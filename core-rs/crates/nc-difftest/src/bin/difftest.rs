@@ -211,12 +211,47 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
     let d_oracle = delta::normalize_delta(delta::delta(&cob, &coa), &canon.registry);
     let (db_identical, db_diff_text) = report::diff(&d_sut, &d_oracle);
 
+    // Match any divergence against the known-divergence inventory
+    // (divergences.yaml — Phase 16.12): listed divergences are reported as
+    // KNOWN (with the inventory id and rationale) and do not fail the run;
+    // unlisted ones are real failures.
+    let inventory_path = format!("{}/divergences.yaml", env!("CARGO_MANIFEST_DIR"));
+    let inventory = nc_difftest::divergences::Inventory::load(&inventory_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let divs = nc_difftest::delta::divergences(&d_sut, &d_oracle);
+    let (known, unlisted) = inventory.match_run(&sc.name, &divs);
+
     println!("[fs] diffing file-tree deltas ...");
     let fd_sut = fs::delta(&fs_sut_before, &fs_sut_after);
     let fd_oracle = fs::delta(&fs_oracle_before, &fs_oracle_after);
     let (fs_identical, fs_diff_text) = fs::diff(&fd_sut, &fd_oracle);
 
-    if db_identical && fs_identical && ops_ok {
+    // A DB delta is acceptable when it is identical OR every divergence is
+    // covered by the known-divergence inventory (divergences.yaml).
+    let db_ok = db_identical || unlisted.is_empty();
+    if fs_identical && ops_ok && db_ok {
+        if !known.is_empty() {
+            println!(
+                "KNOWN DIVERGENCES in scenario '{}' (inventory: {}) — documented, not failures:",
+                sc.name,
+                known.len()
+            );
+            for (d, rec) in &known {
+                println!(
+                    "  [{}] {}\n      {}.{} columns {:?}\n      why: {}{}",
+                    rec.status,
+                    rec.id,
+                    d.table,
+                    d.key,
+                    d.columns,
+                    rec.why,
+                    rec.revisit
+                        .as_ref()
+                        .map(|r| format!("\n      revisit: {r}"))
+                        .unwrap_or_default()
+                );
+            }
+        }
         println!("IDENTICAL: scenario '{}' produced matching deltas on both sides.", sc.name);
         Ok(())
     } else {
@@ -228,6 +263,12 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
             println!("  (response-body mismatch above — rejection parity)");
         }
         if !db_identical {
+            if !unlisted.is_empty() {
+                println!("  UNLISTED divergences (missing from divergences.yaml — real failures):");
+                for d in &unlisted {
+                    println!("    {}.{} columns {:?}", d.table, d.key, d.columns);
+                }
+            }
             println!("{db_diff_text}");
         }
         if !fs_identical {

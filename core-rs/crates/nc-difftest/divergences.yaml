@@ -1,0 +1,94 @@
+# Known-divergence inventory (Phase 16.12).
+#
+# Every INTENTIONAL divergence the SUT keeps against PHP is itemized here —
+# with the WHY (the PHP bug or requirement driving it) and a `status` — so
+# each can be tracked and removed later.  The scenario runner matches its
+# structured divergences against this file: an unlisted divergence fails the
+# run; a listed one is reported as KNOWN DIVERGENCE (inventory id) and does
+# not fail it.
+#
+# Statuses:
+# - `accepted` — intentional: the SUT deliberately differs (PHP bug /
+#   REQ-driven), documented with the rationale and a `revisit` hint.
+# - `noise` — a harness artifact (e.g. second-boundary sentinel-label
+#   differences whose raw values are verified equal), not a behavior gap.
+#
+# Matching: table equal, the row key starts with `key`, the record's
+# `columns` are empty or cover the row's divergent columns, and the record's
+# `scenarios` are empty or contain the scenario name.
+
+- id: home-root-size
+  why: >-
+    PHP's home-root size is never recomputed: Cache::calculateFolderSizeInner
+    (Cache.php:1023) compares the integer mimetype against the string
+    MIMETYPE_FOLDER with strict === (always false), so correctFolderSize is a
+    no-op and the root is updated only by size-delta propagateChanges
+    (overwrites, assembly source-chain removals).  Live-verified 2026-08-07:
+    the oracle root is frozen across PUT/DELETE/COPY/OVERWRITE.  Rust
+    recomputes the actual sum of all children (files + trash + versions +
+    cache + uploads) — the correct usage value — per CLAUDE.md principle 5
+    (don't replicate PHP bugs).  The #1 divergence from the 16.4 record.
+  status: accepted
+  revisit: "when the PHP mimetype comparison is fixed upstream, or if clients are found to depend on PHP's stale root size"
+  scenarios:
+    - 10_put_get
+    - 10_put_get_delete
+    - 12_move_rename
+    - 13_copy
+    - 16_overwrite_put
+    - 17_delete_to_trash
+    - 18_explicit_mtime
+    - 20_chunked_upload_v2
+    - 24_checksum_upload
+    - 25_preview_image
+    - 26_preview_unpreviewable
+  table: oc_filecache
+  # Canonical natural key: the storage label + the path concatenated — the
+  # home root row's key is exactly "home::admin" (empty path).
+  key: "home::admin\u0001"
+  columns: [size]
+
+- id: checksum-verification
+  why: >-
+    The SUT verifies the OC-Checksum header against the uploaded bytes (REQ
+    §13.1) and rejects a mismatch with 400; PHP stores the header verbatim
+    unverified (File.php:374-380) — live-verified the oracle accepted a
+    deliberately wrong SHA1 with 204.  Legitimate clients send correct
+    checksums, so the verification does not affect them; kept per REQ §13.1.
+    Scenario 24's recorded intent (the 16.10 notes).
+  status: accepted
+  revisit: "if REQ §13.1 is relaxed, or the verification must mirror PHP's laxness for third-party tooling"
+  scenarios: [24_checksum_upload]
+  table: oc_filecache
+  key: "home::admin\u0001files/checksummed"
+  # `etag` too: the rejected overwrite leaves the SUT row's etag unchanged
+  # while the accepted PHP overwrite bumps it — the same intentional class.
+  columns: [checksum, etag]
+
+- id: replay-second-boundary
+  why: >-
+    The sequential SUT-then-oracle replay can straddle a second boundary, so
+    the per-row timestamp/volatile sentinel labels (TS/VV) can differ between
+    the sides for the SAME raw values — verified equal via direct DB queries
+    (e.g. files/ storage_mtime).  Pre-state residues (accumulated runs) shift
+    the before-etag labels the same way.  Not a behavior difference.
+  status: noise
+  revisit: "a clock-synchronized replay or per-side raw-value comparison would remove the class"
+  scenarios:
+    - 10_put_get
+    - 10_put_get_delete
+    - 12_move_rename
+    - 13_copy
+    - 16_overwrite_put
+    - 17_delete_to_trash
+    - 18_explicit_mtime
+    - 20_chunked_upload_v2
+    - 24_checksum_upload
+    - 25_preview_image
+    - 26_preview_unpreviewable
+  table: oc_filecache
+  key: ""
+  # `mtime` too: 18's stable_overrides compare mtime verbatim, and the
+  # sequential replay's second-boundary straddle shows as a before-mtime
+  # label difference (the after-values are the same generation instant).
+  columns: [size, etag, mtime, storage_mtime]

@@ -84,6 +84,108 @@ pub fn delta(before: &CanonicalSnapshot, after: &CanonicalSnapshot) -> Delta {
     d
 }
 
+/// One structured divergence between the two sides: a row (canonical natural
+/// key) in a table with the divergent columns listed.  A row with an empty
+/// `columns` list diverges structurally (e.g. the change type differs: Added
+/// on one side, Changed on the other).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Divergence {
+    pub table: String,
+    pub key: String,
+    pub columns: Vec<String>,
+}
+
+/// Extract the column-level divergences between two masked deltas.
+///
+/// Each row is compared state-by-state: Added has only an after-state, Removed
+/// only a before-state, Changed has both.  A column diverges when the sides'
+/// states disagree on it (a value on one side and a different value — or no
+/// value at all — on the other).  The change TYPE is compared separately: a
+/// row whose type differs (Added vs Changed, Added vs none, …) diverges even
+/// when every shared column agrees (e.g. the `uploads` row added on one side
+/// and only etag-bumped on the other — the accumulated-state residue).
+pub fn divergences(sut: &Delta, oracle: &Delta) -> Vec<Divergence> {
+    let mut out = Vec::new();
+    let mut tables: Vec<&String> = sut.keys().collect();
+    for t in oracle.keys() {
+        if !sut.contains_key(t) {
+            tables.push(t);
+        }
+    }
+    tables.sort();
+    for table in tables {
+        let empty_s = TableDelta::new();
+        let empty_o = TableDelta::new();
+        let s = sut.get(table).unwrap_or(&empty_s);
+        let o = oracle.get(table).unwrap_or(&empty_o);
+        let mut keys: Vec<&String> = s.keys().collect();
+        for k in o.keys() {
+            if !s.contains_key(k) {
+                keys.push(k);
+            }
+        }
+        keys.sort();
+        for key in keys {
+            let (sb, sa) = row_states(s.get(key));
+            let (ob, oa) = row_states(o.get(key));
+            let cols = differing_columns(sb, sa, ob, oa);
+            if !cols.is_empty() || change_type(s.get(key)) != change_type(o.get(key)) {
+                out.push(Divergence {
+                    table: table.clone(),
+                    key: key.clone(),
+                    columns: cols,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The (before, after) states of a row on one side; both `None` when absent.
+fn row_states(c: Option<&RowChange>) -> (Option<&CanonRow>, Option<&CanonRow>) {
+    match c {
+        None => (None, None),
+        Some(RowChange::Added(r)) => (None, Some(r)),
+        Some(RowChange::Removed(r)) => (Some(r), None),
+        Some(RowChange::Changed { before, after }) => (Some(before), Some(after)),
+    }
+}
+
+/// The change type as a comparable tag (Added/Removed/Changed/None).
+fn change_type(c: Option<&RowChange>) -> &'static str {
+    match c {
+        None => "none",
+        Some(RowChange::Added(_)) => "added",
+        Some(RowChange::Removed(_)) => "removed",
+        Some(RowChange::Changed { .. }) => "changed",
+    }
+}
+
+fn state_val<'a>(s: Option<&'a CanonRow>, col: &str) -> Option<&'a String> {
+    s.and_then(|r| r.get(col))
+}
+
+/// Columns whose before- or after-state differs between the sides.
+fn differing_columns(
+    sb: Option<&CanonRow>,
+    sa: Option<&CanonRow>,
+    ob: Option<&CanonRow>,
+    oa: Option<&CanonRow>,
+) -> Vec<String> {
+    let mut cols: Vec<String> = Vec::new();
+    for r in [sb, sa, ob, oa].into_iter().flatten() {
+        for c in r.keys() {
+            if !cols.contains(c) {
+                cols.push(c.clone());
+            }
+        }
+    }
+    cols.sort();
+    cols.into_iter()
+        .filter(|c| state_val(sb, c) != state_val(ob, c) || state_val(sa, c) != state_val(oa, c))
+        .collect()
+}
+
 /// Mask volatile columns in a delta so it is comparable across sides. Must be
 /// applied to both `delta_sut` and `delta_oracle` before diffing.
 pub fn normalize_delta(mut d: Delta, registry: &Registry) -> Delta {

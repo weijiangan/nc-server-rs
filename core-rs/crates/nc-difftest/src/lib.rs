@@ -13,6 +13,7 @@ pub mod client;
 pub mod config;
 pub mod db;
 pub mod delta;
+pub mod divergences;
 pub mod fs;
 pub mod preconditions;
 pub mod report;

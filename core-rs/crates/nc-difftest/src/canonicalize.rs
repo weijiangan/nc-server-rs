@@ -705,6 +705,86 @@ mod tests {
     }
 
     #[test]
+    fn divergences_report_column_level() {
+        // Same structure, same masked etag -> no divergence.
+        let a = etag_delta("X", "X");
+        assert!(delta::divergences(&a, &a).is_empty());
+
+        // A structural difference (one file only) -> a row divergence with the
+        // full column list.
+        let canon = Canonicalizer::new(registry());
+        let before = snap_with("1", vec![]);
+        let after = snap_with(
+            "1",
+            vec![["10", "1", "files/a", "a", "5", "100", "100", "X", "27"]],
+        );
+        let cb = canon.canonicalize(&before).unwrap();
+        let ca = canon.canonicalize(&after).unwrap();
+        let one = delta::normalize_delta(delta::delta(&cb, &ca), &canon.registry);
+        let two = etag_delta("X", "X");
+        let divs = delta::divergences(&one, &two);
+        assert!(
+            divs.iter()
+                .any(|d| d.table == "oc_filecache" && d.key == "home::admin\u{1}files/b"),
+            "the single-file delta must surface the row divergence: {divs:?}"
+        );
+    }
+
+    #[test]
+    fn inventory_matches_known_and_rejects_unlisted() {
+        use crate::divergences::{DivergenceRecord, Inventory};
+        // Two records: the root-size (accepted) and the boundary noise.
+        let recs = vec![
+            DivergenceRecord {
+                id: "home-root-size".into(),
+                why: "test".into(),
+                status: "accepted".into(),
+                revisit: None,
+                scenarios: vec!["10_put_get".into()],
+                table: "oc_filecache".into(),
+                key: "home::admin".into(),
+                columns: vec!["size".into()],
+            },
+            DivergenceRecord {
+                id: "replay-second-boundary".into(),
+                why: "test".into(),
+                status: "noise".into(),
+                revisit: None,
+                scenarios: vec![],
+                table: "oc_filecache".into(),
+                key: "".into(),
+                columns: vec!["etag".into(), "storage_mtime".into(), "mtime".into()],
+            },
+        ];
+        let inv = Inventory { records: recs };
+        let divs = vec![
+            crate::delta::Divergence {
+                table: "oc_filecache".into(),
+                key: "home::admin".into(),
+                columns: vec!["size".into()],
+            },
+            crate::delta::Divergence {
+                table: "oc_filecache".into(),
+                key: "home::adminfiles".into(),
+                columns: vec!["storage_mtime".into()],
+            },
+            crate::delta::Divergence {
+                table: "oc_filecache".into(),
+                key: "home::adminfiles/hello.txt".into(),
+                columns: vec!["etag".into(), "size".into()],
+            },
+        ];
+        let (known, unlisted) = inv.match_run("10_put_get", &divs);
+        assert_eq!(known.len(), 2, "root-size + noise must match");
+        assert_eq!(unlisted.len(), 1, "the size column is not covered by the noise record");
+        assert_eq!(unlisted[0].key, "home::adminfiles/hello.txt");
+
+        // Same divergences in a scenario the root-size record does not list.
+        let (known2, _) = inv.match_run("99_other", &divs);
+        assert_eq!(known2.len(), 1, "only the scenario-less noise record matches");
+    }
+
+    #[test]
     fn registry_coverage() {
         let reg = registry();
         for t in [
