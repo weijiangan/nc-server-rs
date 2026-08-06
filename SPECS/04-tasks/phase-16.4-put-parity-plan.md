@@ -1,6 +1,7 @@
 # Plan — close the 16.4 PUT divergence (native single-file PUT ↔ PHP)
 
-> Status: **proposed** (2026-08-05). Companion to [`phase-16.md`](phase-16.md) §16.4 deviation.
+> Status: **done** (2026-08-05, code in commits `7b6b501`–`ee6e38b`; documented 2026-08-06).
+> Companion to [`phase-16.md`](phase-16.md) §16.4 deviation.
 > Ground truth: PHP source in `workspace/server/` (commit `1a0ccac9…`) + requirements
 > [`../01-requirements/requirements/06-webdav-dav.md`](../01-requirements/requirements/06-webdav-dav.md) §6.8 and
 > [`../01-requirements/requirements/21-filecache-population.md`](../01-requirements/requirements/21-filecache-population.md) §21.

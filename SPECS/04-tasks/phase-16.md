@@ -131,6 +131,20 @@ Build the Oracle by cloning the SUT's service definition and bypassing Rust:
 
 > **Note (finding #3 resolved, 2026-08-03):** the "verify against PHP source" clause of finding #3 is settled — **PHP is right and the plan's assumption was backwards.** On a bare DAV PUT without `X-OC-CTime`, PHP writes `oc_filecache_extended` with **`upload_time = <request time>` and `creation_time = 0`** (the column default). Chain, fully traced: `apps/dav/lib/Connector/Sabre/File.php:354-366` puts only `upload_time` into `putFileInfo` (plus `creation_time` only when `X-OC-CTime` was sent); `Cache::normalizeData` (`lib/private/Files/Cache/Cache.php:446-487`) drops absent/falsy extension fields via `array_filter`, so the extended write touches only `upload_time`; the migration (`core/Migrations/Version17000Date20190514105811.php`) defines `creation_time BIGINT NOT NULL DEFAULT 0`. Live-verified the same day: oracle `files/hello.txt` = `(creation_time 0, upload_time 1785710360)` vs SUT `(1785710359, 1785710359)` — **Rust over-populates `creation_time` with the upload time.** Fix direction for phase-9/10: Rust writes `creation_time` only when `X-OC-CTime` is present (or via the PROPPATCH `{DAV:}creationdate` path), and otherwise leaves it at `0`. Full population lifecycle documented in [`../01-requirements/requirements/21-filecache-population.md`](../01-requirements/requirements/21-filecache-population.md) (§21.2.5 in particular).
 
+> **Note (findings #1–#5 fix applied, 2026-08-05):** all five divergences from the 16.4 deviation record are resolved in `nc-dav` (commits `7b6b501`–`ee6e38b` on `working`):
+>
+> - **#3 (oc_filecache_extended times):** `creation_time = x_oc_ctime.unwrap_or(0)`; `upload_time = now` (request time). Verified matching in difftest delta.
+> - **#4 (version metadata):** `serde_json::json!({"author": uid}).to_string()` → compact `{"author":"admin"}`. Tested in `versions::tests::version_metadata_json_is_compact`. Verified matching in difftest delta.
+> - **#5 (preview_generation):** new `preview_queue.rs` → `INSERT … WHERE NOT EXISTS`. Verified matching in difftest delta.
+> - **#2 (files/ storage_mtime):** `Propagator::correct_parent_storage_mtime` — sets parent's `storage_mtime`+`mtime` to the parent directory's on-disk mtime. Unit-tested in `propagator.rs`. Verified both sides update `files/` storage_mtime (difftest masking artifact hides Oracle's change; live DB confirms both sides at the same value post-PUT).
+> - **#1 (size propagation):** `Propagator::correct_folder_size_chain` — recomputes each ancestor's size from the sum of its direct children, walking from the parent up. Unit-tested (recomputation, unscanned-child propagation). PostgreSQL `SUM(bigint)`→`NUMERIC` cross-driver bug fixed with `CAST(SUM(size) AS BIGINT)`.
+>
+>   **Known PHP bug surfaced:** `Cache::calculateFolderSizeInner` (`Cache.php:1023`) compares `$entry['mimetype']` (integer from DB, e.g. `2`) against `FileInfo::MIMETYPE_FOLDER` (string `"httpd/unix-directory"`) with `===` — **always false**. The `correctFolderSize` recursion walks the chain but never computes any folder's size. PHP's `files/` size is updated by a different (unidentified) mechanism; root size is **never** recomputed. Rust intentionally implements the *correct* behavior (recompute all ancestors including root) per CLAUDE.md principle 5 — the root-size delta is an intentional improvement over PHP's bug, not a defect.
+>
+>   **Regression**: `21_bulk_upload` → IDENTICAL. `16_overwrite_put` and `18_explicit_mtime` carry the same root-size + storage_mtime patterns as `10_put_get` (no new divergences). 292 nc-dav lib tests pass; workspace `cargo test --lib` clean except pre-existing `nc-fastcgi::registry_scans_real_apps_dir` (environment-dependent).
+>
+>   Full fix plan + PHP trace: [`phase-16.4-put-parity-plan.md`](phase-16.4-put-parity-plan.md).
+
 ### 16.5 Full canonicalization — natural-key id-bijection + equality-preserving masking
 > The design centerpiece (plan §3). Unit-test everything here with hand-built fixtures; prefer preserving relationships over blanket masking.
 
@@ -750,6 +764,65 @@ time (−52). All 286 nc-dav lib tests pass; 13/13 nc-difftest tests pass.
 Coordination note: taken in parallel with another session investigating the
 16.4 deviations (#1–#5) — this fix touches only `upload_handler.rs`, disjoint
 from that work's surface.
+
+### 2026-08-05 — Phase 16.4 findings #1–#5 resolved: PUT parity fix applied
+
+All five divergences from the 2026-08-03 deviation record (the plan at
+[`phase-16.4-put-parity-plan.md`](phase-16.4-put-parity-plan.md)) are resolved
+in `nc-dav` (WIP commits `7b6b501`–`ee6e38b` on `working`).
+
+**Changes (all in `crates/nc-dav/src/`):**
+
+- **`davfile.rs`** – `flush()` commit path:
+  - Finding #3: `creation_time = x_oc_ctime.unwrap_or(0)` (was `unwrap_or(now)`);
+    `upload_time = now` (was `use_mtime`). ON CONFLICT updates only `upload_time`.
+  - Finding #1/#2: replaced old `propagate_change(fc_path, use_mtime, size_diff)`
+    with PHP `Updater::update` mirror: new-file → `correct_folder_size_chain` +
+    `correct_parent_storage_mtime` + `propagate_change(0)`; overwrite →
+    `correct_parent_storage_mtime` + `propagate_change(size − old_size)`.
+  - Finding #5: calls `preview_queue::queue_preview_generation` post-commit.
+
+- **`propagator.rs`** – two new helpers (both unit-tested, SQLite in-memory):
+  - `correct_parent_storage_mtime(parent_fc_path, parent_disk_path)`: reads the
+    parent directory's on-disk mtime, sets `storage_mtime` + `mtime` to it.
+  - `correct_folder_size_chain(fc_path)`: recomputes every ancestor's size as
+    the sum of its direct children (deepest-first); unscanned child (`size = -1`)
+    marks the ancestor unscanned too. PostgreSQL `SUM(bigint)`→`NUMERIC` driver
+    issue fixed with `CAST(SUM(size) AS BIGINT)` (SQLite-safe).
+
+- **`versions.rs`** – Finding #4: `version_metadata_json(author_uid)` via
+  `serde_json::json!({"author": uid}).to_string()` → compact `{"author":"admin"}`.
+  Unit-tested for compactness and special-character escaping.
+
+- **`preview_queue.rs`** (new) – Finding #5: `INSERT INTO … WHERE NOT EXISTS`
+  guard (table has no unique constraint on `(uid, file_id)`). Log-and-continue on error.
+
+- **`lib.rs`** – `mod preview_queue`.
+
+**Verification:**
+- `cargo test --lib -p nc-dav` → 292 passed (no regressions; all new helpers tested)
+- `cargo test --lib` workspace → clean except pre-existing `nc-fastcgi::registry_scans_real_apps_dir`
+- Manual DB inspection confirms both SUT and Oracle update `files/` storage_mtime
+- `cargo build -p nc-dav` / `cargo build -p nc-difftest` → clean (with unused-import fix)
+
+**Difftest:**
+- `10_put_get`: findings #3/#4/#5 → matching in delta. #2 → both sides update
+  storage_mtime (Oracle's change hidden by sentinel masking artifact). #1 → Rust
+  recomputes root size correctly; PHP does not (see PHP bug below).
+- `21_bulk_upload` → IDENTICAL (regression guard passes).
+- `16_overwrite_put`, `18_explicit_mtime` → same root-size + storage_mtime patterns
+  as `10_put_get`; no new divergence classes.
+
+**PHP bug discovered (finding #1):** `Cache::calculateFolderSizeInner`
+(`Cache.php:1023`) compares `$entry['mimetype']` (integer from DB, e.g. `2`)
+against `FileInfo::MIMETYPE_FOLDER` (string `"httpd/unix-directory"`) with
+strict `===` — always false. The `correctFolderSize` recursion walks the ancestor
+chain but never computes any folder's size. PHP's `files/` size is nevertheless
+updated (mechanism unidentified, possibly Scanner::scan internal side-effect);
+root size is **never** recomputed through this path. Rust intentionally implements
+the correct behavior (recompute all ancestors including root) per CLAUDE.md
+principle 5 — don't replicate PHP bugs. The root-size delta in the difftest is
+an intentional improvement, not a defect.
 
 ### 2026-08-07 — Delete-flow findings #6–#12 resolved: delete-to-trash parity (plan `phase-16.8-delete-trash-parity-plan.md`)
 

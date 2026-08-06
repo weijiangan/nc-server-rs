@@ -238,8 +238,11 @@ impl Propagator {
 
         // SUM of direct children sizes (only rows with size > -1 are counted;
         // unscanned folders with size = -1 contribute 0 to the sum via COALESCE).
+        // PostgreSQL SUM(bigint) returns NUMERIC, which sqlx::Any can't decode;
+        // CAST to BIGINT keeps it as a plain i64.  SQLite treats CAST AS BIGINT
+        // as INTEGER affinity — harmless, same column as without the cast.
         let sql = format!(
-            "SELECT COALESCE(SUM(size), 0) AS total \
+            "SELECT COALESCE(CAST(SUM(size) AS BIGINT), 0) AS total \
              FROM {prefix}filecache \
              WHERE parent = $1 AND storage = $2 AND size > -1",
             prefix = self.prefix
@@ -367,8 +370,10 @@ impl Propagator {
         };
 
         // Single round-trip: SUM of child sizes and MIN to detect an unscanned child.
+        // PostgreSQL SUM(bigint) returns NUMERIC; CAST to BIGINT keeps it as i64 for
+        // sqlx::Any.  SQLite treats CAST AS BIGINT as INTEGER affinity — harmless.
         let sql = format!(
-            "SELECT COALESCE(SUM(size), 0) AS total, COALESCE(MIN(size), 0) AS minsize \
+            "SELECT COALESCE(CAST(SUM(size) AS BIGINT), 0) AS total, COALESCE(MIN(size), 0) AS minsize \
              FROM {prefix}filecache \
              WHERE parent = $1 AND storage = $2",
             prefix = self.prefix
@@ -410,7 +415,6 @@ impl Propagator {
 mod tests {
     use super::*;
     use nc_db::pool::DbPool;
-    use sqlx::Row as _;
 
     // ── Unit: get_parents ──────────────────────────────────────────────────
 
