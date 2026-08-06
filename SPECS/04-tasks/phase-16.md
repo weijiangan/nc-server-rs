@@ -294,7 +294,8 @@ Build the Oracle by cloning the SUT's service definition and bypassing Rust:
 ## S5 — Breadth
 
 ### 16.10 Upload / edge scenarios (20–24)
-- [ ] Author and green: `20_chunked_upload_v2` (MKCOL upload dir → PUT chunks → MOVE assembly over `/remote.php/dav/uploads/*`), `21_bulk_upload` (`/dav/bulk`), `22_invalid_filename` (**rejection parity** — same status code + error shape on both sides), `23_quota_exceeded` (same rejection), `24_checksum_upload` (`OC-Checksum` header → `oc_filecache.checksum` parity).
+- [x] Author and green: `20_chunked_upload_v2` (MKCOL upload dir → PUT chunks → MOVE assembly over `/remote.php/dav/uploads/*`), `21_bulk_upload` (`/dav/bulk`), `22_invalid_filename` (**rejection parity** — same status code + error shape on both sides), `23_quota_exceeded` (same rejection), `24_checksum_upload` (`OC-Checksum` header → `oc_filecache.checksum` parity).
+  - **Status (2026-08-07):** `21_bulk_upload`, `22_invalid_filename`, `23_quota_exceeded` → **IDENTICAL** (status + rejection bodies, no residue). `20_chunked_upload_v2` → parity except the accepted root-size divergence (#1); the assembly side effects (#32 entity, #33 preview queue, #34 etag identity, #24 uploads row, #3 extended times) are fixed. `24_checksum_upload` → the stored-checksum semantics verified; the SUT's OC-Checksum verification is kept as an **intentional** REQ §13.1 divergence (live-verified PHP stores the header verbatim unverified — the same class as the accepted root-size divergence, documented in the davfile flush).
 
 **Verify (gate S5a):** 20–24 report identical; the rejection scenarios (22, 23) match on status **and** normalized error body, not just "both failed."
 
