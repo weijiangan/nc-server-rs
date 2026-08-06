@@ -1019,3 +1019,25 @@ The 16.10 quota divergence is resolved in `nc-dav` (`davfile.rs`, `row.rs`, vend
 **Verification:** `23_quota_exceeded` is **IDENTICAL** (507 == 507, matching bodies, no DB or
 file-tree state on either side); 14/30/15 IDENTICAL; 10/16 unchanged (no regressions).
 `cargo test --lib -p nc-dav` → 305 passed.
+
+### 2026-08-07 — Chunked assembly side effects (`20_chunked_upload_v2`, findings #32–#34)
+
+The assembly path's missing DB side effects are resolved in `nc-dav` (`upload_handler.rs`,
+`filesystem.rs`):
+
+- **#32** — the assembly now inserts the `oc_files_versions` entity (PHP's NodeCreatedEvent →
+  `createVersionEntity`, which the plain-PUT path already had).
+- **#33** — the assembly now queues the `oc_preview_generation` row (NodeWrittenEvent →
+  previewgenerator PostWriteListener).
+- **#34** — the assembly's propagation now stamps the SOURCE chain (`uploads/…` → home root)
+  LAST: live-verified the oracle ends with `root.etag == uploads.etag` and a distinct `files`
+  etag (PHP's `renameFromStorage` source-chain stamp wins on the shared root).
+- **#24** — the `uploads/` filecache row is lazily materialized (extracted the generic
+  `ensure_lazy_dir_row` helper shared with the `cache/` materialization).
+- Finding #3's `creation_time = 0`-without-X-OC-CTime semantics applied to the assembly's
+  extended row (was `now`).
+
+**Verification:** `20_chunked_upload_v2` — the entity/preview/extended/etag-identity rows all
+match; the remaining rows are the accepted root-size (+52 vs −52, #1), the storage_mtime label
+artifact, and the `uploads`-row pre-state residue (ADDED vs CHANGED — the oracle's row
+pre-existed). `14/30/15/21/23` IDENTICAL (no regressions). 305 nc-dav lib tests pass.

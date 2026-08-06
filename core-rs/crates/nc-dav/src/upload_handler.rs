@@ -661,7 +661,9 @@ async fn handle_move(
                 metadata_etag = COALESCE(EXCLUDED.metadata_etag, {prefix}filecache_extended.metadata_etag)",
             prefix = state.table_prefix
         );
-        let creation_time_val = ctime.unwrap_or(now);
+        // Finding #3 (assembly instance): creation_time stays 0 unless the
+        // client sent X-OC-CTime (PHP writes it only when dictated).
+        let creation_time_val = ctime.unwrap_or(0);
         let upload_time_val = now; // always set upload_time for new/uploads
         if let Err(e) = sqlx::query(&sql)
             .bind(fid)
@@ -675,7 +677,11 @@ async fn handle_move(
         }
     }
 
-    // §9.2: propagate size/etag/mtime to the parent chain for chunked upload assembly.
+    // §9.2: propagate size/etag/mtime to the parent chain for chunked upload
+    // assembly.  The assembly is a cross-directory MOVE: PHP's
+    // renameFromStorage stamps the SOURCE chain (`uploads/…` → home root)
+    // last — live-verified: the oracle ends with `root.etag == uploads.etag`
+    // and a distinct `files` etag (finding #34).
     {
         let old_size = existing_row.as_ref().map(|r| r.size).unwrap_or(0);
         let size_diff = (total_size as i64) - old_size;
@@ -684,10 +690,51 @@ async fn handle_move(
             state.table_prefix.clone(),
             storage_id,
         );
+        // PHP lazily materializes the `uploads/` row on the first upload
+        // (finding #24) — the source chain needs it.
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        crate::filesystem::ensure_lazy_dir_row(
+            &state.pool,
+            &state.table_prefix,
+            storage_id,
+            &state.mime_cache,
+            "uploads",
+            now_s,
+        )
+        .await;
+        // Target chain (files) with the size delta, then the source chain
+        // (`uploads/…`) LAST so its etag wins on the shared home root.
         let _ = propagator
             .propagate_change(&fc_path_full, mtime, size_diff)
             .await;
+        let source_fc = format!("uploads/{user_id}/{upload_id}/.file");
+        let _ = propagator.propagate_change(&source_fc, mtime, 0).await;
     }
+
+    // §9.4: the assembly dispatches NodeCreatedEvent → the version entity,
+    // and NodeWrittenEvent → the previewgenerator queue row (findings #32/#33
+    // — PHP's plain-PUT side effects, missing on the assembly path).
+    crate::versions::insert_version_entity(
+        &state.pool,
+        &state.table_prefix,
+        fid,
+        mtime,
+        total_size as i64,
+        mime_type_id,
+        &user_id,
+    )
+    .await;
+    crate::preview_queue::queue_preview_generation(
+        &state.pool,
+        &state.table_prefix,
+        &user_id,
+        fid,
+        now,
+    )
+    .await;
 
     // Clean up chunk directory
     if let Err(e) = fs::remove_dir_all(&chunk_dir).await {

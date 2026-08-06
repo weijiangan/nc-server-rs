@@ -789,11 +789,12 @@ impl NcFileSystem {
         // not identified in the PHP source; replicate the observable row
         // create-if-missing (scanner-insert shape: size 0, permissions 31, no
         // extended row).
-        ensure_cache_row(
+        ensure_lazy_dir_row(
             &self.state.pool,
             &self.state.table_prefix,
             self.storage_id,
             &self.state.mime_cache,
+            "cache",
             now,
         )
         .await;
@@ -2926,42 +2927,35 @@ impl DavFileSystem for NcFileSystem {
 
 // ─── Helper methods ────────────────────────────────────────────────────────────
 
-/// Lazily materialize the user's `cache/` filecache row (finding #8).
-///
-/// PHP materializes the row on the first files access (a fresh instance's
-/// first PUT/DELETE — the delete flow and the first write both show it
-/// live-verified; the triggering read is not identified in the PHP source).
-/// The row is a scanner-insert: size 0, permissions 31, no extended row.
-/// Create-if-missing so subsequent accesses are no-ops, matching PHP's
+/// Lazily materialize a top-level filecache dir row (PHP does this for
+/// `cache/` on the first files access and `uploads/` on the first MKCOL —
+/// findings #8/#24; the triggering reads are not identified in the PHP
+/// source).  The row is a scanner-insert: size 0, permissions 31, no extended
+/// row.  Create-if-missing so subsequent accesses are no-ops, matching PHP's
 /// one-shot behavior.
-pub(crate) async fn ensure_cache_row(
+pub(crate) async fn ensure_lazy_dir_row(
     pool: &DbPool,
     prefix: &str,
     storage_id: i64,
     mime_cache: &SharedMimeCache,
+    dir_name: &str,
     now: i64,
 ) {
-    if row::lookup_by_path(pool, prefix, storage_id, "cache")
+    if row::lookup_by_path(pool, prefix, storage_id, dir_name)
         .await
         .is_some()
     {
         return;
     }
-    let cache_mime_id = nc_db::mime::get_or_insert_mime_id(
-        pool,
-        prefix,
-        mime_cache,
-        "httpd/unix-directory",
-    )
-    .await;
-    let cache_mimepart_id =
-        nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, "httpd").await;
+    let dir_mime_id =
+        nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, "httpd/unix-directory").await;
+    let dir_mimepart_id = nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, "httpd").await;
     let parent_id = row::lookup_by_path(pool, prefix, storage_id, "")
         .await
         .map(|r| r.fileid)
         .unwrap_or(-1);
-    let cache_hash = row::path_hash("cache");
-    let cache_etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+    let dir_hash = row::path_hash(dir_name);
+    let dir_etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
     let sql = format!(
         "INSERT INTO {prefix}filecache \
          (storage, path, path_hash, parent, name, mimetype, mimepart, \
@@ -2972,22 +2966,22 @@ pub(crate) async fn ensure_cache_row(
     );
     if let Err(e) = sqlx::query(&sql)
         .bind(storage_id)
-        .bind("cache")
-        .bind(&cache_hash)
+        .bind(dir_name)
+        .bind(&dir_hash)
         .bind(parent_id)
-        .bind("cache")
-        .bind(cache_mime_id)
-        .bind(cache_mimepart_id)
+        .bind(dir_name)
+        .bind(dir_mime_id)
+        .bind(dir_mimepart_id)
         .bind(0i64)
         .bind(now)
         .bind(now)
-        .bind(&cache_etag)
+        .bind(&dir_etag)
         .bind(31i32)
         .bind("")
         .execute(pool)
         .await
     {
-        warn!(error = %e, "cache row materialization failed");
+        warn!(dir = dir_name, error = %e, "lazy dir row materialization failed");
     }
 }
 
