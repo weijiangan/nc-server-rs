@@ -1041,3 +1041,17 @@ The assembly path's missing DB side effects are resolved in `nc-dav` (`upload_ha
 match; the remaining rows are the accepted root-size (+52 vs −52, #1), the storage_mtime label
 artifact, and the `uploads`-row pre-state residue (ADDED vs CHANGED — the oracle's row
 pre-existed). `14/30/15/21/23` IDENTICAL (no regressions). 305 nc-dav lib tests pass.
+
+### 2026-08-07 — InvalidPath rejection body (`22_invalid_filename`)
+
+The 400 rejection body for filename validation now matches PHP's sabre
+`InvalidPath` exactly: the `FilenameValidator.php:298` message (`'"%1$s" is not allowed
+inside a file or folder name.'` with the offending char) plus the owncloud
+`o:retry`/`o:reason` extensions (the SUT previously used its own message and omitted the
+extensions). `22_invalid_filename` is now **IDENTICAL** (400 == 400 with matching bodies).
+
+**Checksum note (24):** the SUT's OC-Checksum verification (REQ §13.1) is an **intentional
+divergence** — live-verified PHP stores the header verbatim without verifying (the oracle
+accepted a wrong SHA1 with 204); the SUT deliberately rejects mismatches with 400 (scenario
+24's recorded intent), the same class as the accepted root-size divergence. Documented in the
+davfile flush.

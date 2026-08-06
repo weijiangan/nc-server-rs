@@ -986,13 +986,24 @@ fn url_to_path(url: &str) -> &str {
 /// Build a `400 Bad Request` response for a filename validation failure.
 ///
 /// The XML body mirrors what PHP/SabreDAV emits for
-/// `OCA\DAV\Connector\Sabre\Exception\InvalidPath` (HTTP 400).
+/// `OCA\DAV\Connector\Sabre\Exception\InvalidPath` (HTTP 400): the
+/// `FilenameValidator.php:298` message (`'"%1$s" is not allowed inside a file
+/// or folder name.'` with the offending char) plus the owncloud `o:retry` /
+/// `o:reason` extensions (live-verified oracle body).
 fn build_filename_error_response(e: FilenameError) -> Response {
+    let message = match &e {
+        FilenameError::ForbiddenChar(c) => {
+            format!("\"{c}\" is not allowed inside a file or folder name.")
+        }
+        other => other.to_string(),
+    };
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-         <d:error xmlns:d=\"DAV:\" xmlns:s=\"http://sabredav.org/ns\">\n  \
+         <d:error xmlns:d=\"DAV:\" xmlns:s=\"http://sabredav.org/ns\" xmlns:o=\"http://owncloud.org/ns\">\n  \
          <s:exception>OCA\\DAV\\Connector\\Sabre\\Exception\\InvalidPath</s:exception>\n  \
-         <s:message>{e}</s:message>\n\
+         <s:message>{message}</s:message>\n  \
+         <o:retry xmlns:o=\"o:\">false</o:retry>\n  \
+         <o:reason xmlns:o=\"o:\">{message}</o:reason>\n\
          </d:error>\n"
     );
     http::Response::builder()

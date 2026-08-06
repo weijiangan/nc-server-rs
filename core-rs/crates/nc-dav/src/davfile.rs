@@ -338,6 +338,13 @@ impl DavFile for NcDavFile {
             // ── Checksum validation (REQ §13.1) ──────────────────────────────
             // Finalize the running hash and compare against the OC-Checksum
             // header value BEFORE we commit the rename.
+            //
+            // INTENTIONAL DIVERGENCE (live-verified 2026-08-07): PHP stores the
+            // OC-Checksum header verbatim WITHOUT verifying it on a plain PUT —
+            // the oracle accepted a deliberately wrong SHA1 with 204 and stored
+            // the header value.  The SUT deliberately validates (REQ §13.1) and
+            // rejects a mismatch with 400 (scenario 24 records the intent);
+            // keep this divergence, like the root-size one.
             let running_hash = std::mem::replace(&mut ctx.running_hash, RunningHash::None);
             if let Some(ref expected) = ctx.oc_checksum {
                 if let Some(computed_hex) = running_hash.finalize_hex() {
