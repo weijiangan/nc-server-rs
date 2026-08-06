@@ -876,3 +876,48 @@ findings**:
 
 **Remaining known (out of scope):** the versioning-path rows of `10_put_get` (#13–#22), and the
 one-shot `cache/` materialization for non-delete first accesses (16.9's 01 note).
+
+### 2026-08-07 — Versioning-path divergences resolved: overwrite/version-file parity
+
+The versioning-path rows of `10_put_get` / `16_overwrite_put` (the #13–#22 group's versioning
+portion) are resolved in `nc-dav` (`versions.rs`, `davfile.rs`, `bulk_handler.rs`,
+`filesystem.rs`). Ground truth: live PUT-v1/v2 probes against the oracle (raw rows compared
+side-by-side with the SUT) plus fresh-stack difftest runs.
+
+**Fixes (version-file creation — PHP `LegacyVersionsBackend::createVersion` → `View::copy` →
+`Cache::copyFromCache`):**
+- The version row is a **clone** of the overwritten file: it inherits the SOURCE etag (the old
+  content's etag), the source mtime, and a NULL checksum; the SUT had generated a fresh uuid
+  etag, bound `''` checksum, and bound `storage_mtime = mtime`. `storage_mtime` is now the copy
+  time (the copied file's disk mtime — PHP `updateStorageMTimeOnly`).
+- `ensure_version_parents` no longer inserts `oc_filecache_extended` rows for the version dirs
+  (the #9 class) and mirrors `View::mkdir` → `Updater::update` side effects (parent
+  `storage_mtime` + ancestor propagation).
+- The version-file move now runs PHP's `copyOrRenameFromStorage` side effects: the parent dir's
+  `storage_mtime` correction, the `[root, files_versions]` etag/mtime propagation, and the parent
+  dir's size recompute (PHP gets the size from `getFileInfo`'s "ensure scanned").
+- Same-second overwrites keep the file's etag: PHP's scanner reuses the etag when the disk mtime
+  is unchanged (`Scanner.php:167-183`); the SUT's overwrite UPDATE now does the same, so the file
+  and its version share the etag exactly as the oracle does.
+- `insert_version_entity` retries on the unique `(file_id, timestamp)` constraint, bumping the
+  timestamp by 1 (PHP `createVersionEntity`'s 5-try loop) — a same-second overwrite's entity now
+  lands reflecting the CURRENT file state instead of being silently dropped.
+- `trash_versions` moved out of `move_to_trash` into the delete flow AFTER the trash-chain
+  propagation (PHP `retainVersions` runs after `renameFromStorage`), and each version-file move
+  propagates etag/mtime on its source and target chains (the oracle ends with
+  `files_trashbin.etag == files_trashbin/versions.etag`).
+- The `cache/` materialization (finding #8) extracted to `ensure_cache_row` and now also runs on
+  the PUT flush (the first files access can be a PUT).
+
+**Verification (fresh stack):**
+- `16_overwrite_put` — parity except the accepted root-size divergence (#1).
+- `10_put_get` — parity except the accepted root-size divergence.
+- `10_put_get_delete` — parity except the accepted root-size divergence.
+- `14_propfind_depth1`, `30_share_create_selfcheck`, `21_bulk_upload` — IDENTICAL (no
+  regressions).
+- `cargo test --lib -p nc-dav` → 304 passed (2 new tests: the version-row clone semantics + the
+  entity timestamp-bump retry).
+
+**Remaining in the #13–#22 group (out of scope this pass):** the COPY size/checksum/etag/extended
+handling (`12_move_rename` / `13_copy`), the PROPPATCH favorite bug, the lazy `files_metadata`
+appconfig registration, and the home-root mtime propagation.

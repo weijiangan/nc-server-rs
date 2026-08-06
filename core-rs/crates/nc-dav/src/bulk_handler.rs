@@ -359,6 +359,7 @@ async fn write_file(
             ext.creation_time,
             ext.upload_time,
             old.fileid,
+            old.etag.as_deref().unwrap_or(""),
         )
         .await;
     }

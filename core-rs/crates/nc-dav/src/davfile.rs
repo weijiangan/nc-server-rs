@@ -148,6 +148,15 @@ pub struct WriteCtx {
     /// Upload time of the existing file before overwrite (0 for new files).
     /// Inherited by the version row (§9.4).
     pub old_upload_time: i64,
+    /// Etag of the existing file before overwrite.  Inherited by the version
+    /// row — PHP's `Cache::copyFromCache` clones the source row as-is, so the
+    /// version file carries the old content's etag (live-verified).
+    pub old_etag: Option<String>,
+    /// `storage_mtime` of the existing file before overwrite.  The overwrite's
+    /// etag is reused when the new disk mtime equals this (PHP's scanner keeps
+    /// the etag on unchanged mtimes — Scanner.php:167-183), so the file and
+    /// its version share the etag on same-second overwrites.
+    pub old_storage_mtime: i64,
     /// Expected file size from `OpenOptions.size` (for validation).
     pub expected_size:  Option<u64>,
     /// Checksum from `OC-Checksum` header (e.g. `"SHA1:abc…"`).
@@ -391,6 +400,7 @@ impl DavFile for NcDavFile {
                     ctx.old_creation_time,
                     ctx.old_upload_time,
                     source_fileid,
+                    ctx.old_etag.as_deref().unwrap_or(""),
                 )
                 .await;
             }
@@ -427,6 +437,24 @@ impl DavFile for NcDavFile {
 
             if let Some(fid) = ctx.initial_fileid {
                 fileid = fid;
+                // PHP's scanner reuses the existing etag when the file's disk
+                // mtime is unchanged (Scanner.php:167-183 — a same-second
+                // overwrite keeps the row's etag, and the version file — a
+                // copy of this row — shares it).  Replicate: reuse the old
+                // etag when the new disk mtime equals the old storage_mtime.
+                let disk_mtime = std::fs::metadata(&ctx.final_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(use_mtime);
+                let etag_value = if ctx.old_storage_mtime != 0
+                    && disk_mtime == ctx.old_storage_mtime
+                {
+                    ctx.old_etag.clone().unwrap_or_else(|| new_etag.clone())
+                } else {
+                    new_etag.clone()
+                };
                 let sql = format!(
                     "UPDATE {prefix}filecache \
                      SET size=$1, mtime=$2, storage_mtime=$3, etag=$4, checksum=$5 \
@@ -436,7 +464,7 @@ impl DavFile for NcDavFile {
                     .bind(size as i64)
                     .bind(use_mtime)
                     .bind(use_mtime)
-                    .bind(&new_etag)
+                    .bind(&etag_value)
                     .bind(checksum)
                     .bind(fid)
                     .execute(pool)
@@ -634,6 +662,18 @@ impl DavFile for NcDavFile {
                 &ctx.prefix,
                 &ctx.uid,
                 fileid,
+                now,
+            )
+            .await;
+
+            // Finding #8: PHP materializes the user's `cache/` filecache row on
+            // the first files access — the first PUT on a fresh instance shows
+            // it (the delete path already materializes it in move_to_trash).
+            crate::filesystem::ensure_cache_row(
+                &ctx.pool,
+                &ctx.prefix,
+                ctx.storage_id,
+                &ctx.mime_cache,
                 now,
             )
             .await;

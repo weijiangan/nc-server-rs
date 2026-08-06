@@ -34,6 +34,8 @@ use crate::{
     row::{self, dav_to_fc_path, disk_path},
     NcDavState,
 };
+use nc_db::mime::SharedMimeCache;
+use nc_db::pool::DbPool;
 
 // ─── NcFileSystem ─────────────────────────────────────────────────────────────
 
@@ -492,6 +494,13 @@ impl NcFileSystem {
         if let Some(tfc) = trash_fc.as_deref() {
             self.propagate_trash_target(fc_path, tfc, now).await;
         }
+        // PHP `retainVersions` runs after the trash-chain propagation — its
+        // version-move stamps are the final `files_trashbin` etag writers
+        // (see delete_file for the full rationale).
+        if trash_fc.is_some() {
+            let relative = fc_path.strip_prefix("files/").unwrap_or(fc_path);
+            self.trash_versions(relative, now, dir_row.fileid).await;
+        }
         if deleted_size > 0 {
             if let Err(e) = self
                 .propagator
@@ -590,6 +599,18 @@ impl NcFileSystem {
         // propagation below.
         if let Some(tfc) = trash_fc.as_deref() {
             self.propagate_trash_target(fc_path, tfc, now).await;
+        }
+
+        // PHP `Trashbin::retainVersions()` — the version-file moves + the
+        // `oc_files_versions` cleanup — runs AFTER the trash-chain propagation
+        // (PHP runs it after renameFromStorage, Trashbin.php:355): each moved
+        // version's renameFromStorage stamps `files_trashbin` again, so the
+        // version-move stamps are the final `files_trashbin` etag writers
+        // (live-verified: the oracle ends with
+        // `files_trashbin.etag == files_trashbin/versions.etag`).
+        if trash_fc.is_some() {
+            let relative = fc_path.strip_prefix("files/").unwrap_or(fc_path);
+            self.trash_versions(relative, now, frow.fileid).await;
         }
 
         // Source-chain propagation — deliberately LAST.  In PHP the source
@@ -762,81 +783,26 @@ impl NcFileSystem {
             }
         }
 
-        // PHP materializes the user's `cache/` filecache row during the
-        // delete flow (live-verified: absent after a PUT, present after the
-        // DELETE, scanner-insert shape below — size 0, permissions 31, no
-        // extended row; finding #8).  The triggering read is not identified
-        // in the PHP source; replicate the observable row.  Create-if-missing
-        // so subsequent deletes are no-ops, matching PHP's lazy behavior.
-        if row::lookup_by_path(
+        // PHP lazily materializes the user's `cache/` filecache row on the
+        // first files access (the delete flow, or the first PUT/PROPFIND on a
+        // fresh instance — live-verified; finding #8).  The triggering read is
+        // not identified in the PHP source; replicate the observable row
+        // create-if-missing (scanner-insert shape: size 0, permissions 31, no
+        // extended row).
+        ensure_cache_row(
             &self.state.pool,
             &self.state.table_prefix,
             self.storage_id,
-            "cache",
+            &self.state.mime_cache,
+            now,
         )
-        .await
-        .is_none()
-        {
-            let cache_mime_id = nc_db::mime::get_or_insert_mime_id(
-                &self.state.pool,
-                &self.state.table_prefix,
-                &self.state.mime_cache,
-                "httpd/unix-directory",
-            )
-            .await;
-            let cache_mimepart_id = nc_db::mime::get_or_insert_mime_id(
-                &self.state.pool,
-                &self.state.table_prefix,
-                &self.state.mime_cache,
-                "httpd",
-            )
-            .await;
-            let parent_id = row::lookup_by_path(
-                &self.state.pool,
-                &self.state.table_prefix,
-                self.storage_id,
-                "",
-            )
-            .await
-            .map(|r| r.fileid)
-            .unwrap_or(-1);
-            let cache_hash = row::path_hash("cache");
-            let cache_etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
-            let sql = format!(
-                "INSERT INTO {prefix}filecache \
-                 (storage, path, path_hash, parent, name, mimetype, mimepart, \
-                  size, mtime, storage_mtime, etag, permissions, checksum) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
-                 ON CONFLICT DO NOTHING",
-                prefix = self.state.table_prefix
-            );
-            if let Err(e) = sqlx::query(&sql)
-                .bind(self.storage_id)
-                .bind("cache")
-                .bind(&cache_hash)
-                .bind(parent_id)
-                .bind("cache")
-                .bind(cache_mime_id)
-                .bind(cache_mimepart_id)
-                .bind(0i64)
-                .bind(now)
-                .bind(now)
-                .bind(&cache_etag)
-                .bind(31i32)
-                .bind("")
-                .execute(&self.state.pool)
-                .await
-            {
-                warn!(error = %e, "move_to_trash: cache row materialization failed");
-            }
-        }
+        .await;
 
-        // PHP `Trashbin::retainVersions()` (Trashbin.php:391-417): move the
-        // file's versions to `files_trashbin/versions/` and clean up the
-        // `oc_files_versions` rows (findings #10).  Runs before the file's own
-        // filecache UPDATE so the `oc_files_versions` DELETE below can still
-        // match rows by their original `files/…` paths.
-        self.trash_versions(relative, now, row.fileid).await;
+        // PHP `Trashbin::retainVersions()` (Trashbin.php:391-417) — the
+        // version-file moves + `oc_files_versions` cleanup — runs in the
+        // CALLERS after the trash-chain propagation (PHP runs it after
+        // renameFromStorage, so its stamps are the final `files_trashbin`
+        // etag writers; see delete_file/delete_dir).
 
         // Create parent dirs on disk.
         let from_disk = self.disk_path(fc_path);
@@ -1168,6 +1134,19 @@ impl NcFileSystem {
                 {
                     warn!(fileid = fid, error = %e, "trash_versions: row update failed");
                 }
+            }
+
+            // PHP `retainVersions` → `move()` → `renameFromStorage`
+            // (Trashbin.php:445-459, Updater.php:203-204) propagates etag/mtime
+            // on the version's source chain (`files_versions/…`) and its target
+            // chain (`files_trashbin/versions`) — the last move's target-chain
+            // stamp wins on `files_trashbin` (live-verified: the oracle ends
+            // with `files_trashbin.etag == files_trashbin/versions.etag`).
+            if let Err(e) = self.propagator.propagate_change(old_path, now, 0).await {
+                tracing::warn!(path = %old_path, error = %e, "trash_versions: source-chain propagation failed");
+            }
+            if let Err(e) = self.propagator.propagate_change(&target, now, 0).await {
+                tracing::warn!(path = %target, error = %e, "trash_versions: target-chain propagation failed");
             }
         }
 
@@ -1508,6 +1487,8 @@ impl DavFileSystem for NcFileSystem {
                 let old_size = existing.as_ref().map(|r| r.size).unwrap_or(0);
                 let old_mtime = existing.as_ref().map(|r| r.mtime).unwrap_or(0);
                 let old_mimetype = existing.as_ref().map(|r| r.mimetype).unwrap_or(0);
+                let old_etag = existing.as_ref().and_then(|r| r.etag.clone());
+                let old_storage_mtime = existing.as_ref().map(|r| r.storage_mtime).unwrap_or(0);
                 // §9.4: inherit permissions + extended times from the source file
                 // so that the version row carries correct metadata for PHP-FPM.
                 let old_permissions = existing.as_ref().map(|r| r.permissions).unwrap_or(27);
@@ -1541,6 +1522,8 @@ impl DavFileSystem for NcFileSystem {
                     old_permissions,
                     old_creation_time,
                     old_upload_time,
+                    old_etag,
+                    old_storage_mtime,
                     expected_size: options.size,
                     oc_checksum: options.checksum.clone(),
                     running_hash: crate::davfile::RunningHash::from_checksum_header(
@@ -2845,6 +2828,71 @@ impl DavFileSystem for NcFileSystem {
 
 // ─── Helper methods ────────────────────────────────────────────────────────────
 
+/// Lazily materialize the user's `cache/` filecache row (finding #8).
+///
+/// PHP materializes the row on the first files access (a fresh instance's
+/// first PUT/DELETE — the delete flow and the first write both show it
+/// live-verified; the triggering read is not identified in the PHP source).
+/// The row is a scanner-insert: size 0, permissions 31, no extended row.
+/// Create-if-missing so subsequent accesses are no-ops, matching PHP's
+/// one-shot behavior.
+pub(crate) async fn ensure_cache_row(
+    pool: &DbPool,
+    prefix: &str,
+    storage_id: i64,
+    mime_cache: &SharedMimeCache,
+    now: i64,
+) {
+    if row::lookup_by_path(pool, prefix, storage_id, "cache")
+        .await
+        .is_some()
+    {
+        return;
+    }
+    let cache_mime_id = nc_db::mime::get_or_insert_mime_id(
+        pool,
+        prefix,
+        mime_cache,
+        "httpd/unix-directory",
+    )
+    .await;
+    let cache_mimepart_id =
+        nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, "httpd").await;
+    let parent_id = row::lookup_by_path(pool, prefix, storage_id, "")
+        .await
+        .map(|r| r.fileid)
+        .unwrap_or(-1);
+    let cache_hash = row::path_hash("cache");
+    let cache_etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+    let sql = format!(
+        "INSERT INTO {prefix}filecache \
+         (storage, path, path_hash, parent, name, mimetype, mimepart, \
+          size, mtime, storage_mtime, etag, permissions, checksum) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+         ON CONFLICT DO NOTHING",
+        prefix = prefix
+    );
+    if let Err(e) = sqlx::query(&sql)
+        .bind(storage_id)
+        .bind("cache")
+        .bind(&cache_hash)
+        .bind(parent_id)
+        .bind("cache")
+        .bind(cache_mime_id)
+        .bind(cache_mimepart_id)
+        .bind(0i64)
+        .bind(now)
+        .bind(now)
+        .bind(&cache_etag)
+        .bind(31i32)
+        .bind("")
+        .execute(pool)
+        .await
+    {
+        warn!(error = %e, "cache row materialization failed");
+    }
+}
+
 /// Extract the file extension from a filename (the part after the last `.`).
 /// Returns empty string for extensionless names.
 fn extension(name: &str) -> &str {
@@ -3802,10 +3850,9 @@ mod tests {
         .unwrap();
 
         let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir.clone());
-        let row = row::lookup_by_path(&pool, &prefix, storage_id, "files/hello.txt")
-            .await
-            .unwrap();
-        fs.move_to_trash("files/hello.txt", &row).await.unwrap();
+        // The version moves now run in the delete flow (PHP `retainVersions`
+        // runs after the trash move) — exercise the full delete path.
+        fs.delete_file("files/hello.txt").await.unwrap();
 
         // Version file moved on disk and re-keyed under files_trashbin/versions.
         let ts = trash_ts(&pool).await;
@@ -3885,7 +3932,10 @@ mod tests {
         .unwrap();
 
         let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir.clone());
-        fs.trash_directory("files/dir").await.unwrap();
+        // The version-subtree moves now run in the delete flow (PHP
+        // `retainVersions` runs after the trash move) — exercise the full
+        // delete path.
+        fs.delete_dir("files/dir").await.unwrap();
         let ts = trash_ts(&pool).await;
 
         // Subtree version file moved and re-keyed under files_trashbin/versions.
