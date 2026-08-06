@@ -274,24 +274,11 @@ impl NcFileSystem {
                 }
             };
 
-            // Also create the extended-cache row.
-            {
-                let sql = format!(
-                    "INSERT INTO {prefix}filecache_extended \
-                     (fileid, metadata_etag, creation_time, upload_time) \
-                     VALUES ($1, '', $2, $2) \
-                     ON CONFLICT(fileid) DO NOTHING",
-                    prefix = self.state.table_prefix
-                );
-                if let Err(e) = sqlx::query(&sql)
-                    .bind(fid)
-                    .bind(now)
-                    .execute(&self.state.pool)
-                    .await
-                {
-                    tracing::warn!(fileid = fid, error = %e, "Failed to insert oc_filecache_extended for ancestor {built}");
-                }
-            }
+            // No oc_filecache_extended row is created here — PHP's mkdir path
+            // (`View::mkdir` → `Cache::insert`) never writes extension fields
+            // (`normalizeData` drops them when absent), so dirs have no extended
+            // row.  Creating one with `creation_time = upload_time = now` was a
+            // diff-visible divergence on the trashbin ancestor dirs (finding #9).
 
             let new_row = row::FileCacheRow {
                 fileid: fid,
@@ -311,6 +298,41 @@ impl NcFileSystem {
                 creation_time: now,
                 upload_time: now,
             };
+
+            // PHP `View::mkdir` → `basicOperation` → `Updater::update()`
+            // (View.php:1253-1259, Updater.php:68-93) side effects, in the same
+            // order: `correctParentStorageMtime(parent)` then `propagateChange`.
+            // - The new dir's parent gets `storage_mtime` (and `mtime`, via
+            //   Cache::normalizeData's copy magic) from the parent's disk
+            //   mtime — so creating `files_trashbin` (a direct child of the
+            //   storage root) stamps the root's `storage_mtime` (live-verified
+            //   oracle behavior, finding #12).
+            // - Every ancestor of the new dir gets one shared etag + bumped
+            //   mtime. These stamps are transient for the trash flow (later
+            //   propagations overwrite them) but are the mechanism behind the
+            //   oracle's `files_trashbin == files_trashbin/files` etag, and
+            //   PHP does the same for MKCOL/PUT ancestor mkdirs.
+            let parent_fc_path = {
+                let mut parts: Vec<&str> = built.split('/').collect();
+                parts.pop();
+                parts.join("/")
+            };
+            let parent_disk = self.disk_path(&parent_fc_path);
+            if let Err(e) = self
+                .propagator
+                .correct_parent_storage_mtime(&parent_fc_path, &parent_disk)
+                .await
+            {
+                tracing::warn!(
+                    dir = %built,
+                    error = %e,
+                    "ensure_parent_dir: parent storage_mtime correction failed"
+                );
+            }
+            if let Err(e) = self.propagator.propagate_change(&built, now, 0).await {
+                tracing::warn!(dir = %built, error = %e, "ensure_parent_dir: mkdir propagation failed");
+            }
+
             last_existing_row = Some(new_row);
         }
 
@@ -403,9 +425,12 @@ impl NcFileSystem {
         .ok_or(FsError::NotFound)?;
         let deleted_size = dir_row.size;
 
-        if self.should_move_to_trash(fc_path).await {
-            self.trash_directory(fc_path).await?;
+        let trash_fc = if self.should_move_to_trash(fc_path).await {
+            Some(self.trash_directory(fc_path).await?)
         } else {
+            None
+        };
+        if trash_fc.is_none() {
             // Trashbin app not enabled — hard delete.
             let disk = self.disk_path(fc_path);
             let d = disk.clone();
@@ -457,11 +482,16 @@ impl NcFileSystem {
 
         // §9.2: always propagate — matching PHP's View::rmdir() calling
         // Updater::remove() regardless of whether the storage trashed or
-        // hard-deleted.
+        // hard-deleted.  The trash-chain propagation runs first and the
+        // source chain last (PHP's Updater::remove is the final root etag
+        // writer — see delete_file for the full ordering rationale).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        if let Some(tfc) = trash_fc.as_deref() {
+            self.propagate_trash_target(fc_path, tfc, now).await;
+        }
         if deleted_size > 0 {
             if let Err(e) = self
                 .propagator
@@ -501,9 +531,12 @@ impl NcFileSystem {
 
         let deleted_size = frow.size;
 
-        if self.should_move_to_trash(fc_path).await {
-            self.move_to_trash(fc_path, &frow).await?;
+        let trash_fc = if self.should_move_to_trash(fc_path).await {
+            Some(self.move_to_trash(fc_path, &frow).await?)
         } else {
+            None
+        };
+        if trash_fc.is_none() {
             let disk = self.disk_path(fc_path);
             let d = disk.clone();
             blocking(move || std::fs::remove_file(&d))
@@ -548,6 +581,26 @@ impl NcFileSystem {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+
+        // PHP `renameFromStorage` target-chain side effects
+        // (`copyOrRenameFromStorage`, Updater.php:192-204): the trash ancestors
+        // get their sizes recomputed, both the source and the target direct
+        // parents get their `storage_mtime` corrected, and the target chain
+        // gets etag/mtime propagated.  Runs BEFORE the source-chain
+        // propagation below.
+        if let Some(tfc) = trash_fc.as_deref() {
+            self.propagate_trash_target(fc_path, tfc, now).await;
+        }
+
+        // Source-chain propagation — deliberately LAST.  In PHP the source
+        // chain is stamped twice: `renameFromStorage`'s propagateChange and
+        // then `View::unlink`'s post-op `Updater::remove` (View.php:1247-1248,
+        // Updater.php:102-115), which runs after the trash move and is the
+        // final writer of the storage root's etag.  Live-verified oracle state
+        // after a delete: `root.etag == files/etag` (one shared value) while
+        // `files_trashbin.etag == files_trashbin/files.etag` (the trash
+        // chain's stamp).  If the source chain ran first, the trash chain
+        // would win on root and `root != files`.
         if deleted_size > 0 {
             if let Err(e) = self
                 .propagator
@@ -571,11 +624,11 @@ impl NcFileSystem {
 
     // ── trash_directory ───────────────────────────────────────────────────
 
-    /// Move a directory tree to the trashbin.
+    /// Move a directory tree to the trashbin.  Returns the trash `fc_path`.
     ///
     /// Does NOT handle propagation — [`delete_dir`] does that centrally
     /// (matching PHP's View → Updater separation).
-    pub(crate) async fn trash_directory(&self, fc_path: &str) -> Result<(), FsError> {
+    pub(crate) async fn trash_directory(&self, fc_path: &str) -> Result<String, FsError> {
         let row = row::lookup_by_path(
             &self.state.pool,
             &self.state.table_prefix,
@@ -626,7 +679,7 @@ impl NcFileSystem {
             }
         }
 
-        Ok(())
+        Ok(trash_fc)
     }
 
     /// Move a file or directory to the trash bin, matching PHP's
@@ -698,6 +751,93 @@ impl NcFileSystem {
             .await
             .map_err(|_| FsError::NotFound)?;
 
+        // PHP `setUpTrash()` (Trashbin.php:162-176) creates all four trashbin
+        // skeleton dirs on first use: `files_trashbin`, `files_trashbin/files`,
+        // `files_trashbin/versions`, `files_trashbin/keys`.  The parent chain
+        // above covers the first two; create the other two the same way
+        // (idempotent — no-op when they already exist).
+        for skeleton in ["files_trashbin/versions", "files_trashbin/keys"] {
+            if let Err(e) = self.ensure_parent_dir(skeleton).await {
+                warn!("move_to_trash: ensure {skeleton} failed: {e}");
+            }
+        }
+
+        // PHP materializes the user's `cache/` filecache row during the
+        // delete flow (live-verified: absent after a PUT, present after the
+        // DELETE, scanner-insert shape below — size 0, permissions 31, no
+        // extended row; finding #8).  The triggering read is not identified
+        // in the PHP source; replicate the observable row.  Create-if-missing
+        // so subsequent deletes are no-ops, matching PHP's lazy behavior.
+        if row::lookup_by_path(
+            &self.state.pool,
+            &self.state.table_prefix,
+            self.storage_id,
+            "cache",
+        )
+        .await
+        .is_none()
+        {
+            let cache_mime_id = nc_db::mime::get_or_insert_mime_id(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.state.mime_cache,
+                "httpd/unix-directory",
+            )
+            .await;
+            let cache_mimepart_id = nc_db::mime::get_or_insert_mime_id(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.state.mime_cache,
+                "httpd",
+            )
+            .await;
+            let parent_id = row::lookup_by_path(
+                &self.state.pool,
+                &self.state.table_prefix,
+                self.storage_id,
+                "",
+            )
+            .await
+            .map(|r| r.fileid)
+            .unwrap_or(-1);
+            let cache_hash = row::path_hash("cache");
+            let cache_etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+            let sql = format!(
+                "INSERT INTO {prefix}filecache \
+                 (storage, path, path_hash, parent, name, mimetype, mimepart, \
+                  size, mtime, storage_mtime, etag, permissions, checksum) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+                 ON CONFLICT DO NOTHING",
+                prefix = self.state.table_prefix
+            );
+            if let Err(e) = sqlx::query(&sql)
+                .bind(self.storage_id)
+                .bind("cache")
+                .bind(&cache_hash)
+                .bind(parent_id)
+                .bind("cache")
+                .bind(cache_mime_id)
+                .bind(cache_mimepart_id)
+                .bind(0i64)
+                .bind(now)
+                .bind(now)
+                .bind(&cache_etag)
+                .bind(31i32)
+                .bind("")
+                .execute(&self.state.pool)
+                .await
+            {
+                warn!(error = %e, "move_to_trash: cache row materialization failed");
+            }
+        }
+
+        // PHP `Trashbin::retainVersions()` (Trashbin.php:391-417): move the
+        // file's versions to `files_trashbin/versions/` and clean up the
+        // `oc_files_versions` rows (findings #10).  Runs before the file's own
+        // filecache UPDATE so the `oc_files_versions` DELETE below can still
+        // match rows by their original `files/…` paths.
+        self.trash_versions(relative, now, row.fileid).await;
+
         // Create parent dirs on disk.
         let from_disk = self.disk_path(fc_path);
         let to_disk = self.disk_path(&trash_fc);
@@ -718,7 +858,9 @@ impl NcFileSystem {
                 io_to_fs(e)
             })?;
 
-        // Update the filecache row.
+        // Update the filecache row.  Mirrors PHP `Cache::move` (Cache.php:813-831):
+        // path/path_hash/name/parent only — **mtime is left untouched** (the
+        // trashed file keeps the mtime it had before deletion; live-verified).
         let new_hash = row::path_hash(&trash_fc);
         let new_name = trash_fc.rsplit('/').next().unwrap_or("").to_string();
         let trash_parent = row::lookup_by_path(
@@ -732,8 +874,8 @@ impl NcFileSystem {
 
         let sql = format!(
             "UPDATE {prefix}filecache \
-             SET path=$1, path_hash=$2, name=$3, parent=$4, mtime=$5 \
-             WHERE fileid=$6",
+             SET path=$1, path_hash=$2, name=$3, parent=$4 \
+             WHERE fileid=$5",
             prefix = self.state.table_prefix
         );
         sqlx::query(&sql)
@@ -741,11 +883,31 @@ impl NcFileSystem {
             .bind(&new_hash)
             .bind(&new_name)
             .bind(trash_parent.fileid)
-            .bind(now)
             .bind(row.fileid)
             .execute(&self.state.pool)
             .await
             .map_err(|_| FsError::GeneralFailure)?;
+
+        // PHP `updateStorageMTimeOnly($target)` (Updater.php:207-220): the
+        // moved file's own `storage_mtime` ← its disk mtime (mtime untouched).
+        let disk_mtime = std::fs::metadata(&to_disk)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(now);
+        let sql_sm = format!(
+            "UPDATE {prefix}filecache SET storage_mtime = $1 WHERE fileid = $2",
+            prefix = self.state.table_prefix
+        );
+        if let Err(e) = sqlx::query(&sql_sm)
+            .bind(disk_mtime)
+            .bind(row.fileid)
+            .execute(&self.state.pool)
+            .await
+        {
+            tracing::warn!(fileid = row.fileid, error = %e, "move_to_trash: storage_mtime update failed");
+        }
 
         // Insert into oc_files_trash.
         //
@@ -789,6 +951,238 @@ impl NcFileSystem {
         }
 
         Ok(trash_fc)
+    }
+
+    /// Mirror the target-chain half of PHP `renameFromStorage`
+    /// (`copyOrRenameFromStorage`, Updater.php:192-204) for a move-to-trash:
+    /// the trash ancestors' sizes get recomputed from their children, both
+    /// the source and the target direct parents get their `storage_mtime`
+    /// corrected to their disk mtimes, and the target chain gets etag/mtime
+    /// propagated (findings #6/#12).
+    ///
+    /// The source chain's size subtraction is done by the caller's existing
+    /// `propagate_change(fc_path, now, -size)`; this fills in the trash side.
+    async fn propagate_trash_target(&self, source_fc: &str, trash_fc: &str, now: i64) {
+        // correctFolderSize(target) — recompute trash ancestors from children.
+        if let Err(e) = self.propagator.correct_folder_size_chain(trash_fc).await {
+            tracing::warn!(path = %trash_fc, error = %e, "trash: trash-chain folder-size recompute failed");
+        }
+        // correctParentStorageMtime(source) + correctParentStorageMtime(target).
+        for (path, label) in [
+            (source_fc.to_string(), "source"),
+            (trash_fc.to_string(), "target"),
+        ] {
+            let parent_fc = path
+                .rsplit_once('/')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_default();
+            let parent_disk = self.disk_path(&parent_fc);
+            if let Err(e) = self
+                .propagator
+                .correct_parent_storage_mtime(&parent_fc, &parent_disk)
+                .await
+            {
+                tracing::warn!(
+                    parent = %parent_fc,
+                    label,
+                    error = %e,
+                    "trash: parent storage_mtime correction failed"
+                );
+            }
+        }
+        // propagateChange(target, time, 0) — etag/mtime only, size already recomputed.
+        if let Err(e) = self
+            .propagator
+            .propagate_change(trash_fc, now, 0)
+            .await
+        {
+            tracing::warn!(path = %trash_fc, error = %e, "trash: trash-chain etag/mtime propagation failed");
+        }
+    }
+
+    /// Mirror PHP `Trashbin::retainVersions()` (Trashbin.php:391-417) plus the
+    /// `oc_files_versions` cleanup of the delete-hook cascade
+    /// (`FileEventsListener::remove_hook` → `deleteVersionsEntity` →
+    /// `deleteAllVersionsForFileId`, LegacyVersionsBackend.php:281-283 +
+    /// VersionsMapper.php:63-69): move the trashed file's versions from
+    /// `files_versions/` to `files_trashbin/versions/` (so the web UI can
+    /// restore them) and delete its `oc_files_versions` metadata rows
+    /// (finding #10).
+    ///
+    /// The row DELETE is **unconditional** — live-verified: PHP removes the
+    /// version-entity rows even when no version *file* exists on disk (the
+    /// SUT's PUT creates a row for every write; without an unconditional
+    /// cleanup the row would survive the delete and diverge).  It matches by
+    /// the trashed node's OWN file id (`deleteAllVersionsForFileId`) — so a
+    /// directory trash deletes nothing, since only the deleted node's id is
+    /// used and directories never have version rows.
+    ///
+    /// The version-file move + `files_versions`/`files_trashbin/versions`
+    /// size recomputes stay gated on version files existing (PHP moves them
+    /// only when present).
+    ///
+    /// Must run **before** the file's own filecache row is re-keyed to the
+    /// trash path.
+    async fn trash_versions(&self, relative: &str, now: i64, fileid: i64) {
+        let pool = &self.state.pool;
+        let prefix = &self.state.table_prefix;
+
+        // Unconditional row cleanup — matches PHP `deleteAllVersionsForFileId`
+        // (DELETE FROM oc_files_versions WHERE file_id = ?), which runs even
+        // when the file has no version files on disk.
+        let sql_del = format!(
+            "DELETE FROM {prefix}files_versions WHERE file_id = $1",
+            prefix = prefix
+        );
+        if let Err(e) = sqlx::query(&sql_del).bind(fileid).execute(pool).await {
+            warn!(fileid = fileid, error = %e, "trash_versions: oc_files_versions DELETE failed");
+        }
+
+        let versions_base = format!("files_versions/{relative}");
+        let base_like = format!("{versions_base}/%");
+        let file_like = format!("{versions_base}.v%");
+
+        let sql = format!(
+            "SELECT fileid, path FROM {prefix}filecache \
+             WHERE storage = $1 AND (path = $2 OR path LIKE $3 OR path LIKE $4) \
+             ORDER BY path",
+            prefix = prefix
+        );
+        let rows: Vec<(i64, String)> = match sqlx::query(&sql)
+            .bind(self.storage_id)
+            .bind(&versions_base)
+            .bind(&base_like)
+            .bind(&file_like)
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rs) => rs
+                .into_iter()
+                .map(|r| (r.get::<i64, _>("fileid"), r.get::<String, _>("path")))
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "trash_versions: version-row query failed");
+                return;
+            }
+        };
+        if rows.is_empty() {
+            return;
+        }
+
+        let trash_versions_parent = match row::lookup_by_path(
+            pool,
+            prefix,
+            self.storage_id,
+            "files_trashbin/versions",
+        )
+        .await
+        {
+            Some(r) => r,
+            None => {
+                warn!("trash_versions: files_trashbin/versions missing from filecache");
+                return;
+            }
+        };
+
+        let versions_len = versions_base.len();
+        let mut first_target: Option<String> = None;
+        for (fid, old_path) in &rows {
+            let is_subtree_child =
+                old_path.len() > versions_len && old_path[versions_len..].starts_with('/');
+            let target = if is_subtree_child {
+                // Directory subtree child: keep the relative structure under
+                // files_trashbin/versions/{basename}.d{now}.  (Bare
+                // `{basename}.d{now}` — `trash_fc_name` would add the
+                // `files_trashbin/files/` prefix, which belongs to the main
+                // trash location only.)
+                let base = relative.rsplit('/').next().unwrap_or(relative);
+                format!(
+                    "files_trashbin/versions/{base}.d{now}{}",
+                    &old_path[versions_len..]
+                )
+            } else {
+                // The subtree root (directory case) or a `.v{ts}` sibling
+                // (file case): PHP getTrashFilename() appends `.d{now}` to the
+                // existing name.
+                let base = old_path.rsplit('/').next().unwrap_or(old_path);
+                format!("files_trashbin/versions/{base}.d{now}")
+            };
+            if first_target.is_none() {
+                first_target = Some(target.clone());
+            }
+
+            if is_subtree_child {
+                // The subtree root's disk rename carried the whole directory —
+                // children only get their filecache paths re-keyed (PHP
+                // `moveFromCache` dir branch, Cache.php:749-768).  Parents stay
+                // the same fileids (they moved with the subtree).
+                let new_hash = row::path_hash(&target);
+                let sql_upd = format!(
+                    "UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3",
+                    prefix = prefix
+                );
+                if let Err(e) = sqlx::query(&sql_upd)
+                    .bind(&target)
+                    .bind(&new_hash)
+                    .bind(fid)
+                    .execute(pool)
+                    .await
+                {
+                    warn!(fileid = fid, error = %e, "trash_versions: child path update failed");
+                }
+            } else {
+                // Move on disk (the subtree root or a `.v{ts}` sibling).
+                let from_disk = self.disk_path(old_path);
+                let to_disk = self.disk_path(&target);
+                if let Some(parent) = to_disk.parent() {
+                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                        warn!("trash_versions: mkdir {} failed: {e}", parent.display());
+                        continue;
+                    }
+                }
+                let f = from_disk.clone();
+                let t = to_disk.clone();
+                if let Err(e) = blocking(move || std::fs::rename(&f, &t)).await {
+                    warn!("trash_versions: rename {old_path} → {target} failed: {e}");
+                    continue;
+                }
+
+                // Re-key the row: new name + parent (PHP `moveFromCache` single
+                // row branch, Cache.php:809-831).
+                let new_hash = row::path_hash(&target);
+                let new_name = target.rsplit('/').next().unwrap_or(&target).to_string();
+                let sql_upd = format!(
+                    "UPDATE {prefix}filecache \
+                     SET path=$1, path_hash=$2, name=$3, parent=$4 \
+                     WHERE fileid=$5",
+                    prefix = prefix
+                );
+                if let Err(e) = sqlx::query(&sql_upd)
+                    .bind(&target)
+                    .bind(&new_hash)
+                    .bind(&new_name)
+                    .bind(trash_versions_parent.fileid)
+                    .bind(fid)
+                    .execute(pool)
+                    .await
+                {
+                    warn!(fileid = fid, error = %e, "trash_versions: row update failed");
+                }
+            }
+        }
+
+        // PHP's renameFromStorage recomputes sizes on both the source chain
+        // (`files_versions/…`) and the target chain (`files_trashbin/versions`).
+        if let Some(old_first) = rows.first().map(|(_, p)| p.clone()) {
+            if let Err(e) = self.propagator.correct_folder_size_chain(&old_first).await {
+                tracing::warn!(path = %old_first, error = %e, "trash_versions: source-chain size recompute failed");
+            }
+        }
+        if let Some(t) = &first_target {
+            if let Err(e) = self.propagator.correct_folder_size_chain(t).await {
+                tracing::warn!(path = %t, error = %e, "trash_versions: target-chain size recompute failed");
+            }
+        }
     }
 
     /// Load `NcMetaData` for any filecache path, including extended times.
@@ -3003,5 +3397,659 @@ mod tests {
         assert!(!is_trash_extension("d"));     // too short
         assert!(!is_trash_extension("dx123"));  // has non-digit
         assert!(!is_trash_extension(""));       // empty
+    }
+
+    // ── Delete-to-trash parity (phase-16 findings #6–#12) ────────────────
+    //
+    // In-memory-SQLite + temp data dir; exercises move_to_trash / delete_file /
+    // trash_directory / ensure_parent_dir against the PHP reference behaviour.
+
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, RwLock};
+
+    use nc_db::appconfig::AppConfigCache;
+    use nc_db::config::NcConfig;
+    use nc_db::filename_validator::FilenameValidator;
+    use nc_db::mime::MimeCache;
+    use nc_db::pool::DbPool;
+
+    use crate::preview::ProviderRegistry;
+    use crate::upload::UploadStateStore;
+    use crate::SharedWriteResult;
+    use crate::WriteResult;
+
+    use super::{row, NcFileSystem};
+    use sqlx::Row as _;
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn fresh_data_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nc-dav-trash-test-{}-{}",
+            std::process::id(),
+            TEST_DIR_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![b'x'; 26]).unwrap();
+    }
+
+    /// The `.d{timestamp}` of the most recent trash operation (from the
+    /// `oc_files_trash` row — the naming is derived from the deletion second).
+    async fn trash_ts(pool: &DbPool) -> String {
+        sqlx::query_scalar::<_, String>("SELECT \"timestamp\" FROM oc_files_trash LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// In-memory SQLite with the delete-path tables and a seeded home tree.
+    ///
+    /// Seed (fileids fixed, matching the propagator test convention):
+    /// ```text
+    /// 1  "" (root, size -1)        2  "files" (size 100)
+    /// 6  "files_versions" (0)      4  "files/hello.txt" (26)
+    /// ```
+    async fn fresh_delete_db() -> (DbPool, String, i64) {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite");
+
+        sqlx::query(
+            "CREATE TABLE oc_filecache (
+                fileid           INTEGER NOT NULL PRIMARY KEY,
+                storage          BIGINT  NOT NULL DEFAULT 0,
+                path             VARCHAR(4000),
+                path_hash        VARCHAR(32) NOT NULL DEFAULT '',
+                parent           BIGINT  NOT NULL DEFAULT 0,
+                name             VARCHAR(250),
+                mimetype         BIGINT  NOT NULL DEFAULT 0,
+                mimepart         BIGINT  NOT NULL DEFAULT 0,
+                size             BIGINT  NOT NULL DEFAULT 0,
+                mtime            INTEGER NOT NULL DEFAULT 0,
+                storage_mtime    INTEGER NOT NULL DEFAULT 0,
+                etag             VARCHAR(40),
+                permissions      INTEGER DEFAULT 0,
+                checksum         VARCHAR(255)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create filecache");
+        sqlx::query(
+            "CREATE TABLE oc_filecache_extended (
+                fileid         INTEGER NOT NULL PRIMARY KEY,
+                metadata_etag  VARCHAR(40) NOT NULL DEFAULT '',
+                creation_time  BIGINT NOT NULL DEFAULT 0,
+                upload_time    BIGINT NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create filecache_extended");
+        sqlx::query(
+            "CREATE TABLE oc_files_versions (
+                id         INTEGER NOT NULL PRIMARY KEY,
+                file_id    BIGINT NOT NULL,
+                \"timestamp\" BIGINT NOT NULL,
+                size       BIGINT NOT NULL,
+                mimetype   BIGINT NOT NULL,
+                metadata   TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create files_versions");
+        sqlx::query(
+            "CREATE TABLE oc_files_trash (
+                id         VARCHAR(250) NOT NULL,
+                \"user\"      VARCHAR(64) NOT NULL,
+                \"timestamp\" VARCHAR(12) NOT NULL,
+                location   VARCHAR(512) NOT NULL,
+                deleted_by VARCHAR(64) NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create files_trash");
+        sqlx::query(
+            "CREATE TABLE oc_preview_generation (
+                id        INTEGER NOT NULL PRIMARY KEY,
+                uid       VARCHAR(64) NOT NULL,
+                file_id   BIGINT NOT NULL,
+                queued_at BIGINT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create preview_generation");
+        sqlx::query(
+            "CREATE TABLE oc_mimetypes (
+                id       BIGINT NOT NULL PRIMARY KEY,
+                mimetype VARCHAR(255) NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create mimetypes");
+        sqlx::query(
+            "CREATE TABLE oc_appconfig (
+                appid      VARCHAR(32) NOT NULL,
+                configkey  VARCHAR(64) NOT NULL,
+                configvalue VARCHAR(4000) NOT NULL,
+                type       INTEGER NOT NULL DEFAULT 0,
+                lazy       INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create appconfig");
+
+        // files_trashbin enabled.
+        sqlx::query(
+            "INSERT INTO oc_appconfig (appid, configkey, configvalue, type, lazy) \
+             VALUES ('files_trashbin', 'enabled', 'yes', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed appconfig");
+
+        let prefix = "oc_".to_string();
+        let storage_id = 1i64;
+        for (fid, path, parent, size, name) in [
+            (1i64, "", -1i64, -1i64, ""),
+            (2, "files", 1, 100, "files"),
+            (6, "files_versions", 1, 0, "files_versions"),
+            (4, "files/hello.txt", 2, 26, "hello.txt"),
+        ] {
+            sqlx::query(&format!(
+                "INSERT INTO {prefix}filecache \
+                 (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+                  size, mtime, storage_mtime, etag, permissions, checksum) \
+                 VALUES ($1, $2, $3, $4, $5, $6, 0, 0, $7, 100, 100, 'etag', 27, '')"
+            ))
+            .bind(fid)
+            .bind(storage_id)
+            .bind(path)
+            .bind(row::path_hash(path))
+            .bind(parent)
+            .bind(name)
+            .bind(size)
+            .execute(&pool)
+            .await
+            .expect("seed filecache");
+        }
+
+        (pool, prefix, storage_id)
+    }
+
+    fn test_fs(
+        pool: DbPool,
+        prefix: String,
+        storage_id: i64,
+        data_dir: PathBuf,
+    ) -> NcFileSystem {
+        let cfg = NcConfig::from_php_config("<?php\n$CONFIG = ['dbtype' => 'sqlite3'];").unwrap();
+        let state = crate::NcDavState {
+            pool,
+            mime_cache: Arc::new(RwLock::new(MimeCache::default())),
+            appconfig_cache: Arc::new(RwLock::new(AppConfigCache::default())),
+            table_prefix: prefix,
+            data_directory: data_dir,
+            instance_id: Arc::new("testinst".to_string()),
+            filename_validator: Arc::new(FilenameValidator::from_config(&cfg)),
+            base_url: Arc::new(String::new()),
+            upload_state_store: Arc::new(UploadStateStore::new()),
+            preview_registry: Arc::new(ProviderRegistry::build(false, None, false, false, false, &[])),
+        };
+        let write_result: SharedWriteResult = Arc::new(std::sync::Mutex::new(None::<WriteResult>));
+        let put_error: crate::SharedPutError = Arc::new(std::sync::Mutex::new(None));
+        NcFileSystem::new(
+            state,
+            "admin".to_string(),
+            storage_id,
+            None,
+            None,
+            write_result,
+            put_error,
+            false,
+        )
+    }
+
+    async fn fc_row(
+        pool: &DbPool,
+        prefix: &str,
+        path: &str,
+    ) -> Option<(i64, i64, i64, i64, i64, String)> {
+        // (fileid, size, mtime, storage_mtime, parent, path)
+        let hash = row::path_hash(path);
+        let sql = format!(
+            "SELECT fileid, size, mtime, storage_mtime, parent, path FROM {prefix}filecache \
+             WHERE storage = $1 AND path_hash = $2",
+            prefix = prefix
+        );
+        sqlx::query(&sql)
+            .bind(1i64)
+            .bind(&hash)
+            .fetch_optional(pool)
+            .await
+            .ok()?
+            .map(|r| {
+                (
+                    r.get::<i64, _>("fileid"),
+                    r.get::<i64, _>("size"),
+                    r.get::<i64, _>("mtime"),
+                    r.get::<i64, _>("storage_mtime"),
+                    r.get::<i64, _>("parent"),
+                    r.get::<String, _>("path"),
+                )
+            })
+    }
+
+    async fn extended_count(pool: &DbPool) -> i64 {
+        let sql = "SELECT COUNT(*) FROM oc_filecache_extended";
+        sqlx::query_scalar::<_, i64>(sql).fetch_one(pool).await.unwrap()
+    }
+
+    /// The trashed file keeps its original mtime and gets `storage_mtime` from
+    /// its disk mtime (PHP `Cache::move` + `updateStorageMTimeOnly`); the trash
+    /// skeleton (`keys`/`versions`) is created (findings #7/#12 follow-ups).
+    #[tokio::test]
+    async fn move_to_trash_preserves_mtime_and_creates_skeleton() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        let data_dir = fresh_data_dir();
+        touch(&data_dir.join("admin/files/hello.txt"));
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir.clone());
+
+        let row = row::lookup_by_path(&pool, &prefix, storage_id, "files/hello.txt")
+            .await
+            .unwrap();
+        fs.move_to_trash("files/hello.txt", &row).await.unwrap();
+
+        // The row is gone from its original path; find it under files_trashbin.
+        assert!(fc_row(&pool, &prefix, "files/hello.txt").await.is_none());
+        let ts = trash_ts(&pool).await;
+        let expected = format!("files_trashbin/files/hello.txt.d{ts}");
+        let (_, size, mtime, storage_mtime, _, trash_path) =
+            fc_row(&pool, &prefix, &expected).await.unwrap();
+        assert_eq!(size, 26);
+        assert_eq!(mtime, 100, "trashed file must keep its original mtime");
+        assert_eq!(trash_path, expected);
+        let disk_mtime = std::fs::metadata(data_dir.join("admin").join(&trash_path))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap();
+        assert!(
+            (storage_mtime - disk_mtime).abs() <= 1,
+            "storage_mtime {storage_mtime} should be the disk mtime {disk_mtime}"
+        );
+
+        // Skeleton dirs created (PHP setUpTrash) — including keys + versions.
+        for p in [
+            "files_trashbin",
+            "files_trashbin/files",
+            "files_trashbin/versions",
+            "files_trashbin/keys",
+        ] {
+            assert!(
+                row::lookup_by_path(&pool, &prefix, storage_id, p).await.is_some(),
+                "missing skeleton dir {p}"
+            );
+        }
+
+        // oc_files_trash row inserted.
+        let trash_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oc_files_trash")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(trash_count, 1);
+    }
+
+    /// Finding #6: the trash ancestors get the trashed file's size, the source
+    /// ancestors lose it, and the storage_mtime is corrected on both parents
+    /// (PHP `copyOrRenameFromStorage` target-chain half).
+    #[tokio::test]
+    async fn delete_file_trash_propagates_sizes_and_storage_mtime() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        let data_dir = fresh_data_dir();
+        touch(&data_dir.join("admin/files/hello.txt"));
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir.clone());
+
+        fs.delete_file("files/hello.txt").await.unwrap();
+
+        // Source chain: files/ loses the 26 bytes.
+        let (_, size, _, storage_mtime, _, _) = fc_row(&pool, &prefix, "files").await.unwrap();
+        assert_eq!(size, 74, "files/ must lose the trashed file's size");
+        let files_disk_mtime = std::fs::metadata(data_dir.join("admin/files"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap();
+        assert!(
+            (storage_mtime - files_disk_mtime).abs() <= 1,
+            "files/ storage_mtime {storage_mtime} should be its disk mtime {files_disk_mtime}"
+        );
+
+        // Target chain: trash ancestors gain the 26 bytes.
+        let (_, size, _, _, _, _) = fc_row(&pool, &prefix, "files_trashbin/files").await.unwrap();
+        assert_eq!(size, 26, "files_trashbin/files must gain the trashed file's size");
+        let (_, size, _, _, _, _) = fc_row(&pool, &prefix, "files_trashbin").await.unwrap();
+        assert_eq!(size, 26, "files_trashbin must gain the trashed file's size");
+
+        // Root recomputed from children: files(74) + files_trashbin(26) + files_versions(0).
+        let (_, size, _, _, _, _) = fc_row(&pool, &prefix, "").await.unwrap();
+        assert_eq!(size, 100);
+    }
+
+    /// Finding #9: ensure_parent_dir creates filecache dirs WITHOUT
+    /// oc_filecache_extended rows (PHP `View::mkdir` → `Cache::insert` writes
+    /// no extension fields for directories).
+    #[tokio::test]
+    async fn ensure_parent_dir_creates_no_extended_rows() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        let data_dir = fresh_data_dir();
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir);
+
+        fs.ensure_parent_dir("files_trashbin/files/x").await.unwrap();
+        for p in ["files_trashbin", "files_trashbin/files", "files_trashbin/files/x"] {
+            assert!(
+                row::lookup_by_path(&pool, &prefix, storage_id, p).await.is_some(),
+                "missing dir {p}"
+            );
+        }
+        assert_eq!(extended_count(&pool).await, 0, "no extended rows for mkdir'd dirs");
+    }
+
+    /// Finding #10: versions move to `files_trashbin/versions/` and the
+    /// `oc_files_versions` metadata row is deleted (PHP `retainVersions` +
+    /// `remove_hook`).
+    #[tokio::test]
+    async fn trash_versions_moves_version_file_and_deletes_rows() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        let data_dir = fresh_data_dir();
+        touch(&data_dir.join("admin/files/hello.txt"));
+        touch(&data_dir.join("admin/files_versions/hello.txt.v100"));
+
+        // Version filecache row (id 5) under files_versions + oc_files_versions row.
+        sqlx::query(
+            "INSERT INTO oc_filecache \
+             (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+              size, mtime, storage_mtime, etag, permissions, checksum) \
+             VALUES (5, 1, 'files_versions/hello.txt.v100', $1, 6, 'hello.txt.v100', 0, 0, 26, 100, 100, 'etag', 27, '')",
+        )
+        .bind(row::path_hash("files_versions/hello.txt.v100"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO oc_files_versions (id, file_id, \"timestamp\", size, mimetype, metadata) \
+             VALUES (1, 4, 100, 26, 0, '{\"author\":\"admin\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir.clone());
+        let row = row::lookup_by_path(&pool, &prefix, storage_id, "files/hello.txt")
+            .await
+            .unwrap();
+        fs.move_to_trash("files/hello.txt", &row).await.unwrap();
+
+        // Version file moved on disk and re-keyed under files_trashbin/versions.
+        let ts = trash_ts(&pool).await;
+        let expected_v = format!("files_trashbin/versions/hello.txt.v100.d{ts}");
+        let (_, size, mtime, _, _, trash_vpath) =
+            fc_row(&pool, &prefix, &expected_v).await.unwrap();
+        assert_eq!(size, 26);
+        assert_eq!(mtime, 100);
+        assert_eq!(trash_vpath, expected_v);
+        assert!(
+            data_dir.join("admin").join(&trash_vpath).exists(),
+            "version file must exist at {trash_vpath}"
+        );
+        assert!(
+            !data_dir.join("admin/files_versions/hello.txt.v100").exists(),
+            "version file must leave files_versions/"
+        );
+
+        // oc_files_versions row deleted (PHP remove_hook → deleteVersionsEntity).
+        let vcount: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oc_files_versions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(vcount, 0);
+    }
+
+    /// Finding #10 for directories: the whole `files_versions/{dir}/` subtree
+    /// moves.  The `oc_files_versions` cleanup matches by the TRASHED NODE's
+    /// own file id (PHP `deleteAllVersionsForFileId` — the delete-hook
+    /// cascade fires only for the deleted node, never for the files moved
+    /// along inside it), so a directory trash leaves the inner files' version
+    /// rows in place — the version files moved to `files_trashbin/versions/`
+    /// keep their fileids, so the rows stay consistent.
+    #[tokio::test]
+    async fn trash_directory_moves_version_subtree_and_deletes_rows() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        let data_dir = fresh_data_dir();
+        touch(&data_dir.join("admin/files/dir/a.txt"));
+        touch(&data_dir.join("admin/files_versions/dir/a.txt.v100"));
+
+        // files/dir (id 7, size 8) + files/dir/a.txt (id 9) +
+        // files_versions/dir (id 10) + files_versions/dir/a.txt.v100 (id 11).
+        for (fid, path, parent, name) in [
+            (7i64, "files/dir", 2i64, "dir"),
+            (9, "files/dir/a.txt", 7, "a.txt"),
+            (10, "files_versions/dir", 6, "dir"),
+            (11, "files_versions/dir/a.txt.v100", 10, "a.txt.v100"),
+        ] {
+            sqlx::query(&format!(
+                "INSERT INTO {prefix}filecache \
+                 (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+                  size, mtime, storage_mtime, etag, permissions, checksum) \
+                 VALUES ($1, 1, $2, $3, $4, $5, 0, 0, 8, 100, 100, 'etag', 27, '')"
+            ))
+            .bind(fid)
+            .bind(path)
+            .bind(row::path_hash(path))
+            .bind(parent)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // The seeded `files/hello.txt` row references parent 2 — leave it; the
+        // subtree DELETE only touches files/dir rows.  Drop the hello.txt row
+        // so it doesn't linger under the (now-trashed) files/ tree.
+        sqlx::query("DELETE FROM oc_filecache WHERE fileid = 4")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO oc_files_versions (id, file_id, \"timestamp\", size, mimetype, metadata) \
+             VALUES (1, 9, 100, 8, 0, '{\"author\":\"admin\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir.clone());
+        fs.trash_directory("files/dir").await.unwrap();
+        let ts = trash_ts(&pool).await;
+
+        // Subtree version file moved and re-keyed under files_trashbin/versions.
+        let expected_v = format!("files_trashbin/versions/dir.d{ts}/a.txt.v100");
+        let (_, _, _, _, _, vpath) = fc_row(&pool, &prefix, &expected_v).await.unwrap();
+        assert_eq!(vpath, expected_v);
+        assert!(data_dir.join("admin").join(&vpath).exists());
+
+        // The inner file's oc_files_versions row SURVIVES: PHP's
+        // deleteAllVersionsForFileId runs for the trashed dir's own id only
+        // (dirs have no version rows), and the moved files' rows stay
+        // consistent with their (unchanged) fileids.
+        let vcount: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oc_files_versions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(vcount, 1, "dir trash must not delete inner files' version rows");
+
+        // The main file moved too (id 9 under files_trashbin/files/dir.d{ts}).
+        assert!(fc_row(&pool, &prefix, "files/dir/a.txt").await.is_none());
+        let expected_m = format!("files_trashbin/files/dir.d{ts}/a.txt");
+        let (_, _, _, _, _, p9) = fc_row(&pool, &prefix, &expected_m).await.unwrap();
+        assert_eq!(p9, expected_m);
+    }
+
+    /// Finding #11: the preview_generation row survives the trash move (it was
+    /// queued by the PUT; the filecache row keeps its fileid through the trash).
+    #[tokio::test]
+    async fn trash_keeps_preview_generation_row() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        let data_dir = fresh_data_dir();
+        touch(&data_dir.join("admin/files/hello.txt"));
+        sqlx::query(
+            "INSERT INTO oc_preview_generation (id, uid, file_id, queued_at) \
+             VALUES (1, 'admin', 4, 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir);
+        fs.delete_file("files/hello.txt").await.unwrap();
+
+        let pcount: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oc_preview_generation")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pcount, 1, "preview row must survive the trash move");
+    }
+
+    async fn etag_of(pool: &DbPool, prefix: &str, path: &str) -> Option<String> {
+        let hash = row::path_hash(path);
+        let sql = format!(
+            "SELECT etag FROM {prefix}filecache WHERE storage = $1 AND path_hash = $2",
+            prefix = prefix
+        );
+        sqlx::query_scalar::<_, String>(&sql)
+            .bind(1i64)
+            .bind(&hash)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Finding #10: the `oc_files_versions` cleanup is unconditional — the row
+    /// the SUT's PUT inserted is deleted even when no version FILE exists on
+    /// disk (live-verified PHP behavior).
+    #[tokio::test]
+    async fn delete_file_deletes_version_row_without_version_files() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        let data_dir = fresh_data_dir();
+        touch(&data_dir.join("admin/files/hello.txt"));
+        sqlx::query(
+            "INSERT INTO oc_files_versions (id, file_id, \"timestamp\", size, mimetype, metadata) \
+             VALUES (1, 4, 100, 26, 0, '{\"author\":\"admin\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir);
+        fs.delete_file("files/hello.txt").await.unwrap();
+
+        let vcount: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oc_files_versions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(vcount, 0, "version rows must be deleted even without version files");
+    }
+
+    /// Finding #12 (etag pattern): after a delete-to-trash the storage root
+    /// and `files/` share ONE etag (the source chain, stamped last — PHP's
+    /// `Updater::remove` runs after the trash move), while `files_trashbin`
+    /// and `files_trashbin/files` share the trash chain's etag; `keys` and
+    /// `versions` keep distinct mkdir/insert etags.
+    #[tokio::test]
+    async fn delete_file_etag_equality_pattern() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        let data_dir = fresh_data_dir();
+        touch(&data_dir.join("admin/files/hello.txt"));
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir);
+
+        fs.delete_file("files/hello.txt").await.unwrap();
+
+        let root = etag_of(&pool, &prefix, "").await.unwrap();
+        let files = etag_of(&pool, &prefix, "files").await.unwrap();
+        let trash = etag_of(&pool, &prefix, "files_trashbin").await.unwrap();
+        let trash_files = etag_of(&pool, &prefix, "files_trashbin/files").await.unwrap();
+        let keys = etag_of(&pool, &prefix, "files_trashbin/keys").await.unwrap();
+        let versions = etag_of(&pool, &prefix, "files_trashbin/versions").await.unwrap();
+        assert_eq!(root, files, "root and files/ must share the source-chain etag");
+        assert_eq!(
+            trash, trash_files,
+            "files_trashbin and files_trashbin/files must share the trash-chain etag"
+        );
+        assert_ne!(root, trash, "root etag must differ from the trash chain's");
+        assert_ne!(keys, versions);
+        assert_ne!(keys, trash);
+        assert_ne!(versions, trash);
+    }
+
+    /// Finding #12 (storage_mtime): creating `files_trashbin` (a direct child
+    /// of the storage root) stamps the root's `storage_mtime` with the root
+    /// dir's disk mtime (PHP `View::mkdir` → `Updater::update` →
+    /// `correctParentStorageMtime`).
+    #[tokio::test]
+    async fn delete_file_stamps_root_storage_mtime() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        let data_dir = fresh_data_dir();
+        touch(&data_dir.join("admin/files/hello.txt"));
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir.clone());
+
+        fs.delete_file("files/hello.txt").await.unwrap();
+
+        let (_, _, _, root_sm, _, _) = fc_row(&pool, &prefix, "").await.unwrap();
+        let disk_mtime = std::fs::metadata(data_dir.join("admin"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap();
+        assert!(
+            (root_sm - disk_mtime).abs() <= 1,
+            "root storage_mtime {root_sm} should be the root dir's disk mtime {disk_mtime}"
+        );
+    }
+
+    /// Finding #8: the delete flow materializes the user's `cache/` filecache
+    /// row (live-verified oracle behavior — the row appears during the DELETE;
+    /// scanner-insert shape: size 0, permissions 31, no extended row).
+    #[tokio::test]
+    async fn delete_flow_materializes_cache_row() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        let data_dir = fresh_data_dir();
+        touch(&data_dir.join("admin/files/hello.txt"));
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir);
+
+        fs.delete_file("files/hello.txt").await.unwrap();
+
+        let (_, size, mtime, sm, parent, path) = fc_row(&pool, &prefix, "cache").await.unwrap();
+        assert_eq!(path, "cache");
+        assert_eq!(size, 0);
+        assert_eq!(parent, 1, "cache must hang off the storage root");
+        assert!(mtime > 0 && sm > 0);
+        assert_eq!(extended_count(&pool).await, 0, "cache row must have no extended row");
     }
 }

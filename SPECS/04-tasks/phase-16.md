@@ -229,6 +229,16 @@ Build the Oracle by cloning the SUT's service definition and bypassing Rust:
 >
 > **Deviation (16.8):** the task's exclusion mechanism ("Exclude volatile subtrees: `files_versions/`, `cache/`, `appdata_*/`") is realized by **rooting the snapshot at `files/**`** rather than filtering within a wider walk — those subtrees are siblings of `files/`, never children, so the root excludes them by construction (verified against the live datadir layout). Equivalent coverage, one less way to get it wrong.
 
+> **Note (2026-08-07 — delete-to-trash parity, plan
+> [`phase-16.8-delete-trash-parity-plan.md`](phase-16.8-delete-trash-parity-plan.md)):** the
+> delete-flow findings #6–#12 cluster is resolved in `filesystem.rs` (see the `## Changes` log
+> entry below). Difftest-verified on fresh stacks: `10_put_get_delete` and `17_delete_to_trash`
+> are at parity except the accepted root-size divergence (#1 — PHP's `calculateFolderSizeInner`
+> mimetype bug; Rust intentionally correct); `11_mkdir_nested`'s known parent-`storage_mtime`
+> divergence is fixed; `14_propfind_depth1` / `30_share_create_selfcheck` stay IDENTICAL;
+> `10_put_get`'s remaining versioning-path rows are the pre-existing #13–#22 group (untouched
+> code). `cargo test --lib -p nc-dav` → 302 passed.
+
 ### 16.9 Core native scenarios (11–18)
 > Native = Rust writes the DB itself (`/remote.php/webdav/*`, `/remote.php/dav/files/{uid}/*`) — the highest-value differential surface.
 
@@ -740,3 +750,56 @@ time (−52). All 286 nc-dav lib tests pass; 13/13 nc-difftest tests pass.
 Coordination note: taken in parallel with another session investigating the
 16.4 deviations (#1–#5) — this fix touches only `upload_handler.rs`, disjoint
 from that work's surface.
+
+### 2026-08-07 — Delete-flow findings #6–#12 resolved: delete-to-trash parity (plan `phase-16.8-delete-trash-parity-plan.md`)
+
+The delete-to-trash divergence cluster (findings #6–#12 from the 16.8 Changes record) is resolved
+in `nc-dav` (`filesystem.rs`). Ground truth was re-verified live — controlled PUT/DELETE probes
+against the oracle plus fresh-stack difftest runs — which **corrected three of the original
+findings**:
+
+- **#10 (version rows):** PHP creates an `oc_files_versions` row on every PUT (`created()` →
+  `createVersionEntity`: `file_id` = file id, `timestamp` = **file mtime**, `metadata` =
+  `{"author":…}` — the SUT's `davfile.rs:618` insert already matched) and **deletes it
+  unconditionally during the trash flow**: the View-level `delete` hook bridges (`HookConnector`)
+  to `NodeDeletedEvent` → versions `remove_hook` → `deleteVersionsEntity` →
+  `deleteAllVersionsForFileId` (`DELETE … WHERE file_id = ?`), regardless of version files.
+  Rust's `trash_versions` had gated the DELETE behind the version-file query's early return; it
+  now runs unconditionally by the trashed node's own file id (dir trashes delete nothing, since
+  the hook fires only for the deleted node — inner files' rows survive with unchanged fileids,
+  PHP parity).
+- **#11 (preview re-queue): the original claim was wrong.** PHP does NOT touch
+  `oc_preview_generation` on trash (pixel.png probe: PUT queues id 3, DELETE leaves it). No fix
+  needed — the SUT already matched; adding the plan's queue call would have introduced a
+  divergence.
+- **#12 (root storage_mtime + etag ordering):** the root's `storage_mtime = now` comes from
+  `setUpTrash`'s mkdir side effects (`View::mkdir` → `Updater::update` →
+  `correctParentStorageMtime`), not from `renameFromStorage`; `ensure_parent_dir` now mirrors
+  them. The oracle etag pattern (`root.etag == files.etag`, `files_trashbin.etag ==
+  files_trashbin/files.etag`) comes from PHP's three-step stamping: `renameFromStorage` source →
+  trash chain → **`View::unlink`'s post-op `Updater::remove`**, the final root writer;
+  `delete_file`/`delete_dir` now run the trash chain first and the source chain last.
+- **#8 rescoped (cache/):** the delete flow materializes the user's `cache/` row (one-shot per
+  instance on first files access — cf. the 16.9 01-scenario note). `move_to_trash` now
+  create-if-missing's it with the scanner-insert shape (size 0, permissions 31, no extended row).
+  Without it the harness's etag sentinel numbering shifted for every subsequent row, hiding the
+  etag-pattern fix.
+
+**Verification (fresh stacks, `down -v && make diff-up` before each acceptance run):**
+- `10_put_get_delete` and `17_delete_to_trash` — parity except the accepted root-size divergence
+  (#1: SUT recomputes the root size including the trash; PHP's bugged `correctFolderSize` never
+  does). Every other row — etag equality patterns, storage_mtime (raw values verified equal),
+  skeleton, trash row, extended rows, preview row, version rows — matches.
+- `11_mkdir_nested` — the known "MKCOL matches except parent storage_mtime" divergence is fixed
+  (mkdir'd dirs now identical incl. storage_mtime; `ensure_parent_dir` mkdir side effects).
+- `14_propfind_depth1`, `30_share_create_selfcheck` — IDENTICAL (no regressions).
+- `10_put_get` — unchanged versioning-path rows (version-file etag/checksum/storage_mtime,
+  `files_versions` size + extended row) — the pre-existing #13–#22 group in `davfile.rs`/
+  `versions.rs` (untouched this session) — out of scope.
+- `cargo test --lib -p nc-dav` → 302 passed (4 new tests: unconditional version-row delete, etag
+  equality pattern, root storage_mtime stamp, cache-row materialization; the dir-trash test
+  updated to PHP's by-id semantics). Workspace `cargo test --lib` clean except the pre-existing
+  `nc-fastcgi::registry_scans_real_apps_dir`.
+
+**Remaining known (out of scope):** the versioning-path rows of `10_put_get` (#13–#22), and the
+one-shot `cache/` materialization for non-delete first accesses (16.9's 01 note).
