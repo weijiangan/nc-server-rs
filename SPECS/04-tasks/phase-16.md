@@ -982,3 +982,21 @@ The "broken text-valued PROPPATCH extraction" (16.9 finding) is resolved in `nc-
 
 **Remaining in the #13–#22 group:** the lazy `files_metadata` appconfig registration and the
 home-root mtime propagation.
+
+### 2026-08-07 — `files_metadata` appconfig registration + #13–#22 group closed
+
+The last two 16.9 findings are resolved, closing the whole #13–#22 group:
+
+- **Lazy `files_metadata` appconfig registration:** PHP's tag/favorite PROPPATCH registers the
+  `core | files_metadata` appconfig row (`FilesMetadataManager::setValueArray`, lazy). The SUT's
+  PROPPATCH now registers it create-if-missing with the oracle's exact row: `files-live-photo`
+  (etag `""`), `type = 64, lazy = 1` — the `blurhash` key only appears on a fresh instance's
+  first registration and is not reproducible per-run (documented in the helper).
+- **Home-root mtime propagation (#22):** verified resolved — the root's mtime bumps on child
+  writes on both sides (the SUT's ancestor propagation has covered it since the 16.4-era work);
+  the 18_explicit_mtime residuals are the accepted root-size (#1) and the 1-second replay
+  boundary, not a propagation gap.
+
+**Verification:** `15_proppatch_favorite_tags` is now **IDENTICAL** (favorite mapping +
+tags + appconfig all match on a clean appconfig state); 14/30 IDENTICAL; 10/16/12/13 unchanged
+(no regressions). 305 nc-dav lib tests pass.

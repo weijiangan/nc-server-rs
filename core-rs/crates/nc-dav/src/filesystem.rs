@@ -2737,6 +2737,10 @@ impl DavFileSystem for NcFileSystem {
                                 let t = s.trim();
                                 t.parse::<i64>().ok() == Some(1) || t == "true"
                             });
+                            // PHP lazily registers the files_metadata appconfig
+                            // on the tag/favorite PROPPATCH.
+                            ensure_files_metadata_appconfig(&self.state.pool, &self.state.table_prefix)
+                                .await;
                             let fileid = crate::row::lookup_by_path(
                                 &self.state.pool,
                                 &self.state.table_prefix,
@@ -2761,6 +2765,10 @@ impl DavFileSystem for NcFileSystem {
 
                         // §9.5: {oc:}tags — diff current vs requested, skip favorite sentinel.
                         ("http://owncloud.org/ns", "tags") => {
+                            // PHP lazily registers the files_metadata appconfig
+                            // on the tag/favorite PROPPATCH.
+                            ensure_files_metadata_appconfig(&self.state.pool, &self.state.table_prefix)
+                                .await;
                             let requested = prop.xml.as_ref()
                                 .map(|xml| crate::tags::parse_tags_xml(xml))
                                 .unwrap_or_default();
@@ -2980,6 +2988,26 @@ pub(crate) async fn ensure_cache_row(
         .await
     {
         warn!(error = %e, "cache row materialization failed");
+    }
+}
+
+/// Lazily register the `core | files_metadata` appconfig row (the lazy
+/// registration PHP's PROPPATCH triggers — live-verified against the oracle:
+/// `files-live-photo` (etag = "") with `type = 64, lazy = 1`; the `blurhash`
+/// key only appears on a fresh instance's first registration and is not
+/// reproducible per-run, so it is omitted).
+pub(crate) async fn ensure_files_metadata_appconfig(pool: &DbPool, prefix: &str) {
+    let config_value = "{\"files-live-photo\":{\"value\":null,\"type\":\"string\",\
+        \"etag\":\"\",\"indexed\":false,\"editPermission\":2}}"
+        .to_string();
+    let sql = format!(
+        "INSERT INTO {prefix}appconfig (appid, configkey, configvalue, type, lazy) \
+         VALUES ('core', 'files_metadata', $1, 64, 1) \
+         ON CONFLICT DO NOTHING",
+        prefix = prefix
+    );
+    if let Err(e) = sqlx::query(&sql).bind(&config_value).execute(pool).await {
+        tracing::warn!(error = %e, "files_metadata appconfig registration failed");
     }
 }
 
