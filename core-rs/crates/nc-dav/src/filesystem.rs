@@ -1720,7 +1720,6 @@ impl DavFileSystem for NcFileSystem {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64;
-            let new_etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
             let new_name = to_fc.rsplit('/').next().unwrap_or("").to_string();
             let new_hash = row::path_hash(&to_fc);
             let prefix = &self.state.table_prefix;
@@ -1736,19 +1735,20 @@ impl DavFileSystem for NcFileSystem {
             )
             .await;
 
-            // Update the node itself.
+            // Update the node itself.  Path/path_hash/name/parent only — PHP
+            // `Cache::move` (Cache.php:813-831) leaves the moved file's
+            // mtime/etag/storage_mtime untouched (live-verified); the
+            // parents' etags are bumped by the propagation below.
             let sql_node = format!(
                 "UPDATE {prefix}filecache \
-                 SET path=$1, path_hash=$2, name=$3, parent=$4, mtime=$5, etag=$6 \
-                 WHERE fileid=$7"
+                 SET path=$1, path_hash=$2, name=$3, parent=$4 \
+                 WHERE fileid=$5"
             );
             sqlx::query(&sql_node)
                 .bind(&to_fc)
                 .bind(&new_hash)
                 .bind(&new_name)
                 .bind(to_parent.fileid)
-                .bind(now)
-                .bind(&new_etag)
                 .bind(from_row.fileid)
                 .execute(&self.state.pool)
                 .await
@@ -1851,6 +1851,26 @@ impl DavFileSystem for NcFileSystem {
                 parts.pop();
                 parts.join("/")
             };
+            // PHP `copyOrRenameFromStorage` corrects both direct parents'
+            // `storage_mtime` from their disk mtimes (Updater.php:198-201).
+            for (parent_fc, label) in [
+                (from_parent_fc.clone(), "from"),
+                (to_parent_fc.clone(), "to"),
+            ] {
+                let parent_disk = self.disk_path(&parent_fc);
+                if let Err(e) = self
+                    .propagator
+                    .correct_parent_storage_mtime(&parent_fc, &parent_disk)
+                    .await
+                {
+                    tracing::warn!(
+                        parent = %parent_fc,
+                        label,
+                        error = %e,
+                        "move: parent storage_mtime correction failed"
+                    );
+                }
+            }
             if let Err(e) = self
                 .propagator
                 .propagate_change(&from_fc, now, 0)
@@ -1865,19 +1885,22 @@ impl DavFileSystem for NcFileSystem {
             {
                 tracing::warn!(path = %to_fc, error = %e, "move: target propagation failed");
             }
-            // Recalculate immediate parent sizes (size change can't be expressed
-            // as a simple signed delta when subtrees move).
+            // Recalculate ancestor sizes (size change can't be expressed as a
+            // simple signed delta when subtrees move).  Size-ONLY — PHP's
+            // `correctFolderSize` never touches etag/mtime, and the standalone
+            // `correct_folder_size`'s internal propagation would re-stamp the
+            // root after the target-chain etag, breaking `root == files`.
             if from_parent_fc != to_parent_fc {
-                if let Err(e) = self.propagator.correct_folder_size(&from_parent_fc).await {
-                    tracing::warn!(path = %from_parent_fc, error = %e, "move: correct_folder_size from failed");
+                if let Err(e) = self.propagator.correct_folder_size_chain(&from_parent_fc).await {
+                    tracing::warn!(path = %from_parent_fc, error = %e, "move: correct_folder_size_chain from failed");
                 }
-                if let Err(e) = self.propagator.correct_folder_size(&to_parent_fc).await {
-                    tracing::warn!(path = %to_parent_fc, error = %e, "move: correct_folder_size to failed");
+                if let Err(e) = self.propagator.correct_folder_size_chain(&to_parent_fc).await {
+                    tracing::warn!(path = %to_parent_fc, error = %e, "move: correct_folder_size_chain to failed");
                 }
             } else {
                 // Same parent (rename within the same directory) — recalculate once.
-                if let Err(e) = self.propagator.correct_folder_size(&to_parent_fc).await {
-                    tracing::warn!(path = %to_parent_fc, error = %e, "move: correct_folder_size failed");
+                if let Err(e) = self.propagator.correct_folder_size_chain(&to_parent_fc).await {
+                    tracing::warn!(path = %to_parent_fc, error = %e, "move: correct_folder_size_chain failed");
                 }
             }
 
@@ -1931,6 +1954,14 @@ impl DavFileSystem for NcFileSystem {
                     parts.pop();
                     parts.join("/")
                 };
+                // PHP's copy scans the target parent into the cache when it's
+                // missing (Updater.php:141-148 — the disk copy needs the dir
+                // too).  A COPY into a fresh subdir must create it
+                // (live-verified: the oracle answers 201 with the dir
+                // created; the SUT previously returned 409).
+                self.ensure_parent_dir(&to_parent_fc)
+                    .await
+                    .map_err(|_| FsError::NotFound)?;
                 if let Some(parent_row) = row::lookup_by_path(
                     &self.state.pool,
                     &self.state.table_prefix,
@@ -1943,7 +1974,23 @@ impl DavFileSystem for NcFileSystem {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as i64;
-                    let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+                    // The copied row is a CLONE of the source (PHP
+                    // `copyFromCache`): it inherits the source's etag and
+                    // mtime, drops the checksum (NULL), and takes
+                    // `storage_mtime` = the copy time (the copied file's disk
+                    // mtime — PHP `updateStorageMTimeOnly`).
+                    let etag = from_row.etag.clone().unwrap_or_else(|| {
+                        format!("{:032x}", uuid::Uuid::new_v4().as_u128())
+                    });
+                    let (src_creation, src_upload) = {
+                        let ext = row::get_extended(
+                            &self.state.pool,
+                            &self.state.table_prefix,
+                            from_row.fileid,
+                        )
+                        .await;
+                        (ext.creation_time, ext.upload_time)
+                    };
                     let name = to_fc.rsplit('/').next().unwrap_or("").to_string();
                     let hash = row::path_hash(&to_fc);
                     let prefix = &self.state.table_prefix;
@@ -1989,11 +2036,13 @@ impl DavFileSystem for NcFileSystem {
                             (from_row.mimetype, from_row.mimepart)
                         };
 
+                    // `checksum` intentionally unbound: the clone drops it
+                    // (NULL), matching the oracle.
                     let sql = format!(
                         "INSERT INTO {prefix}filecache \
                          (storage, path, path_hash, parent, name, mimetype, mimepart, \
-                          size, mtime, storage_mtime, etag, permissions, checksum) \
-                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+                          size, mtime, storage_mtime, etag, permissions) \
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
                          RETURNING fileid"
                     );
                     let copy_fid: Option<i64> = match sqlx::query_scalar::<_, i64>(&sql)
@@ -2005,11 +2054,10 @@ impl DavFileSystem for NcFileSystem {
                         .bind(copy_mid)
                         .bind(copy_pid)
                         .bind(from_row.size)
-                        .bind(now)
+                        .bind(from_row.mtime)
                         .bind(now)
                         .bind(&etag)
                         .bind(from_row.permissions)
-                        .bind(from_row.checksum.as_deref().unwrap_or(""))
                         .fetch_one(&self.state.pool)
                         .await
                     {
@@ -2020,9 +2068,29 @@ impl DavFileSystem for NcFileSystem {
                         }
                     };
 
-                    // §9.4: insert oc_files_versions for the copied file.
-                    // Matches PHP NodeCreatedEvent → created() → createVersionEntity().
                     if let Some(fid) = copy_fid {
+                        // The copied row inherits the source's extended row
+                        // (creation_time/upload_time) — the oracle's copies
+                        // carry one.
+                        let sql_ext = format!(
+                            "INSERT INTO {prefix}filecache_extended \
+                             (fileid, metadata_etag, creation_time, upload_time) \
+                             VALUES ($1, '', $2, $3) \
+                             ON CONFLICT(fileid) DO NOTHING",
+                            prefix = self.state.table_prefix
+                        );
+                        if let Err(e) = sqlx::query(&sql_ext)
+                            .bind(fid)
+                            .bind(src_creation)
+                            .bind(src_upload)
+                            .execute(&self.state.pool)
+                            .await
+                        {
+                            tracing::warn!(fileid = fid, error = %e, "Failed to insert copy extended row");
+                        }
+
+                        // §9.4: insert oc_files_versions for the copied file.
+                        // Matches PHP NodeCreatedEvent → created() → createVersionEntity().
                         crate::versions::insert_version_entity(
                             &self.state.pool,
                             &self.state.table_prefix,
@@ -2031,6 +2099,18 @@ impl DavFileSystem for NcFileSystem {
                             from_row.size,
                             copy_mid,
                             &self.uid,
+                        )
+                        .await;
+
+                        // PHP's copy dispatches NodeWrittenEvent → the
+                        // previewgenerator PostWriteListener queues a
+                        // preview_generation row for the copy.
+                        crate::preview_queue::queue_preview_generation(
+                            &self.state.pool,
+                            &self.state.table_prefix,
+                            &self.uid,
+                            fid,
+                            now,
                         )
                         .await;
                     }
@@ -2062,13 +2142,14 @@ impl DavFileSystem for NcFileSystem {
             {
                 tracing::warn!(path = %to_fc, error = %e, "copy: propagation failed");
             }
-            let to_parent_fc = {
-                let mut parts: Vec<&str> = to_fc.split('/').collect();
-                parts.pop();
-                parts.join("/")
-            };
-            if let Err(e) = self.propagator.correct_folder_size(&to_parent_fc).await {
-                tracing::warn!(path = %to_parent_fc, error = %e, "copy: correct_folder_size failed");
+            // Size-ONLY (PHP correctFolderSize never touches etag/mtime — the
+            // standalone correct_folder_size would re-stamp the root after
+            // the target-chain etag and break `root == files`).  Chained on
+            // the TARGET so the copy's own parent (e.g. a freshly-created
+            // subdir) gets its size recomputed from the new child
+            // (live-verified: the oracle's copy-dir carries the copy's size).
+            if let Err(e) = self.propagator.correct_folder_size_chain(&to_fc).await {
+                tracing::warn!(path = %to_fc, error = %e, "copy: correct_folder_size_chain failed");
             }
 
             Ok(())

@@ -921,3 +921,42 @@ side-by-side with the SUT) plus fresh-stack difftest runs.
 **Remaining in the #13–#22 group (out of scope this pass):** the COPY size/checksum/etag/extended
 handling (`12_move_rename` / `13_copy`), the PROPPATCH favorite bug, the lazy `files_metadata`
 appconfig registration, and the home-root mtime propagation.
+
+### 2026-08-07 — MOVE/COPY divergences resolved: move-rename + copy parity (`12_move_rename`, `13_copy`)
+
+The MOVE/COPY cluster (the #13–#22 group's remaining file-operation rows) is resolved in
+`nc-dav` (`filesystem.rs`). Ground truth: live PUT/MOVE/COPY probes against the oracle (raw rows
+compared side-by-side with the SUT) plus difftest runs.
+
+**Fixes (MOVE — PHP `View::rename` → `copyOrRenameFromStorage`):**
+- The moved file's row is re-keyed path/path_hash/name/parent only — `mtime` and `etag` are
+  KEPT (PHP `Cache::move`, Cache.php:813-831; the SUT had been stamping fresh values).
+- Both direct parents' `storage_mtime` are corrected from their disk mtimes
+  (`correctParentStorageMtime`, Updater.php:198-201 — the SUT's rename lacked the calls).
+- The ancestor size recomputes switched to the size-ONLY `correct_folder_size_chain`: the
+  standalone `correct_folder_size`'s internal propagation re-stamped the root AFTER the
+  target-chain etag, breaking the oracle's `root.etag == files.etag` after a move.
+
+**Fixes (COPY — PHP `View::copy` → `copyFromStorage`):**
+- The destination row is a CLONE of the source: it inherits the source etag and mtime, drops
+  the checksum (NULL), and takes `storage_mtime` = the copy time — the same clone semantics as
+  the version-file fix.
+- The destination inherits the source's `oc_filecache_extended` row
+  (creation_time/upload_time).
+- A COPY into a fresh subdir now creates the parent (PHP scans it into the cache;
+  Updater.php:141-148 — the SUT previously answered 409).
+- The copy queues an `oc_preview_generation` row (PHP's NodeWrittenEvent → the previewgenerator
+  PostWriteListener).
+- The ancestor size recompute chained on the TARGET so a freshly-created parent dir gets its
+  size from the new child (the oracle's `copy-dir` carries the copy's size).
+
+**Verification:**
+- `12_move_rename` — parity except the accepted root-size divergence (#1).
+- `13_copy` — parity except the accepted root-size divergence (remaining storage_mtime rows are
+  the known second-boundary label artifacts).
+- `14_propfind_depth1`, `30_share_create_selfcheck`, `10_put_get`, `16_overwrite_put` —
+  unchanged/no regressions (the last two at their established parity level).
+- `cargo test --lib -p nc-dav` → 304 passed.
+
+**Remaining in the #13–#22 group:** the PROPPATCH favorite bug (`15_proppatch_favorite_tags`),
+the lazy `files_metadata` appconfig registration, and the home-root mtime propagation.
