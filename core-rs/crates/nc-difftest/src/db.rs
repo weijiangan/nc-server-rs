@@ -72,6 +72,37 @@ fn skip_table(name: &str) -> bool {
     SKIP_TABLES.contains(&name) || name.ends_with("_queue")
 }
 
+/// Count rows in one table (the quiescence drain-wait polls
+/// `oc_preview_generation` this way; the table name is a fixed literal at the
+/// call site, never user input).
+pub async fn count_table(dsn: &str, table: &str) -> Result<i64> {
+    let pool = PgPool::connect(dsn)
+        .await
+        .with_context(|| format!("connecting to {dsn}"))?;
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    let n: i64 = sqlx::query_scalar(&sql)
+        .fetch_one(&pool)
+        .await
+        .with_context(|| format!("counting {table} on {dsn}"))?;
+    Ok(n)
+}
+
+/// The oc_jobs id of the previewgenerator's PreviewJob.  The snowflake ids
+/// are per-instance (the SUT and oracle have independent oc_jobs tables), so
+/// the quiescence drain looks each side's id up before forcing the job.
+pub async fn preview_job_id(dsn: &str) -> Result<Option<i64>> {
+    let pool = PgPool::connect(dsn)
+        .await
+        .with_context(|| format!("connecting to {dsn}"))?;
+    let id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM oc_jobs WHERE class LIKE '%PreviewJob' ORDER BY id LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .with_context(|| format!("looking up PreviewJob on {dsn}"))?;
+    Ok(id)
+}
+
 /// Snapshot one instance. `dsn` is a `postgres://` connection string.
 pub async fn snapshot(dsn: &str) -> Result<Snapshot> {
     let pool = PgPool::connect(dsn)

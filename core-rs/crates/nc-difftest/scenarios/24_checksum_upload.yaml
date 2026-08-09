@@ -1,7 +1,10 @@
 # Phase 16.10 — OC-Checksum parity. First PUT carries the correct SHA1 of the
 # body (precomputed) — the stored oc_filecache.checksum must match PHP's
-# verbatim (stable column). Second PUT carries a WRONG checksum — both sides
-# must reject identically (status + body), leaving no residue.
+# verbatim (stable column). Second PUT carries a WRONG checksum: the SUT
+# deliberately rejects it (400, REQ §13.1) while PHP stores the header
+# unverified (204) — a recorded intentional divergence (divergences.yaml
+# checksum-verification + the version-row consequences), so the statuses are
+# printed but not asserted equal for this op.
 name: 24_checksum_upload
 ops:
   - op: put
@@ -16,7 +19,7 @@ ops:
     body_file: checksum-body.txt
     headers:
       OC-Checksum: "SHA1:0000000000000000000000000000000000000000"
-    compare_body: true
+    compare_status: false
 cleanup:
   - op: delete
     path: /remote.php/dav/files/admin/checksummed.txt

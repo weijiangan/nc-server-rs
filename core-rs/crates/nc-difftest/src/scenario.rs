@@ -38,6 +38,10 @@ pub struct Scenario {
     pub stable_overrides: Vec<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
@@ -53,6 +57,13 @@ pub enum Op {
         /// parity: same status is not enough, the error shape must match too).
         #[serde(default)]
         compare_body: bool,
+        /// Skip the cross-side STATUS equality assertion for this op (the
+        /// statuses are still printed).  For recorded intentional divergences
+        /// — e.g. the SUT's REQ §13.1 OC-Checksum rejection (400) vs PHP
+        /// accepting the header unverified (204); the row consequences are
+        /// listed in divergences.yaml.
+        #[serde(default = "default_true")]
+        compare_status: bool,
         /// Capture response headers into variables (`var: Header-Name`).
         #[serde(default)]
         capture_headers: std::collections::BTreeMap<String, String>,
@@ -179,6 +190,17 @@ pub struct OpResult {
 }
 
 /// Resolve a fixture body. `body_file` is relative to the crate's `fixtures/`.
+impl Op {
+    /// Whether the runner must assert equal statuses across sides (default
+    /// true; `compare_status: false` marks a recorded intentional divergence).
+    pub fn compare_status(&self) -> bool {
+        match self {
+            Op::Put { compare_status, .. } => *compare_status,
+            _ => true,
+        }
+    }
+}
+
 fn body_bytes(body_file: &Option<String>, body: &Option<String>) -> Result<Vec<u8>> {
     if let Some(f) = body_file {
         let p = format!("{}/fixtures/{f}", env!("CARGO_MANIFEST_DIR"));
@@ -268,6 +290,7 @@ pub async fn run_ops(
                 body,
                 headers,
                 compare_body,
+                compare_status: _,
                 capture_headers,
             } => {
                 let bytes = body_bytes(body_file, body)?;

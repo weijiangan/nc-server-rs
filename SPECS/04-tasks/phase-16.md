@@ -1133,3 +1133,51 @@ Imaginary both sides share.
 - Instance hygiene: all probe files hard-deleted from both sides (`X-NC-Skip-Trashbin`);
   preview rows for deleted files are orphaned and stay out of later deltas (unchanged
   between snapshots — established convention).
+
+### 2026-08-09 — dav-server fork salvage, 507 framing regression, suite hardening (inverted repo)
+
+The repo inversion (nc-server-core becomes the parent; nextcloud-docker-dev,
+workspace/server, and the vendored dav-server fork become submodules) surfaced
+that the vendored dav-server had never been tracked as files — the index
+recorded a bare gitlink (160000) with no .gitmodules entry, and the checkout's
+directory was empty.  The fork (branch `nextcloud-0.11.0`) was recovered
+byte-exact from the master-nextcloud image layers (the build context copies in
+podman's storage), including two commits that post-dated the last recovery
+point: **112b968** (Lowercase DAV namespace prefix `D:` → `d:` throughout) and
+the **InsufficientStorage 507 error-body** change (uncommitted worktree state).
+
+- **Framing regression found during recovery:** the newest build context
+  (ecb9e26c) carried the 507 body fix in a **broken ordering** —
+  `Content-Length: 0` was set before the XML body, so hyper truncated the body
+  at framing and the SUT answered 507 with an empty body (the Aug-7-verified
+  behavior was the successor build minutes later, 7f38bde7: the XML body sets
+  its own Content-Length).  The fork branch is amended to the working version
+  (1534043 → 47a1231, force-pushed).  `23_quota_exceeded` is **IDENTICAL**
+  again (507 == 507, matching bodies).
+- **24_checksum_upload greened.**  The SUT's OC-Checksum rejection (400, REQ
+  §13.1) vs PHP accepting the header unverified (204) is a recorded intentional
+  divergence — the harness now supports `compare_status: false` per PUT op (the
+  statuses still print; only the equality assertion is skipped), and the
+  version-row consequences (oc_filecache `files_versions` rows, the extended
+  row, the oc_files_versions entity) are inventoried as
+  `checksum-reject-version-*`.  Scenario 24 is **IDENTICAL** (6 KNOWN).
+- **Flake classes handled by quiescence, not masking.**  The dev containers
+  run cron on a 5-minute schedule (`*/5` in `cron.conf`); the previewgenerator
+  job drains `oc_preview_generation` and the job loop bumps the heartbeat
+  appconfig rows (`backgroundjob|lastjob`, `core|lastcron`, `circles|
+  maintenance_update`) on that cadence.  A snapshot straddling one of those
+  events diverges on which side the event landed in the window.  The runner's
+  `quiesce_background` now forces each side's PreviewJob (`occ
+  background-job:execute <id> --force-execute` via docker exec — plain
+  `cron.php` does not drain on demand, the job is interval-gated)
+  deterministically before **every** snapshot and waits for the queue to
+  drain (bounded 30 s; fast path when both queues are already empty) — the
+  job's writes land before the snapshot on both sides.  The three heartbeat
+  rows stay inventoried as narrow `noise` backstops for the rare mid-window
+  5-minute cron; the preview lifecycle (queue / oc_previews / extended-row
+  bumps) is **not** masked — a real preview-parity gap would fail loudly
+  (the 16.10 #33 class).  Also: `11_mkdir_nested` added to `home-root-size`
+  + `replay-second-boundary`.
+- **Verification (inverted repo):** three consecutive full-suite rounds,
+  all 20 scenarios green (KNOWN divergences only); `cargo test --lib -p
+  nc-difftest` → 15 passed; 25/26/27 stay byte-IDENTICAL.

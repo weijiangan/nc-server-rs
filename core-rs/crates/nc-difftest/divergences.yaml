@@ -33,6 +33,7 @@
   scenarios:
     - 10_put_get
     - 10_put_get_delete
+    - 11_mkdir_nested
     - 12_move_rename
     - 13_copy
     - 16_overwrite_put
@@ -66,6 +67,49 @@
   # while the accepted PHP overwrite bumps it — the same intentional class.
   columns: [checksum, etag]
 
+# Consequence of checksum-verification: the SUT's rejected overwrite creates
+# no version rows, while PHP accepts the write unverified and creates the
+# oc_filecache `files_versions` dir + file rows, the extended row, and the
+# oc_files_versions entity.  The scenario's second PUT carries
+# `compare_status: false` — the statuses still print, only the equality
+# assertion is skipped.
+- id: checksum-reject-version-rows
+  why: >-
+    The rejected overwrite (SUT 400 on the wrong OC-Checksum, REQ §13.1)
+    leaves the version tree untouched; the accepted PHP overwrite (204)
+    creates the files_versions dir + version-file rows.  Same intentional
+    class as checksum-verification; no behavior gap.
+  status: accepted
+  revisit: "with checksum-verification"
+  scenarios: [24_checksum_upload]
+  table: oc_filecache
+  key: "home::admin\u0001files_versions"
+  columns: []
+
+- id: checksum-reject-version-extended
+  why: >-
+    The oracle-only files_versions version-file row carries its extended row
+    (creation_time/upload_time); the SUT rejected the write, so no extended
+    row.  Same intentional class as checksum-verification.
+  status: accepted
+  revisit: "with checksum-verification"
+  scenarios: [24_checksum_upload]
+  table: oc_filecache_extended
+  key: "home::admin\u0001files_versions/checksummed"
+  columns: []
+
+- id: checksum-reject-version-entity
+  why: >-
+    The oracle-only oc_files_versions entity for the accepted overwrite
+    (metadata {"author":"admin"}); the SUT rejected the write, so no entity.
+    Same intentional class as checksum-verification.
+  status: accepted
+  revisit: "with checksum-verification"
+  scenarios: [24_checksum_upload]
+  table: oc_files_versions
+  key: "home::admin\u0001files_versions/checksummed"
+  columns: []
+
 - id: replay-second-boundary
   why: >-
     The sequential SUT-then-oracle replay can straddle a second boundary, so
@@ -78,6 +122,7 @@
   scenarios:
     - 10_put_get
     - 10_put_get_delete
+    - 11_mkdir_nested
     - 12_move_rename
     - 13_copy
     - 16_overwrite_put
@@ -94,3 +139,54 @@
   # sequential replay's second-boundary straddle shows as a before-mtime
   # label difference (the after-values are the same generation instant).
   columns: [size, etag, mtime, storage_mtime]
+
+# The nc-server's background-job loop (and PHP's request-triggered cron) bump
+# the heartbeat appconfig rows on their own schedules; when a bump lands inside
+# a replay window, the changed row's key (which embeds the new value) diverges
+# between the sides — pure timing, the rows keep moving on both sides.  Not a
+# behavior difference.  Blanket (scenarios empty): any scenario can catch a
+# bump.  Live-verified: the bumps are heartbeat-only, both sides' jobs run
+# identically.
+- id: background-job-lastjob-heartbeat
+  why: >-
+    The backgroundjob app's `lastjob` configvalue is bumped on every job-loop
+    run; the canonical key embeds the value, so an in-window bump makes the
+    changed row diverge between the sides.  Both sides' loops run the same
+    jobs — timing only.
+  status: noise
+  revisit: "quiesce the job loop for the replay, or drop the configvalue from the appconfig key"
+  scenarios: []
+  table: oc_appconfig
+  key: "backgroundjob|lastjob"
+  columns: []
+
+- id: background-job-lastcron-heartbeat
+  why: >-
+    The core app's `lastcron` configvalue is bumped when a cron heartbeat
+    lands in the replay window — timing only, both sides' crons run.
+  status: noise
+  revisit: "with background-job-lastjob-heartbeat"
+  scenarios: []
+  table: oc_appconfig
+  key: "core|lastcron"
+  columns: []
+
+- id: circles-maintenance-heartbeat
+  why: >-
+    The circles app's `maintenance_update` JSON configvalue embeds run
+    timestamps; a maintenance run landing in the replay window changes the
+    row on one side only — timing only, both sides run the same maintenance.
+  status: noise
+  revisit: "with background-job-lastjob-heartbeat"
+  scenarios: []
+  table: oc_appconfig
+  key: "circles|maintenance_update"
+  columns: []
+
+# The preview-lifecycle timing class (the async queue drain + generation
+# landing inside a replay window) is NOT inventoried as noise — masking it
+# would hide real preview-parity gaps (16.10's #33 class).  The runner
+# instead quiesces deterministically: `quiesce_background` triggers each
+# side's cron before every snapshot and waits for oc_preview_generation to
+# drain (bounded).  The residual mid-window 5-minute cron is rare; if it
+# lands in a window, the run fails loudly rather than masking.

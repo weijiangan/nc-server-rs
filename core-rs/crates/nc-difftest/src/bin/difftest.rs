@@ -128,6 +128,75 @@ async fn snapshot_check(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Quiesce the async background writers before a snapshot.
+///
+/// The dev containers run cron on a 5-minute schedule (`*/5` in
+/// docker/configs/cron.conf); the previewgenerator's PreviewJob drains
+/// `oc_preview_generation` on that cadence, and the job loop bumps the
+/// heartbeat appconfig rows.  A snapshot straddling one of those events
+/// diverges on which side the event landed in the window.  Instead of racing
+/// the schedule (or masking the rows in divergences.yaml), force each side's
+/// PreviewJob (`occ background-job:execute … --force-execute`) so the queue
+/// drains deterministically — the job's writes land before the snapshot on
+/// both sides, so the deltas stay clean.  Fast path: both queues already
+/// empty (the common case between scenarios) → no job runs at all.  Bounded:
+/// a stuck job only warns (the residual event is covered by the
+/// background-job-heartbeat noise records).
+async fn quiesce_background(cfg: &Config) -> Result<()> {
+    let s0 = db::count_table(&cfg.sut.dsn, "oc_preview_generation").await?;
+    let o0 = db::count_table(&cfg.oracle.dsn, "oc_preview_generation").await?;
+    if s0 == 0 && o0 == 0 {
+        return Ok(());
+    }
+    for (inst, dsn) in [(&cfg.sut, &cfg.sut.dsn), (&cfg.oracle, &cfg.oracle.dsn)] {
+        let Some(job_id) = db::preview_job_id(dsn).await? else {
+            tracing::warn!(container = %inst.container, "no PreviewJob in oc_jobs — skipping drain");
+            continue;
+        };
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tokio::process::Command::new("docker")
+                .args([
+                    "exec",
+                    &inst.container,
+                    "sudo", "-E", "-u", "www-data",
+                    "php", "/var/www/html/occ",
+                    "background-job:execute",
+                    &job_id.to_string(),
+                    "--force-execute",
+                ])
+                .output(),
+        )
+        .await;
+        match res {
+            Ok(Ok(o)) if o.status.success() => {}
+            Ok(Ok(o)) => tracing::warn!(
+                container = %inst.container,
+                status = %o.status,
+                "background-job:execute exited non-zero"
+            ),
+            Ok(Err(e)) => tracing::warn!(container = %inst.container, error = %e, "docker exec background-job:execute failed"),
+            Err(_) => tracing::warn!(container = %inst.container, "background-job:execute timed out after 60s"),
+        }
+    }
+    let mut last = (1i64, 1i64);
+    for _ in 0..30 {
+        let s = db::count_table(&cfg.sut.dsn, "oc_preview_generation").await?;
+        let o = db::count_table(&cfg.oracle.dsn, "oc_preview_generation").await?;
+        last = (s, o);
+        if s == 0 && o == 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    tracing::warn!(
+        sut = last.0,
+        oracle = last.1,
+        "oc_preview_generation did not drain within 30s"
+    );
+    Ok(())
+}
+
 async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
     preconditions::check(cfg).await?;
     let sc = Scenario::load(path)?;
@@ -146,6 +215,8 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
     let sut = NextcloudClient::new(&cfg.sut, &cfg.admin_user, &cfg.admin_pass)?;
     let oracle = NextcloudClient::new(&cfg.oracle, &cfg.admin_user, &cfg.admin_pass)?;
 
+    quiesce_background(&cfg).await?;
+
     println!("[before] snapshotting both (DB + file tree) ...");
     let sut_before = db::snapshot(&cfg.sut.dsn).await?;
     let oracle_before = db::snapshot(&cfg.oracle.dsn).await?;
@@ -162,8 +233,13 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
     let mut status_ok = true;
     let mut body_ok = true;
     let mut bytes_ok = true;
-    for (a, b) in sut_res.iter().zip(oracle_res.iter()) {
-        if a.status != b.status {
+    for ((a, b), op) in sut_res.iter().zip(oracle_res.iter()).zip(sc.ops.iter()) {
+        if !op.compare_status() {
+            println!(
+                "  {}: SUT {} vs oracle {} (status comparison skipped — recorded divergence)",
+                a.op, a.status, b.status
+            );
+        } else if a.status != b.status {
             println!("  STATUS MISMATCH {}: SUT {} vs oracle {}", a.op, a.status, b.status);
             status_ok = false;
         } else {
@@ -197,6 +273,12 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
         }
     }
     let ops_ok = status_ok && body_ok && bytes_ok;
+
+    // Quiesce the async background writers again: the ops queued preview
+    // generations (and the 5-min container cron may have fired mid-window) —
+    // trigger both sides' cron and drain the queue so the after-snapshot sees
+    // the converged state (same principle as the idle double-snapshot check).
+    quiesce_background(&cfg).await?;
 
     println!("[after] snapshotting both (DB + file tree) ...");
     let sut_after = db::snapshot(&cfg.sut.dsn).await?;
