@@ -1,0 +1,6 @@
+[submodule "nextcloud-docker-dev"]
+	path = nextcloud-docker-dev
+	url = git@github.com:weijiangan/nextcloud-docker-dev.git
+[submodule "workspace-server"]
+	path = workspace/server
+	url = https://github.com/nextcloud/server.git
