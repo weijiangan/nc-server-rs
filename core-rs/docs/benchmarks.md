@@ -186,3 +186,34 @@ Evidence: baseline tables above; first flamegraph pass
 | depth-1 PROPFIND per-child work | load probe: depth-1 4.58 ms vs depth-0 2.33 ms p50; scenario 14 at 5.7-6.2 ms | 2× the depth-0 cost; grows with directory size | follow-up: batch per-child property lookups |
 | write ops (PUT/DELETE/MOVE/COPY) | baseline: 1.3-2.3× vs PHP — the smallest native wins | real server work (DB writes, propagator), not KDF-bound | watch item: biggest gap among native ops |
 | debug-level logging | `RUST_LOG=debug` puts sqlx query statements + span events in the sample set | visible in light-load profile; negligible at `info` | run benchmarks with `RUST_LOG=info` |
+
+## Phase 18 improvements — before/after (2026-08-10)
+
+Three flamegraph-driven changes: DAV route consolidation (~30 routes → 6 via
+arbiter classification), static-file path whitelist (no fs stat on API
+traffic), throttler COUNT cache (2 s TTL). Measured on the same stack, same
+methodology.
+
+### Load probes (4 workers, 10 s)
+
+| probe | before rust req/s | after rust req/s | before p50 (ms) | after p50 (ms) |
+|---|---|---|---|---|
+| GET /status.php | 1921 | **2280** (+19%) | 2.17 | **1.39** (−36%) |
+| GET /ocs/v2.php/cloud/capabilities?format=json | 1192 | **1457** (+22%) | 2.43 | 2.46 |
+| PROPFIND /remote.php/webdav/ (depth 0) | 1595 | **1692** (+6%) | 2.33 | 2.29 |
+| PROPFIND /remote.php/webdav/ (depth 1) | 750 | **832** (+11%) | 4.58 | **4.04** (−12%) |
+
+### Flamegraph clone-machinery share (10 s load dump)
+
+35.0% of frames before → 33.6% after. The remaining router (~45 registry/OCS/
+static-PHP routes) still dominates the per-request axum clone cost — the
+registry's explicit per-app 404 semantics (Phase 7.5) is a deliberate
+tradeoff, so the full clone win awaits a different architecture (single
+catch-all + in-handler dispatch) if it is ever wanted.
+
+### Scenario suite totals
+
+Within run-to-run noise (shared host, no quiescence): a few scenarios −12-30%
+(16_overwrite_put −30%, 17_delete_to_trash −13%, 14_propfind_depth1 −12%,
+21_bulk −15%, 22_invalid −18%), a few +7-14% (10_put_get, 18_explicit_mtime,
+20_chunked), the rest flat. The differential suite stays 20/20 green.

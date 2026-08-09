@@ -1,7 +1,9 @@
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use nc_db::{appconfig::SharedAppConfigCache, pool::DbPool};
 
 /// Result of a brute-force throttle check.
@@ -24,6 +26,20 @@ const SHORT_WINDOW_SECS: i64 = 30 * 60;
 const LONG_WINDOW_SECS: i64 = 12 * 60 * 60;
 /// Maximum delay applied: 25 s (REQ §4.6: MAX_DELAY_MS = 25 000).
 const MAX_DELAY_MS: u64 = 25_000;
+
+/// Phase 18: per-(action, subnet) count cache.  The two COUNT queries run on
+/// every request; the counts only change when `record_attempt` inserts a row,
+/// so a short TTL is safe — the DB stays the source of truth on miss, and a
+/// ≤2 s staleness on the exponential delay formula is immaterial.
+const COUNT_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// Cached counts: (short-window count, long-window count, cached_at).
+type CountEntry = (i64, i64, Instant);
+
+fn count_cache() -> &'static DashMap<(String, String), CountEntry> {
+    static CACHE: OnceLock<DashMap<(String, String), CountEntry>> = OnceLock::new();
+    CACHE.get_or_init(DashMap::new)
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -72,30 +88,82 @@ pub async fn check_throttle(
     let table = format!("{prefix}bruteforce_attempts");
     let subnet = ip_to_subnet(client_ip);
 
-    // Count attempts in the short window (30 min).
-    // REQ §4.6: > max_attempts in 30 min → 429.
-    let short_count: i64 = match sqlx::query_scalar(&format!(
-        "SELECT COUNT(*) FROM {table} \
-         WHERE action = $1 AND subnet = $2 AND occurred >= $3"
-    ))
-    .bind(action)
-    .bind(&subnet)
-    .bind(short_cutoff)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                action,
-                subnet = %subnet,
-                error = %e,
-                "brute-force short-window COUNT failed — skipping throttle check for this request"
-            );
-            return ThrottleResult { delay: None, should_reject: false, retry_after_secs: 0 };
+    // Phase 18: serve the two COUNTs from the per-(action, subnet) cache
+    // when fresh.  The 429 and error paths below deliberately do NOT populate
+    // the cache: a 429 storm wants exact counts, and a transient DB failure
+    // must not freeze the throttle state.
+    let cache_key = (action.to_string(), subnet.clone());
+    let cached = count_cache()
+        .get(&cache_key)
+        .map(|e| *e.value())
+        .filter(|(_, _, at)| at.elapsed() < COUNT_CACHE_TTL);
+
+    let (short_count, long_count) = if let Some((s, l, _)) = cached {
+        (s, l)
+    } else {
+        // Count attempts in the short window (30 min).
+        // REQ §4.6: > max_attempts in 30 min → 429.
+        let short_count: i64 = match sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} \
+             WHERE action = $1 AND subnet = $2 AND occurred >= $3"
+        ))
+        .bind(action)
+        .bind(&subnet)
+        .bind(short_cutoff)
+        .fetch_one(pool)
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    action,
+                    subnet = %subnet,
+                    error = %e,
+                    "brute-force short-window COUNT failed — skipping throttle check for this request"
+                );
+                return ThrottleResult { delay: None, should_reject: false, retry_after_secs: 0 };
+            }
+        };
+
+        if short_count > max_attempts {
+            return ThrottleResult {
+                delay: Some(Duration::from_millis(MAX_DELAY_MS)),
+                should_reject: true,
+                retry_after_secs: 30,
+            };
         }
+
+        // Count attempts in long window (12 h) for delay calculation.
+        // REQ §4.6: over-threshold in 12 h → throttle (sleep), not 429.
+        let long_count: i64 = match sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} \
+             WHERE action = $1 AND subnet = $2 AND occurred >= $3"
+        ))
+        .bind(action)
+        .bind(&subnet)
+        .bind(long_cutoff)
+        .fetch_one(pool)
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    action,
+                    subnet = %subnet,
+                    error = %e,
+                    "brute-force long-window COUNT failed — skipping delay"
+                );
+                return ThrottleResult { delay: None, should_reject: false, retry_after_secs: 0 };
+            }
+        };
+
+        count_cache().insert(cache_key, (short_count, long_count, Instant::now()));
+        (short_count, long_count)
     };
 
+    // Defensive 429 for the cache-hit path (fresh entries never exceed
+    // max_attempts — the 429 branch above returns before caching — but stay
+    // correct if one ever does).
     if short_count > max_attempts {
         return ThrottleResult {
             delay: Some(Duration::from_millis(MAX_DELAY_MS)),
@@ -103,30 +171,6 @@ pub async fn check_throttle(
             retry_after_secs: 30,
         };
     }
-
-    // Count attempts in long window (12 h) for delay calculation.
-    // REQ §4.6: over-threshold in 12 h → throttle (sleep), not 429.
-    let long_count: i64 = match sqlx::query_scalar(&format!(
-        "SELECT COUNT(*) FROM {table} \
-         WHERE action = $1 AND subnet = $2 AND occurred >= $3"
-    ))
-    .bind(action)
-    .bind(&subnet)
-    .bind(long_cutoff)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                action,
-                subnet = %subnet,
-                error = %e,
-                "brute-force long-window COUNT failed — skipping delay"
-            );
-            return ThrottleResult { delay: None, should_reject: false, retry_after_secs: 0 };
-        }
-    };
 
     if long_count == 0 {
         return ThrottleResult {

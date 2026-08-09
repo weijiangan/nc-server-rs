@@ -40,8 +40,17 @@ async fn try_static_files(
 ) -> Response {
     if matches!(req.method(), &Method::GET | &Method::HEAD) {
         let path = req.uri().path();
+        // Phase 18: static files live only under the app's four asset roots
+        // plus two exact root files; everything else (status.php, OCS, DAV,
+        // index.php, …) skips the fs stat entirely.  This also stops serving
+        // repo files (AUTHORS, 3rdparty/*, dotfiles) that real nginx
+        // installs deny.  `/index.html` preserves the install page; GET /
+        // itself still falls through (the root is a directory).
+        const STATIC_PREFIXES: [&str; 4] = ["/core/", "/dist/", "/themes/", "/apps/"];
+        let is_static = STATIC_PREFIXES.iter().any(|p| path.starts_with(p))
+            || matches!(path, "/robots.txt" | "/index.html");
         // Skip PHP scripts and any path that looks like traversal.
-        if !path.contains(".php") && !path.contains("..") {
+        if is_static && !path.contains(".php") && !path.contains("..") {
             let candidate = state.nc_root.join(path.trim_start_matches('/'));
             if tokio::fs::metadata(&candidate)
                 .await
@@ -58,25 +67,70 @@ async fn try_static_files(
     next.run(req).await
 }
 
-/// DAV arbiter-root handler — intercepts SEARCH and forwards to PHP-FPM.
+/// Proxied DAV sub-trees (Phase 18) — served by PHP/SabreDAV, not the native
+/// files handler.  Mirrors the explicit route registrations they replaced
+/// (10 subtrees × 2 mount prefixes).  `/uploads` is native and deliberately
+/// NOT in this list.
+const PROXIED_DAV_SUBTREES: [&str; 10] = [
+    "/versions",
+    "/comments",
+    "/trashbin",
+    "/principals",
+    "/calendars",
+    "/public-calendars",
+    "/system-calendars",
+    "/addressbooks",
+    "/avatars",
+    "/access-control",
+];
+
+/// DAV arbiter handler — the single classified entry for both mount roots
+/// (`/remote.php/dav`, `/dav`).
 ///
-/// PHP's `SearchDAV` + `FileSearchBackend` handle the full DASL protocol:
-/// XML parsing, operator translation, SQL generation, DB query, and
-/// `207 Multi-Status` formatting.  All other methods use the native
-/// Rust DAV handler.
+/// Phase 18: replaced the ~30 explicit mount routes with one wildcard pair
+/// per root; classification happens here:
+///   SEARCH/REPORT          → PHP-FPM (DASL search, sync-collection)
+///   proxied subtree prefix → PHP-FPM (versions, comments, trashbin, …)
+///   /uploads               → native upload handler (Phase 5.5)
+///   /bulk (POST)           → native bulk handler (Phase 5.9)
+///   everything else        → native files tree (dav_handler)
 async fn dav_arbiter_handler(
     State(state): State<AppState>,
     req: Request<Body>,
 ) -> Response {
-    // SEARCH and REPORT are not implemented natively on the files tree.
-    // Proxy them to PHP-FPM (which handles filter-files, sync-collection, etc.).
-    if matches!(req.method().as_str(), "SEARCH" | "REPORT") {
+    // Path remainder after the mount root.  Trim in this order so a
+    // "/dav/…" path cannot consume the "/remote.php/dav" prefix.
+    let remainder = req
+        .uri()
+        .path()
+        .trim_start_matches("/remote.php/dav")
+        .trim_start_matches("/dav");
+    let method = req.method().as_str();
+
+    // Proxied subtrees take precedence over the SEARCH/REPORT rule so a
+    // SEARCH against e.g. /remote.php/dav/versions behaves as it did with
+    // the explicit any()-method proxy routes.
+    if PROXIED_DAV_SUBTREES.iter().any(|p| remainder.starts_with(p))
+        || matches!(method, "SEARCH" | "REPORT")
+    {
         if let Some(ref fpm) = state.fastcgi {
             return nc_fastcgi::proxy_handler(fpm, req).await;
         }
         // No PHP-FPM configured → fall through; the native handler
         // will return 405 / 501.
+        return nc_dav::dav_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await;
     }
+
+    if remainder.starts_with("/uploads") {
+        return nc_dav::upload_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await;
+    }
+    // Non-POST /bulk falls through to the files tree (404) — sabreDAV treats
+    // "bulk" as an ordinary resource path, so this is PHP-faithful (the old
+    // post-only route returned an axum 405).
+    if remainder == "/bulk" && method == "POST" {
+        return nc_dav::bulk_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await;
+    }
+
     nc_dav::dav_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await
 }
 
@@ -167,46 +221,25 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
             "/remote.php/webdav/{*path}",
             axum::routing::any(nc_dav::dav_handler),
         )
-        // §4.12 SEARCH at arbiter root — forwarded to PHP-FPM
+        // DAV (Phase 4) — both mount roots (`/remote.php/dav`, `/dav`) are
+        // served by the single classified arbiter handler (Phase 18): the
+        // proxied subtrees, uploads, bulk, and the native files tree are
+        // dispatched inside it, so the route table stays tiny (6 routes
+        // instead of ~30 — axum clones the whole router per request, so
+        // every route costs CPU on every request).
+        // Each root needs three routes because axum's `{*path}` catch-all
+        // requires at least one character — it does NOT match a bare trailing
+        // slash.  WebDAV clients routinely PROPFIND the collection root with a
+        // trailing slash, so we register:
+        //   /mount          — exact, no trailing slash
+        //   /mount/         — exact, trailing slash only (collection root)
+        //   /mount/{*path}  — one or more path segments
         .route("/remote.php/dav", axum::routing::any(dav_arbiter_handler))
         .route("/remote.php/dav/", axum::routing::any(dav_arbiter_handler))
-        // Non-files DAV sub-trees are served by PHP/SabreDAV.  These more-specific
-        // routes must come before the generic `/remote.php/dav/{*path}` wildcard so
-        // that axum matches them first.
-        .route("/remote.php/dav/versions/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/remote.php/dav/comments/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/remote.php/dav/trashbin/{*path}", axum::routing::any(php_fpm_fallback))
-        // PHASE-5.5: Chunked upload v2 - native handler
-        .route("/remote.php/dav/uploads/{*path}", axum::routing::any(nc_dav::upload_handler))
-        .route("/remote.php/dav/principals/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/remote.php/dav/calendars/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/remote.php/dav/public-calendars/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/remote.php/dav/system-calendars/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/remote.php/dav/addressbooks/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/remote.php/dav/avatars/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/remote.php/dav/access-control/{*path}", axum::routing::any(php_fpm_fallback))
-        // Native file-storage handler for /remote.php/dav/files/{uid}/{*path}
-        .route(
-            "/remote.php/dav/{*path}",
-            axum::routing::any(nc_dav::dav_handler),
-        )
+        .route("/remote.php/dav/{*path}", axum::routing::any(dav_arbiter_handler))
         .route("/dav", axum::routing::any(dav_arbiter_handler))
         .route("/dav/", axum::routing::any(dav_arbiter_handler))
-        .route("/dav/versions/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/dav/comments/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/dav/trashbin/{*path}", axum::routing::any(php_fpm_fallback))
-        // PHASE-5.5: Chunked upload v2 - native handler
-        .route("/dav/uploads/{*path}", axum::routing::any(nc_dav::upload_handler))
-        .route("/dav/principals/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/dav/calendars/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/dav/public-calendars/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/dav/system-calendars/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/dav/addressbooks/{*path}", axum::routing::any(php_fpm_fallback))
-        .route("/dav/avatars/{*path}", axum::routing::any(php_fpm_fallback))
-        // PHASE-5.9: Bulk upload endpoint
-        .route("/dav/bulk", axum::routing::post(nc_dav::bulk_handler))
-        .route("/remote.php/dav/bulk", axum::routing::post(nc_dav::bulk_handler))
-        .route("/dav/{*path}", axum::routing::any(nc_dav::dav_handler))
+        .route("/dav/{*path}", axum::routing::any(dav_arbiter_handler))
         // Static PHP-FPM routes — always forwarded regardless of registry
         .route("/public.php/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/.well-known/{*path}", axum::routing::any(php_fpm_fallback))

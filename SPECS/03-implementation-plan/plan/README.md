@@ -24,5 +24,6 @@ Split from the original `IMPL_PLAN.md` (Rust Nextcloud Core+Files Implementation
 - [`16-differential-integration-test-harness.md`](16-differential-integration-test-harness.md) — Differential integration-test harness (Rust core vs. PHP reference)
 - [`17-caldav-carddav-build-vs-adopt.md`](17-caldav-carddav-build-vs-adopt.md) — CalDAV/CardDAV: build-vs-adopt exploration
 - [`18-performance-measurement-and-profiling.md`](18-performance-measurement-and-profiling.md) — Performance measurement and profiling (benchmark harness + Rust profiling)
+- [`19-performance-improvements.md`](19-performance-improvements.md) — Performance improvements from the Phase 17 flamegraphs
 
 Back: [`../README.md`](../README.md)
