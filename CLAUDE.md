@@ -54,7 +54,7 @@
 
 ## Project Context
 
-- **Workspace**: `~/Git/nextcloud-rewrite/nextcloud-docker-dev/workspace/server/` contains the PHP reference implementation. All PHP source references in this codebase were originally based on commit `e2dc439c7157e6864313d19e90e626a5db7f20bf`; the workspace is now at `1a0ccac96f9b4a0682c60eac550c0eb03294626b` — verify against the current state when tracing PHP behavior.
+- **Workspace**: `~/Git/nextcloud-rewrite/nc-server-core/workspace/server/` (a submodule pinned at `e2dc439c7157e6864313d19e90e626a5db7f20bf`) contains the PHP reference implementation. Verify against the current state when tracing PHP behavior.
 - **Database**: `docker exec master-database-pgsql-1 psql -U postgres -d nextcloud` for live schema verification
 - **Migrations**: `core-rs/migrations/` are exercised against SQLite in tests; production PostgreSQL schemas are created by PHP Doctrine migrations
 - **Packaging**: `core-rs/packaging/` contains an Arch Linux PKGBUILD that copies the real source tree at build time (`prepare()` copies from the parent `core-rs/` directory).  The `packaging/src/` subtree is a stale build artifact — **do not** update it after code changes; it will be refreshed on the next package build.
@@ -76,11 +76,14 @@ curl -s -u admin:admin "http://127.0.0.1:9090/<path>"   # PHP
 ```
 For `oc:`/`nc:` DAV properties, send an **explicit** `<d:propfind><d:prop>…` body — an allprop/bare PROPFIND does not emit them.
 
-**Rebuilding** (run from `nextcloud-docker-dev/`; Docker is podman):
+**Rebuilding** (run from the repo root; Docker is podman):
 ```bash
-docker compose up -d --build nextcloud   # after Rust or php-shim changes (rebuilds nc-server, re-copies the shim)
-docker compose up -d --build proxy       # after proxy/nginx config or compose port changes
-docker compose restart proxy             # REQUIRED after recreating nextcloud: the proxy caches the old upstream IP and 502s otherwise
+make sut-image    # rebuilds master-nextcloud:latest — Rust source enters via podman --build-context rustsrc=core-rs (compose can't pass it)
+make up           # compose up (proxy rebuilt for the baked vhosts) + `restart proxy` (REQUIRED after recreating nextcloud: the proxy caches the old upstream IP and 502s otherwise)
+make diff-up      # sut-image + up + wait for both instances installed:true (SUT :8080, oracle :9091)
+make diff-test    # differential suite: cargo test -p nc-difftest --release -- --ignored
+make diff-one S=27 # a single scenario
 ```
+The php84 image is shared by the `nextcloud` and `oracle` compose services (`image: master-nextcloud:latest`) — the oracle is the SUT's byte-identical twin by construction.
 - Logs: `docker logs master-nextcloud-1` · DB: `docker exec master-database-pgsql-1 psql -U postgres -d nextcloud`
 - The php-shim is baked into the image at `/usr/local/share/nc-server/php-shim/index.php`. For a quick live test, `docker cp core-rs/php-shim/index.php master-nextcloud-1:/usr/local/share/nc-server/php-shim/index.php` (PHP reads it per-request, no restart) — rebuild to persist.

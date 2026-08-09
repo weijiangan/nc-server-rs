@@ -1,0 +1,6 @@
+# The rustsrc build context (podman --build-context) carries core-rs into the
+# php84 image build.  Keep it lean: the container compiles against its own
+# cache mounts (--mount=type=cache), so local build artifacts are dead weight.
+target/
+packaging/src
+packaging/pkg
