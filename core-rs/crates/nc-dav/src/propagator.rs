@@ -128,6 +128,16 @@ impl Propagator {
     /// Uses a `CASE WHEN` expression so that `size` is only adjusted for rows
     /// that already have a calculated size (`size > -1`), matching PHP lines
     /// 91-100.
+    ///
+    /// The UPDATE runs inside an explicit transaction that first pre-locks
+    /// every parent row `FOR UPDATE … ORDER BY path_hash` (Phase 18).  Postgres
+    /// locks `IN`-list matches in *scan order* (plan-dependent: index vs. heap),
+    /// not IN-list order — the sorted IN-list alone cannot enforce a lock
+    /// order, and concurrent propagations over the same parent set could lock
+    /// rows in opposite orders and deadlock (observed: concurrent PUTs into
+    /// one directory → `deadlock detected` on this very statement, ~2 s
+    /// stalls, sqlx pool churn).  Locking all parents in a deterministic
+    /// order makes concurrent propagations serialize instead of cycle.
     async fn try_propagate(
         &self,
         parent_hashes: &[String],
@@ -148,6 +158,36 @@ impl Propagator {
         let storage_idx = parent_hashes.len() + 1;
         let time_idx = parent_hashes.len() + 2;
         let etag_idx = parent_hashes.len() + 3;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("propagate BEGIN failed: {e}"))?;
+
+        // Pre-lock the parent rows in a deterministic order (see the doc
+        // comment above).  Postgres-only: SQLite has whole-file locking (no
+        // row locks, no deadlock hazard) and does not support `FOR UPDATE`.
+        // Binds: $1..$N = path_hashes, $(N+1) = storage.
+        if tx.backend_name() == "PostgreSQL" {
+            let lock_sql = format!(
+                "SELECT path_hash FROM {prefix}filecache \
+                 WHERE storage = ${storage_idx} AND path_hash IN ({in_clause}) \
+                 ORDER BY path_hash FOR UPDATE",
+                prefix = self.prefix,
+                storage_idx = storage_idx,
+                in_clause = in_clause,
+            );
+            let mut lock_q = sqlx::query(&lock_sql);
+            for h in parent_hashes {
+                lock_q = lock_q.bind(h);
+            }
+            lock_q = lock_q.bind(self.storage_id);
+            lock_q
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("propagate pre-lock failed: {e}"))?;
+        }
 
         // Use CASE WHEN instead of GREATEST for cross-DB compatibility
         // (SQLite lacks GREATEST; PostgreSQL and MySQL support both).
@@ -184,7 +224,7 @@ impl Propagator {
             query = query.bind(size_difference);
 
             query
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| format!("propagate UPDATE with size failed: {e}"))?;
         } else {
@@ -211,11 +251,14 @@ impl Propagator {
             query = query.bind(etag);
 
             query
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| format!("propagate UPDATE failed: {e}"))?;
         }
 
+        tx.commit()
+            .await
+            .map_err(|e| format!("propagate COMMIT failed: {e}"))?;
         Ok(())
     }
 

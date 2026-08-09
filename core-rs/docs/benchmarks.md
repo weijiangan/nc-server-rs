@@ -217,3 +217,22 @@ Within run-to-run noise (shared host, no quiescence): a few scenarios −12-30%
 (16_overwrite_put −30%, 17_delete_to_trash −13%, 14_propfind_depth1 −12%,
 21_bulk −15%, 22_invalid −18%), a few +7-14% (10_put_get, 18_explicit_mtime,
 20_chunked), the rest flat. The differential suite stays 20/20 green.
+
+### Concurrent write probe (4 workers, same file, token auth)
+
+| metric | before | after (deadlock fix) |
+|---|---|---|
+| rust req/s | 41.3 | 45.1 |
+| rust p50 (ms) | 76.4 | 87.9 |
+| rust max (ms) | 2112 | **141** |
+| postgres deadlocks | 258 | **0** |
+
+The write-load profile exposed a real concurrency bug: concurrent PUTs into one
+directory deadlocked in Postgres on the propagator's own parent-chain UPDATE
+(tuple-recheck cycle — the sorted IN-list cannot control Postgres's
+plan-dependent scan/lock order). Each deadlock aborted a transaction, churned
+the sqlx pool (29 connections), and stacked retries (2.1 s max). Fixed by
+pre-locking the parent rows `FOR UPDATE … ORDER BY path_hash` inside an
+explicit transaction (Postgres only; SQLite has whole-file locking). Stalls and
+pool churn gone; residual p50 is lock serialization on the shared directory
+row — inherent to concurrent same-directory writes, not a Rust artifact.
