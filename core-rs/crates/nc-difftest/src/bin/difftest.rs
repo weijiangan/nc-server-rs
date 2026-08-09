@@ -161,6 +161,7 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
     let oracle_res = nc_difftest::scenario::run(&oracle, &sc, &mut oracle_vars).await?;
     let mut status_ok = true;
     let mut body_ok = true;
+    let mut bytes_ok = true;
     for (a, b) in sut_res.iter().zip(oracle_res.iter()) {
         if a.status != b.status {
             println!("  STATUS MISMATCH {}: SUT {} vs oracle {}", a.op, a.status, b.status);
@@ -179,8 +180,23 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
                 body_ok = false;
             }
         }
+        // Byte-exact parity (Phase 16.11 Imaginary): generated preview bytes
+        // must be identical — both sides POST to the same Imaginary.
+        if let (Some(ab), Some(ob)) = (&a.body_bytes, &b.body_bytes) {
+            if ab != ob {
+                println!(
+                    "  BYTES MISMATCH {}: SUT {} B vs oracle {} B",
+                    a.op,
+                    ab.len(),
+                    ob.len()
+                );
+                bytes_ok = false;
+            } else {
+                println!("  {}: bytes identical ({} B)", a.op, ab.len());
+            }
+        }
     }
-    let ops_ok = status_ok && body_ok;
+    let ops_ok = status_ok && body_ok && bytes_ok;
 
     println!("[after] snapshotting both (DB + file tree) ...");
     let sut_after = db::snapshot(&cfg.sut.dsn).await?;
@@ -261,6 +277,9 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
         }
         if !body_ok {
             println!("  (response-body mismatch above — rejection parity)");
+        }
+        if !bytes_ok {
+            println!("  (preview-byte mismatch above — Imaginary parity)");
         }
         if !db_identical {
             if !unlisted.is_empty() {

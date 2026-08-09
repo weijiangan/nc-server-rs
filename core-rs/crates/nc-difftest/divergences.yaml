@@ -42,6 +42,7 @@
     - 24_checksum_upload
     - 25_preview_image
     - 26_preview_unpreviewable
+    - 27_imaginary_preview
   table: oc_filecache
   # Canonical natural key: the storage label + the path concatenated — the
   # home root row's key is exactly "home::admin" (empty path).
@@ -86,6 +87,7 @@
     - 24_checksum_upload
     - 25_preview_image
     - 26_preview_unpreviewable
+    - 27_imaginary_preview
   table: oc_filecache
   key: ""
   # `mtime` too: 18's stable_overrides compare mtime verbatim, and the
