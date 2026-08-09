@@ -4,3 +4,6 @@
 [submodule "workspace-server"]
 	path = workspace/server
 	url = https://github.com/nextcloud/server.git
+[submodule "core-rs/vendor/dav-server"]
+	path = core-rs/vendor/dav-server
+	url = git@github.com:weijiangan/dav-server-rs.git
