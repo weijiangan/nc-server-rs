@@ -9,6 +9,7 @@ members = [
     "crates/nc-fastcgi",
     "crates/nc-preview",
     "crates/nc-difftest",
+    "crates/nc-bench",
 ]
 resolver = "2"
 
@@ -120,10 +121,20 @@ nc-ocs = { path = "crates/nc-ocs" }
 nc-files = { path = "crates/nc-files" }
 nc-fastcgi = { path = "crates/nc-fastcgi" }
 nc-preview = { path = "crates/nc-preview" }
+nc-difftest = { path = "crates/nc-difftest" }
 
 [profile.release]
 lto = "thin"
 strip = true
+
+# Profiling build (Phase 17): release-level optimization but with symbols kept,
+# so pprof-rs flamegraphs resolve function names.  Build with
+# `cargo build --release --profile profiling` (note: --release + --profile
+# selects this profile; `--profile profiling` alone also works).
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "limited"
 
 # NEXTCLOUD-RS: vendored dav-server — upstream
 # https://github.com/messense/dav-server-rs, branch `nextcloud-0.11.0` based

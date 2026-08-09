@@ -50,3 +50,60 @@ diff-test:
 
 diff-one:
 	cd core-rs && cargo test -p nc-difftest --release -- --ignored $(S)
+
+# ── Benchmarking / profiling (Phase 17) ──────────────────────────────────────
+# All bench targets need a live stack (`make diff-up`).  `nc-bench` compares
+# the Rust SUT (:8080) against the pure-PHP oracle (:9091) on the same stack;
+# config comes from the same NC_DIFFTEST_* env vars as the differential suite.
+BENCH := cd core-rs && cargo run -p nc-bench --release --
+
+bench:           # full scenario latency comparison (per-op p50/p90/mean + ratio)
+	$(BENCH) scenario
+
+bench-one:       # a single scenario, e.g. `make bench-one SC=10_put_get`
+	$(BENCH) scenario --scenario $(SC)
+
+bench-load:      # concurrent throughput on the read-only probe set
+	$(BENCH) load
+
+bench-json:      # scenario comparison as machine-readable JSON on stdout
+	$(BENCH) scenario --json
+
+# Capture a CPU profile of the SUT *under load* (pprof-rs, 1000 Hz):
+#   1. build the symbol-bearing profiling binary (`[profile.profiling]` keeps
+#      strip=false so flamegraphs resolve) and hot-swap it into the SUT,
+#   2. restart nc-server in-container with NC_PROFILE_DIR set,
+#   3. run `bench load` in the background, SIGUSR2 mid-run, wait the window,
+#   4. copy the flamegraph SVG + pprof protobuf out to ./profiles/.
+# The swap is ephemeral (lost on container recreate) — run `make sut-image up`
+# to restore the stock binary.
+PROFILE_SECS ?= 10
+PROFILES := profiles
+
+profile:
+	@echo "── 1/4 building profiling binary (strip=false, debug info)…"
+	cd core-rs && cargo build --profile profiling --bin nc-server
+	@echo "── 2/4 hot-swapping into the SUT container and restarting nc-server…"
+	@mkdir -p $(PROFILES)
+	docker cp core-rs/target/profiling/nc-server master-nextcloud-1:/usr/local/bin/nc-server
+	# The image's release binary carries cap_net_bind_service via setcap (a
+	# filesystem attribute that docker cp does not carry) — re-apply it or the
+	# profiling binary cannot bind :80 and the SUT dies.
+	docker exec master-nextcloud-1 setcap 'cap_net_bind_service=+ep' /usr/local/bin/nc-server
+	docker exec master-nextcloud-1 bash -c 'mkdir -p /tmp/nc-profile && chown www-data:www-data /tmp/nc-profile'
+	docker exec master-nextcloud-1 bash -c 'pkill -x nc-server || true'
+	sleep 1
+	# `sudo -E` keeps the container env (NC_FASTCGI_SOCKET, NC_PHP_SHIM) that
+	# the bootstrap process inherited — dropping them disables the FastCGI
+	# proxy and every PHP-FPM-bound route 502s.
+	docker exec -d master-nextcloud-1 bash -c 'sudo -E -u www-data env NC_PROFILE_DIR=/tmp/nc-profile NC_PROFILE_SECS=$(PROFILE_SECS) /usr/local/bin/nc-server --root /var/www/html --listen 0.0.0.0:80'
+	sleep 2
+	# The proxy keepalive pool holds connections to the old process — restart
+	# it or the SUT appears ~300 ms slow / hangs (documented `up` behavior).
+	$(COMPOSE) restart proxy
+	@echo "── 3/4 loading the SUT, then signalling SIGUSR2 mid-run…"
+	@(cd core-rs && cargo run -p nc-bench --release -- load --duration $(shell echo $$(($(PROFILE_SECS) + 4))) >/dev/null 2>&1 & \
+	  sleep 3; docker exec master-nextcloud-1 bash -c 'pkill -USR2 -x nc-server'; wait)
+	@echo "── 4/4 fetching the dump…"
+	@docker cp master-nextcloud-1:/tmp/nc-profile/. ./$(PROFILES)/
+	@ls $(PROFILES)/profile-*.svg $(PROFILES)/profile-*.pb 2>/dev/null || true

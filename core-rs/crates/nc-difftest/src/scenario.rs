@@ -187,6 +187,8 @@ pub struct OpResult {
     /// Response **bytes**, captured only for ops with `compare_bytes`
     /// (byte-exact parity for generated previews) — `None` otherwise.
     pub body_bytes: Option<Vec<u8>>,
+    /// Wall time of the op's HTTP round-trip (Phase 17 — benchmark harness).
+    pub elapsed: std::time::Duration,
 }
 
 /// Resolve a fixture body. `body_file` is relative to the crate's `fixtures/`.
@@ -283,6 +285,7 @@ pub async fn run_ops(
 ) -> Result<Vec<OpResult>> {
     let mut results = Vec::new();
     for op in ops {
+        let start = std::time::Instant::now();
         let resp = match op {
             Op::Put {
                 path,
@@ -315,6 +318,7 @@ pub async fn run_ops(
                     status: status.as_u16(),
                     body: body_text,
                     body_bytes: None,
+                    elapsed: start.elapsed(),
                 });
                 continue;
             }
@@ -346,6 +350,7 @@ pub async fn run_ops(
                     status: status.as_u16(),
                     body: body_text,
                     body_bytes,
+                    elapsed: start.elapsed(),
                 });
                 continue;
             }
@@ -399,6 +404,7 @@ pub async fn run_ops(
                         status: status.as_u16(),
                         body: None,
                         body_bytes: None,
+                        elapsed: start.elapsed(),
                     });
                     continue;
                 }
@@ -421,6 +427,7 @@ pub async fn run_ops(
                     status: mkcol.status().as_u16(),
                     body: None,
                     body_bytes: None,
+                    elapsed: start.elapsed(),
                 });
                 for (i, chunk) in chunks.iter().enumerate() {
                     let bytes = body_bytes(&chunk.body_file, &chunk.body)?;
@@ -432,6 +439,7 @@ pub async fn run_ops(
                         status: resp.status().as_u16(),
                         body: None,
                         body_bytes: None,
+                        elapsed: start.elapsed(),
                     });
                 }
                 // Assemble: MOVE {dir}/.file -> destination.
@@ -471,6 +479,7 @@ pub async fn run_ops(
             status: resp.status().as_u16(),
             body: None,
             body_bytes: None,
+            elapsed: start.elapsed(),
         });
     }
     Ok(results)

@@ -14,6 +14,7 @@ use crate::{
 /// `GET /ocs/v1.php/config` and `GET /ocs/v2.php/config`
 ///
 /// REQ §5.6: returns `version: "1.7"`, `website`, `host`, `contact`, `ssl`.
+#[tracing::instrument(skip_all, level = "debug", fields(method = %request.method(), path = %request.uri().path()))]
 pub async fn ocs_config(State(state): State<OcsState>, request: Request) -> Response {
     let version = OcsVersion::from_path(request.uri().path());
     let format = negotiate_format(request.uri().query(), header_str(request.headers(), "accept"));
@@ -55,6 +56,7 @@ pub async fn ocs_config(State(state): State<OcsState>, request: Request) -> Resp
 /// REQ §5.6: returns pre-built payload from `CapabilityCache`.
 /// ETag = `md5(json_encode($result))`.
 /// Unauthenticated → public-only subset; authenticated → full set.
+#[tracing::instrument(skip_all, level = "debug", fields(method = %request.method(), path = %request.uri().path()))]
 pub async fn ocs_capabilities(
     State(state): State<OcsState>,
     request: Request,

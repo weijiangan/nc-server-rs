@@ -231,6 +231,12 @@ async fn main() -> anyhow::Result<()> {
         spawn_session_cache_eviction_task(sc.clone());
     }
 
+    // ── Phase 17: CPU profiling on SIGUSR2 (env-gated) ────────────────────────
+    // When NC_PROFILE_DIR is set, a SIGUSR2 samples the process for
+    // NC_PROFILE_SECS (default 10) at 1000 Hz and writes a flamegraph SVG +
+    // a pprof protobuf (`.pb`) into the dir.  Unset (production) → no-op.
+    spawn_profile_dump_task();
+
     // ── Router ───────────────────────────────────────────────────────────────
     let app = router::build(state, php_routes);
 
@@ -377,6 +383,88 @@ fn spawn_session_cache_eviction_task(cache: nc_auth::SharedSessionCache) {
                     remaining = after,
                     "session-cache: evicted expired entries"
                 );
+            }
+        }
+    });
+}
+
+/// CPU-profiling on SIGUSR2 (Phase 17).  Installed only when `NC_PROFILE_DIR`
+/// is set — production behavior is byte-identical without it.
+///
+/// The signal listener lives on the async runtime; the sampling window
+/// (sleep + symbolication) runs on a blocking thread so the runtime stays
+/// responsive to the (possibly concurrent) benchmark load.
+///
+/// Note: PID 1 in the dev container is `bootstrap.sh`, so the trigger is
+/// `docker exec master-nextcloud-1 bash -c 'pkill -USR2 -x nc-server'`, not
+/// `docker kill -s USR2`.
+fn spawn_profile_dump_task() {
+    let Some(dir) = std::env::var_os("NC_PROFILE_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let secs = std::env::var("NC_PROFILE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10);
+
+    tokio::spawn(async move {
+        let Ok(mut sigusr2) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
+        else {
+            tracing::warn!(dir = %dir.display(), "profiling: cannot install SIGUSR2 handler");
+            return;
+        };
+        loop {
+            sigusr2.recv().await;
+            tracing::info!(
+                dir = %dir.display(),
+                secs,
+                "profiling: starting {secs}s CPU profile at 1000 Hz (SIGUSR2)"
+            );
+            let guard = match pprof::ProfilerGuardBuilder::default()
+                .frequency(1000)
+                .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                .build()
+            {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::error!(error = %e, "profiling: failed to start profiler");
+                    continue;
+                }
+            };
+            let dir = dir.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                let report = guard.report().build()?;
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let svg_path = dir.join(format!("profile-{stamp}.svg"));
+                let pb_path = dir.join(format!("profile-{stamp}.pb"));
+                report.flamegraph(std::fs::File::create(&svg_path)?)?;
+                let profile = report.pprof()?;
+                let mut buf = Vec::new();
+                prost::Message::encode(&profile, &mut buf)?;
+                std::fs::write(&pb_path, buf)?;
+                anyhow::Ok((svg_path, pb_path))
+            })
+            .await;
+            match res {
+                Ok(Ok((svg_path, pb_path))) => {
+                    tracing::info!(
+                        svg = %svg_path.display(),
+                        protobuf = %pb_path.display(),
+                        "profiling: dump written"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "profiling: failed to write dump");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "profiling: dump task panicked");
+                }
             }
         }
     });

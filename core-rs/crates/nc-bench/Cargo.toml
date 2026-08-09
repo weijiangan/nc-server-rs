@@ -1,0 +1,25 @@
+[package]
+name = "nc-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Black-box benchmark harness: Rust nc-server vs the pure-PHP oracle (Phase 17)"
+
+[dependencies]
+nc-difftest = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+# App-token bootstrap (Phase 17): stored token = hex(sha512(raw + secret)),
+# matching PHP's `PublicKeyTokenProvider::hashToken()`.
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+sqlx = { workspace = true }
+# RSA keypair for the token row (Phase 18): PHP's `encryptPassword()` needs
+# a valid public key on version-2 PublicKeyToken rows.  Default features
+# include `pem` (pkcs1/pkcs8 PEM export).
+rsa = "0.9"
+rand = "0.8"

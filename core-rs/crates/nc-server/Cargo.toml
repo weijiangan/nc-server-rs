@@ -43,3 +43,11 @@ percent-encoding = "2"
 # Native generation orchestration (Phase 11.4/11.5): error type + source/preview bytes.
 thiserror.workspace = true
 bytes.workspace = true
+# CPU profiling (Phase 17): SIGUSR2-triggered flamegraph dumps, env-gated on
+# NC_PROFILE_DIR so production behavior is unchanged.  `prost-codec` enables
+# `Report::pprof()` (the `.pb` output) — pprof's `protobuf` feature alone
+# only provides the protobuf field types.
+pprof = { version = "0.15", features = ["flamegraph", "prost-codec"] }
+# Serializing the pprof profile (Phase 17).  Same 0.12 line pprof's
+# prost-codec already compiles, so this adds no new build work.
+prost = "0.12"

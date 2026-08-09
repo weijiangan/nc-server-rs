@@ -40,6 +40,7 @@ fn is_dav_path(path: &str) -> bool {
 /// - If invalid credentials: return `401` immediately (brute-force recorded).
 /// - If no credentials: anonymous — no extension attached; handler decides
 ///   whether to require auth.
+#[tracing::instrument(skip_all, level = "debug", fields(method = %req.method(), path = %req.uri().path()))]
 pub async fn auth_layer(
     State(state): State<AppState>,
     mut req: Request<Body>,

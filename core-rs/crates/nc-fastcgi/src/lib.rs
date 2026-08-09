@@ -180,6 +180,7 @@ fn resolve_shim_path_from(
 /// - `502 Bad Gateway`: PHP-FPM socket unavailable or FastCGI protocol error.
 /// - `504 Gateway Timeout`: timeout exceeded during connect, or during the
 ///   header phase (body streaming timeout is enforced by the transport layer).
+#[tracing::instrument(skip_all, level = "debug", fields(method = %req.method(), path = %req.uri().path()))]
 pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> Response {
     use axum::http::header;
 

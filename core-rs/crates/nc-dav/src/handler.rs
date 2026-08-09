@@ -41,6 +41,7 @@ static H_X_USER_ID: HeaderName = HeaderName::from_static("x-user-id");
 // ─── Public handler ───────────────────────────────────────────────────────────
 
 /// Axum handler function for all DAV endpoints.
+#[tracing::instrument(skip_all, level = "debug", fields(method = %req.method(), path = %req.uri().path()))]
 pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Response {
     // ── Extract NC-specific headers before consuming the request ──────────
     // §10.5: validate X-OC-MTime / X-OC-CTime against PHP MtimeSanitizer
