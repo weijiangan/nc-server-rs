@@ -74,6 +74,22 @@ async fn smoke(cfg: &Config) -> Result<()> {
         );
     }
 
+    // Phase 15.1 remainder: pin the static-deny property live.  The SUT's
+    // whitelist (F1, Phase 18.1) must deny the same paths real nginx setups
+    // deny, and the pure-PHP oracle must deny them identically.
+    for path in ["/data/.ocdata", "/.htaccess", "/3rdparty/autoload.php"] {
+        for (label, inst) in [("SUT", &cfg.sut), ("Oracle", &cfg.oracle)] {
+            let client = NextcloudClient::new(inst, &cfg.admin_user, &cfg.admin_pass)?;
+            let resp = client.get(path).await?;
+            let status = resp.status();
+            anyhow::ensure!(
+                status.as_u16() == 404,
+                "{label} GET {path} -> {status}, expected 404 (static-deny property)"
+            );
+        }
+    }
+    println!("static-deny parity OK: /data/.ocdata, /.htaccess, /3rdparty/* -> 404 on both sides");
+
     println!("smoke OK: both instances serve the files tree");
     Ok(())
 }

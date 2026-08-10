@@ -140,6 +140,27 @@ location / {
 `nc-server` handles TLS termination upstream (nginx/caddy) the same way a
 standard PHP-FPM setup does.
 
+### Static-file deny rules (canonical layer)
+
+`nc-server` serves static assets itself from a strict whitelist (`/core/`,
+`/dist/`, `/themes/`, `/apps/`, plus `robots.txt` and `index.html`) and 404s
+everything else before touching the filesystem (Phase 18.1 / F1).  The
+canonical webserver layer should enforce the same deny set — defense in depth
+for anything that ever bypasses or precedes `nc-server` (another vhost, a
+misrouted location, a future static mode):
+
+```nginx
+# Deny what the whitelist denies: data dir, dotfiles, PHP's bundled 3rdparty.
+location ~ ^/(data|3rdparty)/          { deny all; return 404; }
+location ~ /\.                         { deny all; return 404; }
+location ~ \.php$                      { deny all; return 404; }  # nc-server proxies PHP itself
+```
+
+These mirror the paths the F1 property pins in tests and the parity gate
+(`/data/.ocdata`, `/.htaccess`, `/3rdparty/*` → 404 on both the Rust SUT and
+the pure-PHP oracle).  When `nc-server` is the only server, the whitelist is
+sufficient; keep the nginx rules only if other vhosts share the webroot.
+
 ---
 
 ## PHP-FPM configuration
