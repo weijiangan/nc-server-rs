@@ -86,7 +86,28 @@ Consequences:
 
 These two items gate any claim of production readiness. F1 is exploitable today with zero preconditions; F2 nullifies brute-force protection in the documented deployment.
 
-### 1.1 Static file serving: deny list (F1)
+### 1.1 Static file serving: deny list (F1) — DONE (superseded by the Phase 18.1 whitelist)
+
+> **RESOLVED — 2026-08-10, superseded by the Phase 18.1 static whitelist.**
+> `try_static_files` now serves **only** `/core/ /dist/ /themes/ /apps/` +
+> `robots.txt` + `index.html` (the `STATIC_PREFIXES` whitelist in `router.rs`),
+> rejecting everything else with 404 **before** the `metadata()` call. The
+> whitelist is strictly stronger than the deny list below: it denies the F1
+> set (`data config lib 3rdparty build tests templates console occ issue
+> indie autotest* db_* dotfiles`) plus every other non-asset path, with the
+> same no-existence-probing property. Live-verified 2026-08-10: `/data/.ocdata`
+> `/config/CAN_INSTALL` `/3rdparty/*` `/lib/*` `/templates/*` `/.git/*` `/occ`
+> all → 404; `/core/img/actions/add.svg` `/robots.txt` → 200.
+>
+> **Remaining work from 1.1 (the deny behavior exists but is unpinned):**
+> 1. Unit tests around the whitelist (`static_denies_data_directory`,
+>    `static_denies_dotfile_path`, `static_denies_3rdparty`,
+>    `static_denied_prefix_case_insensitive`, `static_php_falls_through`).
+> 2. Live probes in the parity gate (`curl /data/.ocdata` → 404).
+> 3. `docs/deployment.md` operator guidance: the recommended nginx block must
+>    carry the admin-manual deny rules — the web server is the canonical
+>    layer for this (PHP relies on `.htaccess`/nginx), and Rust's whitelist is
+>    defense-in-depth, not a substitute.
 
 **Decision:** prefix deny list + dot-segment rejection, returning **404** for denied prefixes — matching the current Nextcloud nginx admin manual, which uses `return 404` on exactly these prefixes (404 also avoids leaking whether a denied path exists; this deliberately deviates from Apache's `Require all denied` → 403 semantics, and we document that). Keep `try_static_files` **outside** the maintenance guard — this is parity-correct: in the canonical stack maintenance mode is enforced inside PHP (`lib/base.php`), and the webserver keeps serving assets, which is what makes PHP's styled maintenance page work.
 
