@@ -30,6 +30,10 @@ pub struct Config {
     pub admin_pass: String,
     /// Data directory inside the containers (Phase 16.8 file-tree snapshots).
     pub data_dir: String,
+    /// Postgres container name for the phase-20 budget gate's statement log
+    /// counting (`docker logs`).  The SUT and oracle share one database
+    /// container on the dev stack.
+    pub db_container: String,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -61,6 +65,7 @@ impl Config {
             admin_user: env_or("NC_DIFFTEST_ADMIN_USER", "admin"),
             admin_pass: env_or("NC_DIFFTEST_ADMIN_PASS", "admin"),
             data_dir: env_or("NC_DIFFTEST_DATADIR", "/var/www/html/data"),
+            db_container: env_or("NC_DIFFTEST_DB_CONTAINER", "master-database-pgsql-1"),
         })
     }
 }

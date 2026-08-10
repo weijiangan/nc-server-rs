@@ -412,6 +412,36 @@ the session noise band).
 composite), diff-test 20/20 on the first run, static probes
 `/core/img/actions/add.svg` → 200, `robots.txt` → 200.
 
+## Phase 20 — query-count budget gate (2026-08-10)
+
+`make perf-gate` fails when any request class exceeds its statement budget —
+the "bundle-size budget" for queries. Budgets in `core-rs/perf-budget.yaml`
+(2x measured floor); measured by enabling Postgres `log_statement` on the SUT
+and counting `execute sqlx` lines (Rust's prepared statements only —
+PHP/Doctrine logs as `<unnamed>` and is excluded by construction; the podman
+docker shim emits the container log on stderr, which the gate merges).
+
+First gate run on the current code (app-token auth, warm caches):
+
+| class | statements | budget |
+|---|---|---|
+| status | 0 | 5 |
+| get_file | 5 | 12 |
+| propfind_depth0 | 13 | 20 |
+| propfind_depth1 | 20 | 30 |
+| put_new | 16 | 30 |
+| **scaling delta** (depth1 − depth0) | **7** | **10** |
+
+The delta row is the keystone: depth-1's extra cost over depth-0 is exactly
+the fixed batch cost (7 batch queries + JOIN listing + tag prefetch) — any
+per-child query reintroduction breaches it at N ≥ 1.
+
+**Regression proof**: temporarily forcing one per-child `get_share_details`
+query pushed depth-1 to 31 (> 30, BREACH) and the scaling delta to 20
+(> 10, BREACH); reverted, the gate passes again. The measurement also
+validated the round-3/4 work end-to-end: warm get_file = 5 statements,
+put_new = 16 (was ~23 pre-round-4).
+
 ### Concurrent write probe (4 workers, same file, token auth)
 
 | metric | before | after (deadlock fix) |

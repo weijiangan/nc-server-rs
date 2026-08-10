@@ -10,7 +10,9 @@ nc-difftest = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 reqwest = { workspace = true }
 # App-token bootstrap (Phase 17): stored token = hex(sha512(raw + secret)),
 # matching PHP's `PublicKeyTokenProvider::hashToken()`.

@@ -1,0 +1,40 @@
+# Per-request-class statement budgets (Phase 20).
+#
+# Measured with app-token auth, warm caches, on the dev docker stack, by
+# counting `execute sqlx` lines in the SUT's Postgres statement log (Rust's
+# prepared statements only — PHP/Doctrine logs as `<unnamed>` and is excluded
+# by construction).  Budgets = 2x measured floor, so a single regression that
+# pushes a class over its floor trips the gate.
+#
+# `make perf-gate` runs the `nc-bench budget` subcommand against this file.
+#
+# The scaling delta is the keystone: depth-1's extra cost over depth-0 must
+# stay at the fixed batch cost (7 batch queries + JOIN listing + tag
+# prefetch).  Any per-child query reintroduction breaches it at N >= 1.
+
+classes:
+  - name: status
+    method: GET
+    path: /status.php
+    budget: 5
+  - name: get_file
+    method: GET
+    path: /remote.php/webdav/hello.txt
+    budget: 12
+  - name: propfind_depth0
+    method: PROPFIND
+    path: /remote.php/webdav/
+    depth: 0
+    budget: 20
+  - name: propfind_depth1
+    method: PROPFIND
+    path: /remote.php/webdav/
+    depth: 1
+    budget: 30
+  - name: put_new
+    method: PUT
+    path: /remote.php/webdav/q-budget-<ts>.txt
+    unique_path: true
+    budget: 30
+
+scaling_delta_budget: 10

@@ -99,7 +99,7 @@ pub async fn instance_creds(
 /// The row carries a real RSA keypair (like PHP `generateToken()`), and any
 /// stale keyless `nc-bench` rows from earlier runs are deleted first — they
 /// break PHP's `updatePasswords()`.
-async fn create_token(inst: &Instance, admin_user: &str) -> Result<String> {
+pub(crate) async fn create_token(inst: &Instance, admin_user: &str) -> Result<String> {
     let secret = read_secret(inst)?;
 
     // Raw token: 256 bits of randomness (two v4 UUIDs).

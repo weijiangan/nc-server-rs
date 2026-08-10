@@ -51,6 +51,12 @@ diff-test:
 diff-one:
 	cd core-rs && cargo test -p nc-difftest --release -- --ignored $(S)
 
+# ── Performance budget gate (Phase 20) ───────────────────────────────────────
+# Fails when any request class exceeds its query-count budget
+# (core-rs/perf-budget.yaml).  Needs a live stack (`make diff-up`).
+perf-gate:
+	cd core-rs && cargo run --release -p nc-bench -- budget --budget perf-budget.yaml
+
 # ── Benchmarking / profiling (Phase 17) ──────────────────────────────────────
 # All bench targets need a live stack (`make diff-up`).  `nc-bench` compares
 # the Rust SUT (:8080) against the pure-PHP oracle (:9091) on the same stack;

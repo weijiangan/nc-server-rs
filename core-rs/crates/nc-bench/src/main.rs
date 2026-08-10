@@ -14,6 +14,7 @@
 //! construction.  Configuration comes from the same `NC_DIFFTEST_*` env vars.
 
 mod auth;
+mod budget;
 mod load;
 mod report;
 mod scenario;
@@ -70,6 +71,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Phase 20: run the query-count budget gate against the SUT.
+    /// Fails (non-zero exit) when any request class exceeds its budget.
+    Budget {
+        /// Path to the budget file (`perf-budget.yaml`).
+        #[arg(long, default_value = "perf-budget.yaml")]
+        budget: String,
+    },
 }
 
 #[tokio::main]
@@ -96,6 +104,12 @@ async fn main() -> Result<()> {
         } => {
             let rep = load::bench(&cfg, &probe, concurrency, duration, warmup).await?;
             report::render_load(&rep, json);
+        }
+        Command::Budget { budget } => {
+            let pass = budget::run(&cfg, &budget).await?;
+            if !pass {
+                std::process::exit(1);
+            }
         }
     }
     Ok(())
