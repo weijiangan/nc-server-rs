@@ -83,6 +83,18 @@ The 18.4 re-profile (`profiles/profile-1786308169.svg`, `profile-1786310260.svg`
 
 - [x] Store into the PropfindBatch meta cache on miss (all three callers verified read-only); kills the root's double lookup per PROPFIND and lets `read_dir` reuse the cached root row.
 
+### 18.12 Throttle the `last_activity` UPDATE (round-4 Task 11)
+
+- [ ] Match PHP's `token_auth_activity_update` throttle (default 60 s, clamp 0-300): add `last_activity` to the token lookup/cache and skip the `UPDATE oc_authtoken` within the window. Today Rust writes on every authenticated request — PHP writes ~1/60 s.
+
+### 18.13 Fold `sharing_disabled` + display name into `cached_user_state` (round-4 Task 12)
+
+- [ ] `shareapi_exclude_groups` config via the state `appconfig_cache`; the group-membership query and the `{oc:}owner-display-name` lookup into the 60 s TTL cache. ~3 queries off every PROPFIND root.
+
+### 18.14 Raise the bruteforce COUNT cache TTL (round-4 Task 13)
+
+- [ ] 2 s → 30-60 s (`nc-auth/src/bruteforce.rs` `COUNT_CACHE_TTL`); staleness immaterial for the exponential delay. ~2 queries per request eliminated at low cadence.
+
 Also recorded: the round-2 dumps are sample-poor (256-290 samples in 10 s — the SUT is I/O-bound); future `make profile` runs must keep load peaking at SIGUSR2 time, raise concurrency to CPU saturation, and use `RUST_LOG=info`.
 
 ---

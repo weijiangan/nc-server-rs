@@ -153,3 +153,79 @@ The PropfindBatch meta map is populated only by `read_dir` (the defensive invari
 4. `make bench-load` — capabilities probe should move toward status.php (auth-query reduction); record in benchmarks.md.
 
 **Not a query-count win** (verified, deliberately out of scope): the depth-0 root's remaining ~10 singles (dav-server-rs visits the root before `read_dir`; each node is visited once per request, so memoization buys nothing beyond Task 10's meta part), and the write-path gap vs PHP (propagator already batched post-deadlock-fix; the 1.3-2.3× is DB work + fsync, not N+1 — worth a query-count measurement before touching it).
+
+---
+
+## Round 4 — remaining per-request queries (2026-08-10)
+
+Follow-up to the round-3 A/B (1124 → 24 statements per 100-child depth-1
+PROPFIND, latency unchanged on the local hot DB — the win materializes on
+slower storage where each round trip costs ms). The remaining per-request
+work, ranked for a slow-disk / low-CPU deployment:
+
+### Task 11 — Throttle the `last_activity` UPDATE to PHP's interval (parity + write removal)
+
+Verified against the PHP reference: `PublicKeyTokenProvider::updateTokenActivity`
+(`lib/private/Authentication/Token/PublicKeyTokenProvider.php:296`) writes only
+when `last_activity < now − token_auth_activity_update` (system value, **default
+60 s**, clamped 0-300). Rust's `spawn_last_activity_update`
+(`nc-auth/src/bearer.rs:147`) issues an unconditional `UPDATE oc_authtoken` on
+**every** authenticated request — a DB write per request PHP would not do for
+60 s (on HDD: a seek + journal write per request). Fix: add `last_activity` to
+the token lookup + cache entry, and skip the update when within the 60 s
+window. Net: ~1 write/60 s per token instead of 1/request; also a parity fix.
+
+### Task 12 — Fold `sharing_disabled` + display name into `cached_user_state`
+
+`sharing_disabled_for_user` runs 2-3 queries per PROPFIND root:
+`oc_appconfig` `shareapi_exclude_groups` + `shareapi_exclude_groups_list`
+(global config — belongs in the state-level `appconfig_cache`, 0 queries after
+warmup) plus an `oc_group_user` membership query (uid-dependent — belongs in
+the 60 s TTL cache next to the admin check). The `{oc:}owner-display-name`
+lookup (uid-only) joins the same cache entry. Net: ~3 queries off every
+PROPFIND root, depth-0 and depth-1 alike.
+
+### Task 13 — Raise the bruteforce COUNT cache TTL (2 s → 30-60 s)
+
+At low request rates the 2 s TTL (Phase 18.3) still pays both COUNT queries on
+nearly every request. The staleness argument that justified 2 s (counts change
+only on `record_attempt`; the delay formula is exponential) holds at 60 s. Net:
+~2 queries per request eliminated at ≤1 req/s cadence.
+
+### The floor (documented, out of scope)
+
+**Why the root's `get_props` cannot use the batch.** dav-server-rs visits the
+request root *before* `read_dir` (its `propfind` handler calls
+`write_props(root)` then `propfind_directory`), so the root is never in the
+`PropfindBatch` and every lookup falls back to the single-row queries.  Each
+node is visited once per request, so per-request memoization buys nothing, and
+a cross-request TTL cache would break PHP parity on writes (a share created
+2 s ago must appear in the next PROPFIND).
+
+**The ~8 per-file queries remaining on every PROPFIND root** (all in
+`nc-dav/src/filesystem.rs` `get_props`, single-row fallbacks; `fc_path` =
+`files` for the webdav root):
+
+| # | query (row fn) | serves | why irreducible |
+|---|---|---|---|
+| 1 | `count_children` — `SELECT SUM(CASE WHEN mimetype = $dir …) … FROM oc_filecache WHERE parent = $1 AND storage = $2` | `{nc:}contained-folder-count` / `-file-count` | per-file data; changes on every write in the dir |
+| 2 | `get_share_details` — `SELECT DISTINCT share_type, share_with FROM oc_share WHERE file_source = $1 …` (+ display-name batch for user-type shares) | `{oc:}share-types` / `{nc:}sharees` | per-file; a new share must appear immediately |
+| 3 | `get_share_note` — `SELECT note FROM oc_share WHERE file_source = $1 AND note != '' ORDER BY stime DESC LIMIT 1` | `{nc:}note` | per-file; share edits must appear immediately |
+| 4 | `get_comments_count` — `SELECT COUNT(*) FROM oc_comments WHERE object_type = 'files' AND object_id = $1` | `{oc:}comments-count` | per-file; new comments must appear immediately |
+| 5 | `get_comments_unread` — `SELECT COUNT(*) FROM oc_comments c … actor_id != $2 AND creation_timestamp > COALESCE((SELECT marker_datetime …), '1970-01-01 00:00:00')` | `{oc:}comments-unread` | per-file × per-user; read markers change constantly |
+| 6 | `get_system_tags_for_file` — `SELECT t.id, t.name … FROM oc_systemtag t JOIN oc_systemtag_object_mapping m … WHERE m.objectid = $1` | `{nc:}system-tags` | per-file; tag edits must appear immediately |
+| 7 | `list_custom_properties` — `SELECT propertyname, propertyvalue, valuetype FROM oc_properties WHERE userid = $1 AND propertypath = $2` | custom (`oc_properties`) props | per-file × per-user; PROPPATCH writes must appear immediately |
+| 8 | `get_tag_info` — `SELECT vco.objid, vc.category FROM oc_vcategory_to_object vco JOIN oc_vcategory vc … WHERE vc.uid = $1 … AND vco.objid IN ($4)` | `{oc:}favorite` / `{oc:}tags` | per-file × per-user; the root is not in `read_dir`'s tag prefetch (it runs before it) |
+
+Plus the root's metadata (`load_meta` → `lookup_by_path_with_ext`, 1 query —
+already JOIN-reduced) and, until Task 12 lands, the display-name and
+sharing-config lookups.  After Tasks 11-13 the depth-1 PROPFIND floor is
+~19 statements: auth (~1 cached token + 2 bruteforce counts every 30-60 s) +
+read_dir batch (6) + root (8-10).
+
+**Write path** (~15 queries per PUT): could lose ~1 via a CTE-combined
+filecache-insert + extended-upsert, but it is already the fastest-vs-PHP area
+(1.3-2.3×); measure the PUT query count before touching it.
+
+With Tasks 11-13: depth-1 PROPFIND ~26 → ~19 statements, GET ~8 → ~5, and the
+per-request DB **write** disappears — the highest-value item on slow storage.
