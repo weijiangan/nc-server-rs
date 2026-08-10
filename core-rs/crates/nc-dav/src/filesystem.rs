@@ -1243,13 +1243,18 @@ impl NcFileSystem {
     async fn load_meta(&self, fc_path: &str) -> Option<NcMetaData> {
         // Phase 18.1: serve from the per-request batch populated by `read_dir`
         // — depth-1 PROPFIND's per-child lookups reuse the rows already in
-        // hand instead of re-issuing two queries per node.  Only `read_dir`
-        // populates the map and write requests never run `read_dir`, so an
-        // entry cannot go stale within a request.
-        if let Some(meta) = batch_get(&self.propfind_batch.meta, fc_path.trim_end_matches('/')) {
+        // hand instead of re-issuing two queries per node.  Round-3 Task 10:
+        // additionally store on miss, so the root's double lookup per
+        // PROPFIND (`fs.metadata(root)` then `get_props(root)` →
+        // `load_meta(root)`) pays once.  All callers are read-only —
+        // `metadata()`, the `open()` read path, and `get_props`; the write
+        // paths call `lookup_by_path` directly and never consult the batch,
+        // so an entry cannot go stale within a request.
+        let key = fc_path.trim_end_matches('/');
+        if let Some(meta) = batch_get(&self.propfind_batch.meta, key) {
             return Some(meta);
         }
-        let row = row::lookup_by_path(
+        let found = row::lookup_by_path_with_ext(
             &self.state.pool,
             &self.state.table_prefix,
             self.storage_id,
@@ -1259,10 +1264,10 @@ impl NcFileSystem {
         tracing::trace!(
             fc_path = %fc_path,
             storage_id = self.storage_id,
-            found = row.is_some(),
+            found = found.is_some(),
             "load_meta result"
         );
-        let row = row?;
+        let (row, ext) = found?;
 
         let mime_type = {
             let cache = self.state.mime_cache.read().expect("mime cache lock");
@@ -1272,9 +1277,13 @@ impl NcFileSystem {
                 .to_string()
         };
 
-        let ext = row::get_extended(&self.state.pool, &self.state.table_prefix, row.fileid).await;
         let mut meta = NcMetaData::from_row(&row, mime_type, ext.metadata_etag.clone());
         meta.apply_extended(ext.creation_time, ext.upload_time, ext.metadata_etag);
+        self.propfind_batch
+            .meta
+            .lock()
+            .expect("propfind batch lock")
+            .insert(key.to_string(), meta.clone());
         Some(meta)
     }
 }
@@ -1346,42 +1355,45 @@ impl DavFileSystem for NcFileSystem {
         async move {
             let fc_path = self.to_fc_path(path);
 
-            // Resolve the directory itself to get its fileid.
-            let dir_row = row::lookup_by_path(
-                &self.state.pool,
-                &self.state.table_prefix,
-                self.storage_id,
-                &fc_path,
-            )
-            .await
-            .ok_or(FsError::NotFound)?;
+            // Resolve the directory itself to get its fileid.  The request
+            // root is usually already in the batch (load_meta store-on-miss
+            // from `fs.metadata`/`get_props`), so reuse it instead of a
+            // second lookup (round-3 Task 10).
+            let dir_fileid = match batch_get(&self.propfind_batch.meta, fc_path.trim_end_matches('/'))
+            {
+                Some(meta) => meta.fileid,
+                None => row::lookup_by_path(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    self.storage_id,
+                    &fc_path,
+                )
+                .await
+                .ok_or(FsError::NotFound)?
+                .fileid,
+            };
 
-            // Fetch all direct children.
-            let children = row::list_children(
+            // Fetch all direct children with their extended metadata in one
+            // LEFT JOIN (round-3 Task 9) — the same single-query shape as
+            // PHP's `Cache::getFolderContentsById` (`selectFileCache` +
+            // `selectMetadata`, Cache.php:214).  Previously two queries
+            // (list_children + list_extended_batch); children without an
+            // extended row get zero times, as before.
+            let (children, extended_map) = row::list_children_with_ext(
                 &self.state.pool,
                 &self.state.table_prefix,
-                dir_row.fileid,
+                dir_fileid,
                 self.storage_id,
             )
             .await;
 
-            // Batch-load oc_filecache_extended for every child in a single
-            // query instead of N individual queries — so that depth-1 PROPFIND
-            // returns correct {nc:}creation_time, {nc:}upload_time, and
-            // {nc:}metadata_etag without hitting the DB per-row (REQ §4.1).
             let child_fileids: Vec<i64> = children.iter().map(|c| c.fileid).collect();
-            let extended_map = row::list_extended_batch(
-                &self.state.pool,
-                &self.state.table_prefix,
-                &child_fileids,
-            )
-            .await;
 
             // §9.5: prefetch tags for the directory + all children so that
             // depth-1 PROPFIND has {oc:}favorite and {oc:}tags ready without
             // N+1 DB queries.  Include the directory itself.
             let mut prefetch_ids = child_fileids.clone();
-            prefetch_ids.push(dir_row.fileid);
+            prefetch_ids.push(dir_fileid);
             crate::tags::prefetch_tags(
                 &self.state.pool,
                 &self.state.table_prefix,

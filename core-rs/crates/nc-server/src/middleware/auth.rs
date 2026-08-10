@@ -188,23 +188,18 @@ pub async fn auth_layer(
                         state.table_prefix.clone(),
                     );
 
-                    // 2FA gate (task 3.6) — REQ §4.5.
-                    match nc_auth::twofa::requires_2fa(
+                    // 2FA gate (task 3.6) — REQ §4.5.  Round-3 Task 8: the
+                    // provider check and the admin-group check are cached per
+                    // uid (60 s TTL); permanent app tokens are exempt from
+                    // the 2FA gate.
+                    let user_state = nc_auth::cached_user_state(
                         &cached.uid,
-                        cached.token_type,
                         &state.pool,
                         &state.table_prefix,
                     )
-                    .await
-                    {
-                        Ok(true) => {
-                            return (
-                                StatusCode::UNAUTHORIZED,
-                                "Not Authenticated: 2FA challenge not passed.",
-                            )
-                                .into_response();
-                        }
-                        Ok(false) => { /* 2FA not required — continue */ }
+                    .await;
+                    let user_state = match user_state {
+                        Ok(s) => s,
                         Err(e) => {
                             tracing::error!(
                                 uid = %cached.uid,
@@ -213,11 +208,17 @@ pub async fn auth_layer(
                             );
                             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                         }
+                    };
+                    if cached.token_type != 1 && user_state.twofa_enabled {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            "Not Authenticated: 2FA challenge not passed.",
+                        )
+                            .into_response();
                     }
 
-                    // Phase 7.2: admin group check.
-                    let is_admin =
-                        nc_auth::is_admin_user(&cached.uid, &state.pool, &state.table_prefix).await;
+                    // Phase 7.2: admin group check (cached per uid).
+                    let is_admin = user_state.is_admin;
 
                     // Extract the raw bearer value for HTTP_X_NC_SESSION_TOKEN.
                     let raw_token = nc_auth::bearer::extract_bearer(ah).map(str::to_owned);
@@ -304,24 +305,18 @@ pub async fn auth_layer(
                                 is_app_token = result.token_id.is_some(),
                                 "Basic auth succeeded"
                             );
-                            // 2FA gate for Basic auth (REQ §4.5).
+                            // 2FA gate for Basic auth (REQ §4.5).  Round-3
+                            // Task 8: both the provider check and the
+                            // admin-group check are cached per uid.
                             let token_type = result.token_type.unwrap_or(0);
-                            match nc_auth::twofa::requires_2fa(
+                            let user_state = nc_auth::cached_user_state(
                                 &result.uid,
-                                token_type,
                                 &state.pool,
                                 &state.table_prefix,
                             )
-                            .await
-                            {
-                                Ok(true) => {
-                                    return (
-                                        StatusCode::UNAUTHORIZED,
-                                        "Not Authenticated: 2FA challenge not passed.",
-                                    )
-                                        .into_response();
-                                }
-                                Ok(false) => { /* 2FA not required — continue */ }
+                            .await;
+                            let user_state = match user_state {
+                                Ok(s) => s,
                                 Err(e) => {
                                     tracing::error!(
                                         uid = %result.uid,
@@ -330,14 +325,16 @@ pub async fn auth_layer(
                                     );
                                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                                 }
+                            };
+                            if token_type != 1 && user_state.twofa_enabled {
+                                return (
+                                    StatusCode::UNAUTHORIZED,
+                                    "Not Authenticated: 2FA challenge not passed.",
+                                )
+                                    .into_response();
                             }
-                            // Phase 7.2: admin group check.
-                            let is_admin = nc_auth::is_admin_user(
-                                &result.uid,
-                                &state.pool,
-                                &state.table_prefix,
-                            )
-                            .await;
+                            // Phase 7.2: admin group check (cached per uid).
+                            let is_admin = user_state.is_admin;
                             // For Basic auth with an app token, store the raw
                             // password (the token value) for HTTP_X_NC_SESSION_TOKEN.
                             // For plain-password auth, do not forward the password.

@@ -142,35 +142,75 @@ pub async fn lookup_by_path(
         Err(e) => {
             tracing::error!(error = %e, path = %path, hash = %hash, storage, "lookup_by_path: SQL error");
         }
-        Ok(Some(row)) => {
-            let db_path: Option<String> = row.get("path");
-            let db_storage: i64 = row.get("storage");
-            tracing::info!(path = %path, hash = %hash, storage, db_path = ?db_path, db_storage, "lookup_by_path: found");
+        Ok(Some(_)) => {
+            tracing::trace!(path = %path, hash = %hash, storage, "lookup_by_path: found");
         }
         Ok(None) => {
-            // Debug: query without the storage filter to check if path_hash
-            // matches any row at all.
-            let debug_sql = format!(
-                "SELECT fileid, storage, path FROM {prefix}filecache WHERE path_hash = $1",
-                prefix = prefix
-            );
-            let debug_rows: Vec<(i64, i64, Option<String>)> = sqlx::query(&debug_sql)
-                .bind(&hash)
-                .fetch_all(pool)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| (r.get(0), r.get(1), r.get(2)))
-                .collect();
-            tracing::info!(
-                path = %path, hash = %hash, storage, ?debug_rows,
-                "lookup_by_path: not found (any storage)"
-            );
+            // Phase 18.1 (round-3 Task 7): the storage-unfiltered fallback
+            // query below used to run on EVERY miss — a hidden second query
+            // on every new-path PUT/MKCOL existence check.  It exists only
+            // to debug hash collisions, so gate it behind trace logging.
+            if tracing::enabled!(tracing::Level::TRACE) {
+                let debug_sql = format!(
+                    "SELECT fileid, storage, path FROM {prefix}filecache WHERE path_hash = $1",
+                    prefix = prefix
+                );
+                let debug_rows: Vec<(i64, i64, Option<String>)> = sqlx::query(&debug_sql)
+                    .bind(&hash)
+                    .fetch_all(pool)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| (r.get(0), r.get(1), r.get(2)))
+                    .collect();
+                tracing::trace!(
+                    path = %path, hash = %hash, storage, ?debug_rows,
+                    "lookup_by_path: not found (any storage)"
+                );
+            }
         }
     }
     match result {
         Err(_) => None,
         Ok(row) => row.map(|r| fc_row_from_any(&r)),
+    }
+}
+
+/// Look up one filecache row **with its `oc_filecache_extended` metadata** in
+/// a single LEFT JOIN (round-3 Task 9).  Files without an extended row get
+/// zero times and `metadata_etag = None` — the `get_extended` fallback
+/// semantics.  Replaces `lookup_by_path` + `get_extended` (2 queries) in
+/// `load_meta` with one.
+pub async fn lookup_by_path_with_ext(
+    pool: &DbPool,
+    prefix: &str,
+    storage: i64,
+    path: &str,
+) -> Option<(FileCacheRow, FileCacheExtRow)> {
+    let hash = path_hash(path);
+    let sql = format!(
+        "SELECT fc.fileid, fc.storage, fc.path, fc.path_hash, fc.parent, fc.name, \
+         fc.mimetype, fc.mimepart, fc.size, fc.mtime, fc.storage_mtime, fc.etag, \
+         fc.permissions, fc.checksum, fe.metadata_etag, fe.creation_time, fe.upload_time \
+         FROM {prefix}filecache fc \
+         LEFT JOIN {prefix}filecache_extended fe ON fe.fileid = fc.fileid \
+         WHERE fc.storage = $1 AND fc.path_hash = $2"
+    );
+    match sqlx::query(&sql).bind(storage).bind(&hash).fetch_optional(pool).await {
+        Ok(Some(r)) => {
+            let row = fc_row_from_any(&r);
+            let ext = FileCacheExtRow {
+                metadata_etag: r.get::<Option<String>, _>("metadata_etag"),
+                creation_time: r.get::<Option<i64>, _>("creation_time").unwrap_or(0),
+                upload_time: r.get::<Option<i64>, _>("upload_time").unwrap_or(0),
+            };
+            Some((row, ext))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(error = %e, path = %path, hash = %hash, storage, "lookup_by_path_with_ext: SQL error");
+            None
+        }
     }
 }
 
@@ -214,6 +254,52 @@ pub async fn list_children(
         }
         Ok(rows) => rows.iter().map(fc_row_from_any).collect(),
     }
+}
+
+/// Fetch all direct children **with their `oc_filecache_extended` metadata**
+/// in a single LEFT JOIN — the same shape PHP's `Cache::getFolderContentsById`
+/// uses (`selectFileCache` + `selectMetadata`, Cache.php:214).  Children
+/// without an extended row get zero times (the `list_extended_batch` fallback
+/// semantics); the map is keyed by fileid.
+///
+/// Round-3 Task 9: replaces `list_children` + `list_extended_batch` (2
+/// queries) in `read_dir` with one.
+pub async fn list_children_with_ext(
+    pool: &DbPool,
+    prefix: &str,
+    parent_id: i64,
+    storage: i64,
+) -> (Vec<FileCacheRow>, std::collections::HashMap<i64, FileCacheExtRow>) {
+    let sql = format!(
+        "SELECT fc.fileid, fc.storage, fc.path, fc.path_hash, fc.parent, fc.name, \
+         fc.mimetype, fc.mimepart, fc.size, fc.mtime, fc.storage_mtime, fc.etag, \
+         fc.permissions, fc.checksum, fe.metadata_etag, fe.creation_time, fe.upload_time \
+         FROM {prefix}filecache fc \
+         LEFT JOIN {prefix}filecache_extended fe ON fe.fileid = fc.fileid \
+         WHERE fc.parent = $1 AND fc.storage = $2"
+    );
+    let mut rows_out: Vec<FileCacheRow> = Vec::new();
+    let mut ext_map: std::collections::HashMap<i64, FileCacheExtRow> =
+        std::collections::HashMap::new();
+    match sqlx::query(&sql).bind(parent_id).bind(storage).fetch_all(pool).await {
+        Err(e) => {
+            tracing::error!(error = %e, parent_id = parent_id, "list_children_with_ext: SQL error");
+        }
+        Ok(rows) => {
+            for r in &rows {
+                let row = fc_row_from_any(r);
+                let fileid = row.fileid;
+                let ext = FileCacheExtRow {
+                    metadata_etag: r.get::<Option<String>, _>("metadata_etag"),
+                    creation_time: r.get::<Option<i64>, _>("creation_time").unwrap_or(0),
+                    upload_time: r.get::<Option<i64>, _>("upload_time").unwrap_or(0),
+                };
+                ext_map.insert(fileid, ext);
+                rows_out.push(row);
+            }
+        }
+    }
+    (rows_out, ext_map)
 }
 
 /// The user's free quota space, mirroring PHP's `Quota::free_space`
@@ -1982,7 +2068,92 @@ mod tests {
         .execute(&pool)
         .await
         .expect("properties");
+        sqlx::query(
+            "CREATE TABLE oc_filecache_extended (
+                fileid BIGINT NOT NULL PRIMARY KEY, metadata_etag VARCHAR(40),
+                creation_time INTEGER NOT NULL DEFAULT 0, upload_time INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("filecache_extended");
         pool
+    }
+
+    #[tokio::test]
+    async fn with_ext_variants_match_singles() {
+        let pool = fresh_batch_db().await;
+        let prefix = "oc_";
+        // dir (1) with two children: a.txt (has an extended row), b.txt (none).
+        for (id, parent, name, mime) in [
+            (1, 0, "files", 2),
+            (2, 1, "a.txt", 1),
+            (3, 1, "b.txt", 1),
+        ] {
+            let path = format!("files/{name}");
+            sqlx::query(
+                "INSERT INTO oc_filecache (fileid, storage, path, path_hash, parent, name, mimetype) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(1)
+            .bind(&path)
+            .bind(path_hash(&path))
+            .bind(parent)
+            .bind(name)
+            .bind(mime)
+            .execute(&pool)
+            .await
+            .expect("insert");
+        }
+        sqlx::query(
+            "INSERT INTO oc_filecache_extended (fileid, metadata_etag, creation_time, upload_time) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(2)
+        .bind("etag-42")
+        .bind(42)
+        .bind(43)
+        .execute(&pool)
+        .await
+        .expect("ext insert");
+
+        // lookup variant: extended row present → real values; absent → zeros.
+        let (row, ext) = lookup_by_path_with_ext(&pool, prefix, 1, "files/a.txt")
+            .await
+            .expect("a.txt");
+        assert_eq!(row.fileid, 2);
+        assert_eq!(ext.creation_time, 42);
+        assert_eq!(ext.upload_time, 43);
+        assert_eq!(ext.metadata_etag.as_deref(), Some("etag-42"));
+        let (row, ext) = lookup_by_path_with_ext(&pool, prefix, 1, "files/b.txt")
+            .await
+            .expect("b.txt");
+        assert_eq!(row.fileid, 3);
+        assert_eq!(ext.creation_time, 0, "absent extended row → zero times");
+        assert_eq!(ext.upload_time, 0);
+        assert_eq!(ext.metadata_etag, None);
+        assert!(lookup_by_path_with_ext(&pool, prefix, 1, "files/missing.txt")
+            .await
+            .is_none());
+
+        // list variant: same values through the fileid-keyed map, consistent
+        // with the single-query pair for every child.
+        let (rows, map) = list_children_with_ext(&pool, prefix, 1, 1).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(map.get(&2).unwrap().creation_time, 42);
+        assert_eq!(map.get(&3).unwrap().creation_time, 0);
+        for r in &rows {
+            let single_row = lookup_by_path(&pool, prefix, 1, r.path.as_deref().unwrap())
+                .await
+                .expect("single row");
+            let single_ext = get_extended(&pool, prefix, r.fileid).await;
+            let joined_ext = map.get(&r.fileid).expect("joined ext");
+            assert_eq!(joined_ext.creation_time, single_ext.creation_time, "fileid {}", r.fileid);
+            assert_eq!(joined_ext.upload_time, single_ext.upload_time);
+            assert_eq!(joined_ext.metadata_etag, single_ext.metadata_etag);
+            assert_eq!(single_row.fileid, r.fileid);
+        }
     }
 
     #[tokio::test]

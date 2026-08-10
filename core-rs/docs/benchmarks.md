@@ -320,6 +320,45 @@ both the single and batch queries.  Two batch queries initially numbered
 their `IN` placeholders from `$1`, colliding with the earlier-bound `$1`
 (dir-mimetype / userid) — shifted to start at `$2`.
 
+## Phase 18.2 — round-3 query reductions (2026-08-10)
+
+Four code-inspection findings (query counts are invisible to CPU sampling),
+planned in `19-performance-improvements.md` §Round 3, all landed:
+
+1. **`lookup_by_path` hidden costs** (`row.rs`): the unconditional
+   storage-unfiltered debug query on every miss — a hidden second query on
+   every new-path PUT/MKCOL existence check — is now gated behind
+   `tracing::enabled!(TRACE)`; the per-lookup `info!` is `trace!`.
+2. **2FA + admin checks cached** (`nc-auth` `cached_user_state`, DashMap,
+   60 s TTL): two raw queries per authenticated request in both auth paths
+   (bearer + basic) now resolve once per TTL window.
+3. **`oc_filecache_extended` LEFT JOINed into the row queries**
+   (`lookup_by_path_with_ext` / `list_children_with_ext`): `load_meta` and
+   `read_dir` fetch row + extended metadata in one query — the same shape as
+   PHP's `getFolderContentsById` (`selectFileCache` + `selectMetadata`).
+   Absent extended row = zero times, the exact fallback semantics.
+4. **`load_meta` store-on-miss**: all three callers are read-only (write
+   paths call `lookup_by_path` directly), so the root's double lookup per
+   PROPFIND (`fs.metadata` then `get_props`) pays once, and `read_dir`
+   reuses the cached root row instead of re-querying.
+
+**Measured** (Postgres statement log, per-request class):
+
+| request | statements | notes |
+|---|---|---|
+| depth-1 PROPFIND | ~26 | 2FA/admin queries gone; children listing one JOIN; read_dir root lookup gone; remaining singles are the depth-0 root's own get_props (documented out of scope — dav-server-rs visits the root before `read_dir`) |
+| depth-0 PROPFIND | ~15 | mostly the root singles + auth |
+| GET file | ~8 | token + cached state + one JOIN lookup |
+| PUT (new path) | ~23 | write work + auth; the hidden miss-path debug query gone |
+
+**Load probes** (4 workers, 10 s): depth-1 PROPFIND **1008 req/s / 3.28 ms
+p50** (best of the session — pre-18.1: 822 req/s / 4.10 ms); depth-0 1573
+req/s / 2.27 ms; capabilities 1669 req/s; status.php 2227 req/s.
+
+**Verification**: 312 nc-dav tests (incl. JOIN-vs-single consistency) +
+55 nc-auth tests (incl. cache-serves-after-DB-flip); **diff-test 20/20 on
+the first run** — no restart-flake this round.
+
 ### Concurrent write probe (4 workers, same file, token auth)
 
 | metric | before | after (deadlock fix) |

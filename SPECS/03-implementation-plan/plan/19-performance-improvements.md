@@ -110,3 +110,46 @@ Round-1 cost-center follow-up ("batch per-child property lookups") implemented a
 3. Explicit-body depth-1 PROPFIND byte-compared against PHP on the same DB — per-path blocks identical modulo the pre-existing etag quote-escaping.
 4. Postgres statement log: ~124 → ~15 statements per depth-1 request; zero per-child queries.
 5. **Re-profile discipline for round 3**: keep load peaking at SIGUSR2 time (the `make profile` flow signals 3 s in — the round-2 dumps caught mostly quiescence), raise concurrency until the SUT saturates CPU, run with `RUST_LOG=info`. Otherwise the next dump will again be ~90% idle scaffolding.
+
+---
+
+## Round 3 — query-level opportunities (2026-08-10)
+
+Code-inspection findings (not flame-graph-driven — query counts are invisible to CPU sampling). Verified against the sources; ranked by leverage. Net effect: depth-1 PROPFIND ~15 → ~11 statements, depth-0 ~12 → ~9, GET ~5 → ~2, plus one query removed from every new-path write.
+
+### Task 7 — (done) Remove the hidden miss-path query + per-lookup info logging (`nc-dav/src/row.rs:124-175`)
+
+`lookup_by_path` carries two unaccounted costs:
+
+- **Every miss runs an extra debug query.** The `Ok(None)` branch unconditionally executes the "Debug: query without the storage filter" fallback (`SELECT fileid, storage, path … WHERE path_hash = $1`). Every PUT of a *new* file misses (the write-path existence check), so every file creation pays 2 queries instead of 1. Fix: drop the fallback or gate it behind `tracing::enabled!(Level::TRACE)`.
+- **`tracing::info!("lookup_by_path: found")`** fires on every successful lookup with `%path`/`%hash` formatting — live in production logs at `info`. Downgrade to `trace!` (part of the measured 3.7-3.9% logging).
+
+### Task 8 — (done) Cache the 2FA-provider + admin-group checks (`nc-server/src/middleware/auth.rs`, `nc-auth/src/lib.rs`)
+
+Every authenticated request runs two raw queries — `SELECT COUNT(*) FROM oc_twofactor_providers WHERE uid = $1 AND enabled = 1` and `SELECT uid FROM oc_group_user WHERE gid = 'admin' AND uid = $1` — on top of the (already cached) token lookup. Phase 18.3 cached only the bruteforce counts; this is the rest of the benchmarks.md "auth_layer per-request DB work" cost-center entry. Cache both per `(uid)` in the nc-auth DashMap with a 30-60 s TTL (2FA enablement / group membership change rarely; staleness immaterial). Removes 2 queries from every authenticated request on every endpoint.
+
+### Task 9 — (done) Join `oc_filecache_extended` into the row queries (match PHP)
+
+PHP's `getFolderContentsById` (`lib/private/Files/Cache/Cache.php:214`) fetches children + metadata in **one** query (`selectFileCache` + `selectMetadata` LEFT JOIN). Rust currently issues `list_children` + `list_extended_batch` (2 queries per `read_dir`) and `lookup_by_path` + `get_extended` (2 per `load_meta`). A LEFT JOIN with COALESCE defaults (absent extended row = zero times, the current fallback semantics exactly) collapses both pairs into single queries. Saves 1-2 queries per PROPFIND and per GET.
+
+### Task 10 — (done) `load_meta` store-on-miss (`nc-dav/src/filesystem.rs`)
+
+The PropfindBatch meta map is populated only by `read_dir` (the defensive invariant); `load_meta` consults but never stores. All three callers are read-only — `metadata()` (:1333), `open()` read path (:1560), `get_props` (:2457) — the write path calls `lookup_by_path` directly. Storing on miss is verifiably safe and kills the root's **double lookup** per PROPFIND (`fs.metadata(root)` then `get_props(root)` → `load_meta(root)` — two queries for the same row), on depth-0 and depth-1 alike.
+
+### Files touched (round 3)
+
+| File | Change |
+|---|---|
+| `core-rs/crates/nc-dav/src/row.rs` | miss-path debug query gated/removed; `trace!` instead of `info!`; optional extended JOIN variants of `lookup_by_path`/`list_children` |
+| `core-rs/crates/nc-auth/src/lib.rs` | 2FA-provider + admin DashMap cache (TTL) |
+| `core-rs/crates/nc-server/src/middleware/auth.rs` | read cached 2FA/admin state |
+| `core-rs/crates/nc-dav/src/filesystem.rs` | `load_meta` store-on-miss; `read_dir` uses the JOIN listing |
+
+### Verification (round 3)
+
+1. `cargo test --lib` — extended JOIN + cache unit tests (SQLite in-memory, absent-extended-row fallback pinned).
+2. `make diff-test` — 20/20 scenarios (write paths exercise the miss-path change directly — every PUT/MKCOL/DELETE).
+3. Postgres statement log before/after per request class: depth-1 PROPFIND, depth-0 PROPFIND, GET, PUT-create.
+4. `make bench-load` — capabilities probe should move toward status.php (auth-query reduction); record in benchmarks.md.
+
+**Not a query-count win** (verified, deliberately out of scope): the depth-0 root's remaining ~10 singles (dav-server-rs visits the root before `read_dir`; each node is visited once per request, so memoization buys nothing beyond Task 10's meta part), and the write-path gap vs PHP (propagator already batched post-deadlock-fix; the 1.3-2.3× is DB work + fsync, not N+1 — worth a query-count measurement before touching it).
