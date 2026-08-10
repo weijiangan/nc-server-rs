@@ -14,12 +14,17 @@ use tracing::Level;
 
 use crate::{
     handlers::{heartbeat::heartbeat, status::status},
-    middleware::{auth::auth_layer, maintenance::maintenance_guard},
+    middleware::{auth::auth_check, maintenance::maintenance_check},
     state::AppState,
 };
 
-/// Outermost middleware: serve physical files directly from the Nextcloud root
-/// before the request reaches any route handler.
+/// Static-file serving check (Phase 18.6): returns `Some(response)` when the
+/// path is a whitelisted static asset that exists on disk, `None` to fall
+/// through to the maintenance + auth + route stack.  Extracted from the
+/// former `from_fn` middleware so the three request-middleware layers
+/// (static → maintenance → auth) run inside one composite
+/// (`http_middleware_stack`) instead of three — ~2 fewer wrapper polls per
+/// await per request.
 ///
 /// Mirrors nginx's `try_files $uri @php` directive:
 /// - Only GET / HEAD requests are candidates.
@@ -28,18 +33,16 @@ use crate::{
 /// - If the resolved path is a regular file, it is served by `tower_http`'s
 ///   `ServeDir` (which handles ETag, Last-Modified, Range, and Content-Type
 ///   detection automatically).
-/// - Everything else falls through to the auth + route layers.
 ///
-/// This covers `/core/`, `/dist/`, `/themes/`, and app-level static assets
-/// such as `/apps/files/img/icon.svg` that the PHP route wildcards would
-/// otherwise swallow and send to PHP-FPM.
-async fn try_static_files(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
+/// Covers `/core/`, `/dist/`, `/themes/`, and app-level static assets such as
+/// `/apps/files/img/icon.svg` that the PHP route wildcards would otherwise
+/// swallow and send to PHP-FPM.
+async fn try_static_files_check(
+    state: &AppState,
+    req: &mut Request<Body>,
+) -> Option<Response> {
     if matches!(req.method(), &Method::GET | &Method::HEAD) {
-        let path = req.uri().path();
+        let path = req.uri().path().to_string();
         // Phase 18: static files live only under the app's four asset roots
         // plus two exact root files; everything else (status.php, OCS, DAV,
         // index.php, …) skips the fs stat entirely.  This also stops serving
@@ -48,7 +51,7 @@ async fn try_static_files(
         // itself still falls through (the root is a directory).
         const STATIC_PREFIXES: [&str; 4] = ["/core/", "/dist/", "/themes/", "/apps/"];
         let is_static = STATIC_PREFIXES.iter().any(|p| path.starts_with(p))
-            || matches!(path, "/robots.txt" | "/index.html");
+            || matches!(path.as_str(), "/robots.txt" | "/index.html");
         // Skip PHP scripts and any path that looks like traversal.
         if is_static && !path.contains(".php") && !path.contains("..") {
             let candidate = state.nc_root.join(path.trim_start_matches('/'));
@@ -57,14 +60,50 @@ async fn try_static_files(
                 .map(|m| m.is_file())
                 .unwrap_or(false)
             {
-                return match ServeDir::new(&state.nc_root).oneshot(req).await {
+                // Serve path consumes the request; the composite is done.
+                let owned = std::mem::take(req);
+                return Some(match ServeDir::new(&state.nc_root).oneshot(owned).await {
                     Ok(resp) => resp.into_response(),
                     Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-                };
+                });
             }
         }
     }
-    next.run(req).await
+    None
+}
+
+/// Composite request middleware (Phase 18.6): static files → maintenance
+/// guard → auth, inside ONE `from_fn` layer instead of three.  Each check
+/// preserves the exact early-return semantics and response bytes of the
+/// former middleware; the composite adds only the Set-Cookie forwarding from
+/// the PHP session resolver (remember-me rotation), which ran after the
+/// handler in the original auth middleware and does the same here.
+pub(crate) async fn http_middleware_stack(
+    State(state): State<AppState>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
+    // 1. Static files (outermost — bypasses auth; JS/CSS/images are public).
+    if let Some(resp) = try_static_files_check(&state, &mut req).await {
+        return resp;
+    }
+    // 2. Maintenance guard (503 except /status.php, /heartbeat).
+    if let Some(resp) = maintenance_check(&state, req.uri().path()).await {
+        return resp;
+    }
+    // 3. Auth (bearer/basic/session) — attaches `AuthInfo` or rejects.
+    let set_cookies = match auth_check(&state, &mut req).await {
+        Ok(cookies) => cookies,
+        Err(resp) => return resp,
+    };
+    let mut resp = next.run(req).await;
+    for cookie_val in &set_cookies {
+        if let Ok(hv) = axum::http::HeaderValue::from_str(cookie_val) {
+            resp.headers_mut()
+                .append(axum::http::header::SET_COOKIE, hv);
+        }
+    }
+    resp
 }
 
 /// Proxied DAV sub-trees (Phase 18) — served by PHP/SabreDAV, not the native
@@ -272,24 +311,20 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
     //
     // Request processing order (outer → inner):
     //   trace_layer       — log every request: method, path, status, duration
-    //   try_static_files  — serve physical files before routing; bypasses auth
-    //                       (JS/CSS/images are always public)
-    //   maintenance_guard — reject API calls when maintenance mode is on
-    //   auth_layer        — validate bearer / session token
+    //   http_middleware_stack — static files → maintenance → auth in one
+    //                       from_fn layer (Phase 18.6)
     //   routes            — native handlers + PHP-FPM proxy
     let trace_layer = TraceLayer::new_for_http()
         .make_span_with(trace::DefaultMakeSpan::new().level(Level::INFO))
         .on_response(trace::DefaultOnResponse::new().level(Level::INFO));
 
-    r.layer(middleware::from_fn_with_state(state.clone(), auth_layer))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            maintenance_guard,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            try_static_files,
-        ))
-        .layer(trace_layer)
+    // Phase 18.6: the three request middlewares (static → maintenance →
+    // auth) run inside ONE from_fn layer — one wrapper chain instead of
+    // three, ~2 fewer wrapper polls per await per request.
+    r.layer(middleware::from_fn_with_state(
+        state.clone(),
+        http_middleware_stack,
+    ))
+    .layer(trace_layer)
         .with_state(state)
 }

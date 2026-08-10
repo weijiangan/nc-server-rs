@@ -74,7 +74,7 @@ The Phase 18 re-profile (`profiles/profile-1786308169.svg`, `profile-1786310260.
 
 Caveat that shapes the next round: the round-2 dumps captured only 256-290 samples over 10 s (~0.3 s of CPU) — the SUT is I/O-bound on the shared Postgres (duty cycle <1%), so the flame graph is dominated by await-side scaffolding and anything below ~1% is ±1-sample noise. All three numbers above are the trustworthy part.
 
-### Task 4 — Consolidate the `from_fn` middleware layers (`nc-server/src/router.rs:284-291`)
+### Task 4 — (done) Consolidate the `from_fn` middleware layers (`nc-server/src/router.rs`)
 
 The DAV routes carry three `from_fn_with_state` layers (auth, maintenance, throttler). Each layer adds ~2 wrapper polls per await (`FromFn::call` + `ResponseFuture::poll` + `Next::run::closure`) plus `MapErr`/`MapIntoResponse` per hop — the `from_fn`-attributable share of the ~30% wrapper machinery is ~3-4% of self CPU in the round-2 flamegraphs (`ResponseFuture::poll` 1.39% + `Next::run` 1.31-1.34% + `FromFn::call` 1.39%, each ~3-4 samples).
 

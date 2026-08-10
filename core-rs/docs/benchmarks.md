@@ -393,6 +393,25 @@ first-run inventory flakes cleared on rerun). Also fixed the pre-existing
 `registry_scans_real_apps_dir` test (it navigated to the repo root — no
 `apps/` — instead of the `workspace/server` PHP submodule).
 
+## Phase 18.4 — middleware consolidation (18.6, 2026-08-10)
+
+The three `from_fn_with_state` request-middleware layers (static files →
+maintenance guard → auth) became one composite `router::http_middleware_stack`
+— one wrapper chain instead of three, ~2 fewer wrapper polls per await per
+request (the round-2 flamegraph's `from_fn`-attributable ~3-4% of self CPU).
+Each middleware was refactored into a check fn with byte-identical early
+returns (`Option<Response>` / `Result<Vec<String>, Response>`, the latter
+carrying the session resolver's Set-Cookie values for post-handler
+forwarding).
+
+**Expected effect**: CPU headroom (~2.5-3% at CPU saturation), not p50 — the
+SUT is I/O-bound. Measured depth-1 PROPFIND 941 req/s / 3.65 ms p50 (within
+the session noise band).
+
+**Verification**: 12 nc-server tests (4 middleware tests now register the
+composite), diff-test 20/20 on the first run, static probes
+`/core/img/actions/add.svg` → 200, `robots.txt` → 200.
+
 ### Concurrent write probe (4 workers, same file, token auth)
 
 | metric | before | after (deadlock fix) |

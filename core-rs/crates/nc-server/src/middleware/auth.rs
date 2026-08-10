@@ -1,8 +1,6 @@
 use axum::{
     body::Body,
-    extract::State,
     http::{Request, StatusCode},
-    middleware::Next,
     response::{IntoResponse, Response},
 };
 
@@ -30,28 +28,30 @@ fn is_dav_path(path: &str) -> bool {
     path.starts_with("/remote.php") || path.starts_with("/dav") || path.starts_with("/public.php")
 }
 
-/// Auth middleware (Phase 3).
-///
-/// Executed AFTER the maintenance guard in axum's layer stack.
+/// Auth check (Phase 3), called from `router::http_middleware_stack` — the
+/// composite that runs static files → maintenance → auth inside ONE `from_fn`
+/// layer (Phase 18.6).  Executed AFTER the maintenance check.
 ///
 /// Behaviour per request:
 /// - Extract credentials from `Authorization` header (Bearer → Basic priority).
 /// - If valid credentials: attach `AuthInfo` extension; update last_activity.
-/// - If invalid credentials: return `401` immediately (brute-force recorded).
+/// - If invalid credentials: return `Err(401)` immediately (brute-force recorded).
 /// - If no credentials: anonymous — no extension attached; handler decides
 ///   whether to require auth.
+///
+/// `Ok(Vec<String>)` carries the session resolver's Set-Cookie values
+/// (remember-me rotation) for the composite to append after the handler.
 #[tracing::instrument(skip_all, level = "debug", fields(method = %req.method(), path = %req.uri().path()))]
-pub async fn auth_layer(
-    State(state): State<AppState>,
-    mut req: Request<Body>,
-    next: Next,
-) -> Response {
+pub async fn auth_check(
+    state: &AppState,
+    req: &mut Request<Body>,
+) -> Result<Vec<String>, Response> {
     let path = req.uri().path().to_string();
     let _method = req.method().as_str().to_string();
 
     // Skip auth processing for /status.php and /heartbeat entirely.
     if matches!(path.as_str(), "/status.php" | "/heartbeat") {
-        return next.run(req).await;
+        return Ok(Vec::new());
     }
 
     // ── Header extraction ─────────────────────────────────────────────────
@@ -134,11 +134,11 @@ pub async fn auth_layer(
             CookieCheck::StrictCheckFailed => {
                 // PHP returns 412 Precondition Failed for strict cookie check
                 // failures (base.php strict cookie check, REQ §7.9.2).
-                return (
+                return Err((
                     StatusCode::PRECONDITION_FAILED,
                     "SameSite cookie check failed",
                 )
-                    .into_response();
+                    .into_response());
             }
             _ => {}
         }
@@ -165,7 +165,7 @@ pub async fn auth_layer(
             .await;
 
             if throttle.should_reject {
-                return build_429(throttle.retry_after_secs);
+                return Err(build_429(throttle.retry_after_secs));
             }
             if let Some(delay) = throttle.delay {
                 tokio::time::sleep(delay).await;
@@ -208,15 +208,15 @@ pub async fn auth_layer(
                                 error = %e,
                                 "2FA check query failed — returning 500"
                             );
-                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
                         }
                     };
                     if cached.token_type != 1 && user_state.twofa_enabled {
-                        return (
+                        return Err((
                             StatusCode::UNAUTHORIZED,
                             "Not Authenticated: 2FA challenge not passed.",
                         )
-                            .into_response();
+                            .into_response());
                     }
 
                     // Phase 7.2: admin group check (cached per uid).
@@ -253,7 +253,7 @@ pub async fn auth_layer(
                         .expect("appconfig lock")
                         .get_bool("oauth2", "enable_oc_clients")
                         && user_agent.contains("mirall");
-                    return build_401(send_www_auth, is_xhr, is_dav, false);
+                    return Err(build_401(send_www_auth, is_xhr, is_dav, false));
                 }
             }
         }
@@ -270,7 +270,7 @@ pub async fn auth_layer(
             .await;
 
             if throttle.should_reject {
-                return build_429(throttle.retry_after_secs);
+                return Err(build_429(throttle.retry_after_secs));
             }
             if let Some(delay) = throttle.delay {
                 tokio::time::sleep(delay).await;
@@ -279,7 +279,7 @@ pub async fn auth_layer(
             match nc_auth::basic::extract_basic(ah) {
                 None => {
                     tracing::debug!(path = %path, "Basic auth header failed to decode (base64/UTF-8/colon)");
-                    return build_401(true, is_xhr, is_dav, false);
+                    return Err(build_401(true, is_xhr, is_dav, false));
                 }
                 Some((login, password)) => {
                     // REQ §4.1/4.2: try app token first, then plain password.
@@ -325,15 +325,15 @@ pub async fn auth_layer(
                                         error = %e,
                                         "2FA check query failed — returning 500"
                                     );
-                                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                                    return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
                                 }
                             };
                             if token_type != 1 && user_state.twofa_enabled {
-                                return (
+                                return Err((
                                     StatusCode::UNAUTHORIZED,
                                     "Not Authenticated: 2FA challenge not passed.",
                                 )
-                                    .into_response();
+                                    .into_response());
                             }
                             // Phase 7.2: admin group check (cached per uid).
                             let is_admin = user_state.is_admin;
@@ -367,7 +367,7 @@ pub async fn auth_layer(
                                 &state.table_prefix,
                             )
                             .await;
-                            return build_401(true, is_xhr, is_dav, false);
+                            return Err(build_401(true, is_xhr, is_dav, false));
                         }
                     }
                 }
@@ -391,7 +391,7 @@ pub async fn auth_layer(
             // `__session_resolve` endpoint and no session cache to populate.
             let (Some(fpm), Some(session_cache)) = (&state.fastcgi, &state.session_cache) else {
                 // PHP-FPM not configured — treat as anonymous.
-                return next.run(req).await;
+                return Ok(Vec::new());
             };
 
             // Find the raw session-cookie value (PHP session cookie keyed on
@@ -402,7 +402,7 @@ pub async fn auth_layer(
                 nc_auth::session::session_cookie_value(&state.instanceid, &cookie_header)
             else {
                 // No session cookies at all — anonymous request.
-                return next.run(req).await;
+                return Ok(Vec::new());
             };
             let raw_val = raw_val.to_owned();
 
@@ -427,7 +427,7 @@ pub async fn auth_layer(
                         // PHP says the session is invalid or unauthenticated.
                         // Fall through as anonymous — the route handler
                         // decides whether to reject with 401.
-                        return next.run(req).await;
+                        return Ok(Vec::new());
                     }
                 }
             };
@@ -449,7 +449,7 @@ pub async fn auth_layer(
             if is_dav
                 && !dav_session_guard(&identity.uid, identity.dav_authenticated_uid.as_deref())
             {
-                return build_401(true, is_xhr, true, false);
+                return Err(build_401(true, is_xhr, true, false));
             }
 
             // Build and return the resolved identity.
@@ -470,21 +470,11 @@ pub async fn auth_layer(
         req.extensions_mut().insert(info);
     }
 
-    let mut resp = next.run(req).await;
-
-    // Forward any Set-Cookie headers from the PHP-FPM session resolver.
-    // These originate from the remember-me token rotation path
-    // (`loginWithCookie()` → `setMagicInCookie()` — §7.9.3/§7.9.4) and
-    // carry the refreshed nc_token / nc_username / nc_session_id cookies
-    // that the browser must receive to stay logged in.
-    for cookie_val in &pending_set_cookies {
-        if let Ok(hv) = axum::http::HeaderValue::from_str(cookie_val) {
-            resp.headers_mut()
-                .append(axum::http::header::SET_COOKIE, hv);
-        }
-    }
-
-    resp
+    // Return the session resolver's Set-Cookie values (remember-me token
+    // rotation — §7.9.3/§7.9.4); `http_middleware_stack` forwards them onto
+    // the response after the handler runs, exactly as the former middleware
+    // did.
+    Ok(pending_set_cookies)
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────
@@ -534,7 +524,7 @@ fn build_429(retry_after_secs: u64) -> Response {
 ///
 /// Extracted as a standalone function solely to allow unit testing without a
 /// live `AppState` or PHP-FPM socket — the logic is otherwise a 3-line match
-/// used exactly once in `auth_layer`.
+/// used exactly once in `auth_check`.
 ///
 /// Returns `true` when the request should be accepted, `false` when it must
 /// be rejected with `401`.
@@ -671,7 +661,10 @@ mod tests {
         let state = make_test_state("oc1abc").await;
         let app = Router::new()
             .route("/dav/files/alice", get(ok_handler))
-            .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::router::http_middleware_stack,
+            ));
 
         let req = Request::builder()
             .method("GET")
@@ -724,7 +717,10 @@ mod tests {
         let state = make_test_state("oc1abc").await;
         let app = Router::new()
             .route("/ocs/v2.php/cloud/capabilities", get(ok_handler))
-            .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::router::http_middleware_stack,
+            ));
 
         // Session cookie present but SameSite guard cookies absent — would be
         // 412 without the OCS-APIRequest bypass.
@@ -749,7 +745,10 @@ mod tests {
         let state = make_test_state("oc1abc").await;
         let app = Router::new()
             .route("/dav/files/alice", get(ok_handler))
-            .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::router::http_middleware_stack,
+            ));
 
         // Valid session cookie + guard cookies, but fastcgi = None.
         let req = Request::builder()
@@ -778,7 +777,10 @@ mod tests {
         let state = make_test_state("oc1abc").await;
         let app = Router::new()
             .route("/remote.php/webdav/", get(ok_handler))
-            .layer(middleware::from_fn_with_state(state.clone(), auth_layer));
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::router::http_middleware_stack,
+            ));
 
         // `oc1abc` session cookie is present (triggers the SameSite check) but
         // neither guard cookie is present → `StrictCheckFailed` → 412.

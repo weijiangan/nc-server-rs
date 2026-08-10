@@ -1,16 +1,15 @@
 use axum::{
     body::Body,
-    http::{Request, Response, StatusCode},
-    middleware::Next,
+    http::{Response, StatusCode},
 };
 
 use crate::state::AppState;
 
-/// Maintenance-mode middleware.
+/// Maintenance-mode check (Phase 18.6).
 ///
 /// When `maintenance = true` in `config/config.php` (read at startup into
-/// `NcConfig`), every route **except** `/status.php` and `/heartbeat` returns:
-///   HTTP 503
+/// `NcConfig`), every route **except** `/status.php` and `/heartbeat` returns
+/// `Some(503)` with:
 ///   X-Nextcloud-Maintenance-Mode: 1
 ///   Retry-After: 120
 ///
@@ -18,22 +17,19 @@ use crate::state::AppState;
 /// plain text.  PHP writes `maintenance` via `SystemConfig::setValue()` to
 /// `config.php` — never to `oc_appconfig` — so checking `NcConfig` is correct.
 /// Toggling maintenance mode while the server is running requires a restart.
-pub async fn maintenance_guard(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    request: Request<Body>,
-    next: Next,
-) -> Response<Body> {
-    let path = request.uri().path().to_owned();
-
+///
+/// Extracted from the former `from_fn` middleware so the three request
+/// middleware layers (static → maintenance → auth) run inside one composite
+/// layer (`router::http_middleware_stack`) instead of three — ~2 fewer
+/// wrapper polls per await per request.  `None` falls through to auth.
+pub async fn maintenance_check(state: &AppState, path: &str) -> Option<Response<Body>> {
     // These two endpoints are always served regardless of maintenance mode.
     if path == "/status.php" || path == "/heartbeat" {
-        return next.run(request).await;
+        return None;
     }
 
-    let is_maintenance = state.nc_config.maintenance;
-
-    if !is_maintenance {
-        return next.run(request).await;
+    if !state.nc_config.maintenance {
+        return None;
     }
 
     // Determine response format based on route prefix.
@@ -61,11 +57,13 @@ pub async fn maintenance_guard(
         "text/plain; charset=UTF-8"
     };
 
-    Response::builder()
-        .status(StatusCode::SERVICE_UNAVAILABLE)
-        .header("Content-Type", content_type)
-        .header("X-Nextcloud-Maintenance-Mode", "1")
-        .header("Retry-After", "120")
-        .body(Body::from(body_text))
-        .expect("maintenance response is well-formed")
+    Some(
+        Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("Content-Type", content_type)
+            .header("X-Nextcloud-Maintenance-Mode", "1")
+            .header("Retry-After", "120")
+            .body(Body::from(body_text))
+            .expect("maintenance response is well-formed"),
+    )
 }
