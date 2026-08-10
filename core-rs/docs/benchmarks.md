@@ -218,6 +218,60 @@ Within run-to-run noise (shared host, no quiescence): a few scenarios −12-30%
 21_bulk −15%, 22_invalid −18%), a few +7-14% (10_put_get, 18_explicit_mtime,
 20_chunked), the rest flat. The differential suite stays 20/20 green.
 
+## Phase 18.1 — depth-1 PROPFIND batching (2026-08-10)
+
+**Problem**: dav-server-rs calls `get_props` per resource, and our `get_props`
+issued ~11 queries per node (load_meta ×2, display name ×2, sharing mask,
+dir counts, share details, share note, comments ×2, system tags, custom
+properties).  A depth-1 PROPFIND on the 9-child bench root issued **~124
+queries** — most of them re-fetching rows `read_dir` already held, or
+re-resolving uid-constant values.
+
+**Fix**: `NcFileSystem` gains a per-request `PropfindBatch` (all maps
+`Arc<Mutex<…>>` because dav-server-rs clones the fs per resource via
+`PropWriter`, and the clones must share one cache).  `read_dir` builds every
+child's `NcMetaData` once and populates the cache with seven batched queries
+(counts `GROUP BY`, shares, notes, comments, system tags, custom properties);
+`get_props` reads the cache — an *in-batch* miss means "no data" (default,
+no query), only nodes *outside* the batch (the depth-0 root, which
+dav-server-rs visits before `read_dir`) fall back to the single-row queries.
+`load_meta` serves children from the cache too.  Writes never run `read_dir`,
+so cache entries cannot go stale within a request.
+
+New row helpers in `row.rs`, each a single `IN (...)` query mirroring its
+single-row counterpart exactly (share_notes batch preserves `stime DESC`
+per-file ordering; comments_unread keeps the correlated read-marker
+subquery): `count_children_batch`, `share_details_batch`, `share_notes_batch`,
+`comments_counts_batch`, `comments_unread_batch`, `system_tags_batch`,
+`custom_properties_batch`.  Each has a SQLite unit test pinning batch ==
+single.
+
+**Measured** (Postgres statement log, one depth-1 PROPFIND on the 9-child
+root): ~124 statements → **~15** (auth ~5 + root singles ~3 + 7 batch
+queries).  Zero per-child queries remain.
+
+**Wall clock**: flat at the bench tree — depth-1 p50 measured 4.10/3.22 ms
+before, 3.81-5.21 ms after across repeated runs (shared-host noise band
+±1 ms; the per-child queries were ~0.01-0.02 ms each on a warm local
+Postgres).  The win is **linear in directory size**: a 100-child directory
+goes from ~1,400 queries to ~25 per depth-1 PROPFIND, and at ~800 req/s the
+change removes ~90k queries/s from the shared Postgres that the PHP-FPM side
+also uses.
+
+**Verification**: differential suite 20/20 green (documented first-run
+`home-root-size`/replay-noise divergences clear on rerun); `nc-dav` unit
+tests 311 pass incl. 6 new batch-vs-single consistency tests; explicit-body
+depth-1 PROPFIND byte-compared against PHP on the same DB — per-path blocks
+identical except the pre-existing etag quote-escaping
+(dav-server-rs emits `"…"`, PHP `&quot;…&quot;`).
+
+**Fixes found along the way**: `get_comments_unread` used the
+Postgres-only typed literal `TIMESTAMP '1970-01-01 00:00:00'` (a silent
+SQLite syntax error); replaced with the portable plain-string literal in
+both the single and batch queries.  Two batch queries initially numbered
+their `IN` placeholders from `$1`, colliding with the earlier-bound `$1`
+(dir-mimetype / userid) — shifted to start at `$2`.
+
 ### Concurrent write probe (4 workers, same file, token auth)
 
 | metric | before | after (deadlock fix) |

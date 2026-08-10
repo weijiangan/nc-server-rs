@@ -376,6 +376,59 @@ pub async fn count_children(
     }
 }
 
+/// Count direct children of a **batch** of directories in a single query,
+/// keyed by parent fileid: `(dir_count, file_count)` per directory.
+///
+/// Used by `read_dir` so depth-1 PROPFIND computes
+/// `{nc:}contained-folder-count` / `{nc:}contained-file-count` for every
+/// child directory with one GROUP BY instead of one query per directory.
+/// Directories with no children are absent from the map (callers fall back
+/// to the single query, which returns `(0, 0)`).
+pub async fn count_children_batch(
+    pool: &DbPool,
+    prefix: &str,
+    parent_ids: &[i64],
+    storage: i64,
+    dir_mimetype_id: i64,
+) -> std::collections::HashMap<i64, (i64, i64)> {
+    if parent_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let n = parent_ids.len();
+    // $1 is the directory mimetype id (bound first); the IN list starts at $2.
+    let placeholders = (2..=n + 1)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT parent, \
+         SUM(CASE WHEN mimetype = $1 THEN 1 ELSE 0 END) AS dirs, \
+         SUM(CASE WHEN mimetype != $1 THEN 1 ELSE 0 END) AS files \
+         FROM {prefix}filecache \
+         WHERE parent IN ({placeholders}) AND storage = ${storage} \
+         GROUP BY parent",
+        prefix = prefix,
+        storage = n + 2,
+    );
+    let mut query = sqlx::query(&sql).bind(dir_mimetype_id);
+    for id in parent_ids {
+        query = query.bind(*id);
+    }
+    query = query.bind(storage);
+    query
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            let parent: i64 = r.get("parent");
+            let dirs: i64 = r.get::<Option<i64>, _>("dirs").unwrap_or(0);
+            let files: i64 = r.get::<Option<i64>, _>("files").unwrap_or(0);
+            (parent, (dirs, files))
+        })
+        .collect()
+}
+
 /// Look up the display name for a user, matching PHP's
 /// `$owner->getDisplayName()` → `User::getDisplayName()`
 /// (`lib/private/User/User.php:84`), which reads the user backend —
@@ -500,6 +553,44 @@ pub async fn get_share_note(pool: &DbPool, prefix: &str, fileid: i64) -> String 
         .unwrap_or_default()
 }
 
+/// Most-recent non-empty share note for a **batch** of files in one query.
+///
+/// Mirrors `get_share_note` (`ORDER BY stime DESC LIMIT 1` per file) via a
+/// single `ORDER BY file_source, stime DESC` — the first row per file in the
+/// result is its most recent note.  Files without a note are absent from the
+/// map (callers fall back to the single query, which returns `""`).
+pub async fn share_notes_batch(
+    pool: &DbPool,
+    prefix: &str,
+    fileids: &[i64],
+) -> std::collections::HashMap<i64, String> {
+    if fileids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let placeholders = (1..=fileids.len())
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT file_source, note FROM {prefix}share \
+         WHERE file_source IN ({placeholders}) AND note != '' \
+         ORDER BY file_source, stime DESC",
+        prefix = prefix,
+    );
+    let mut query = sqlx::query(&sql);
+    for id in fileids {
+        query = query.bind(*id);
+    }
+    let mut notes = std::collections::HashMap::new();
+    for row in query.fetch_all(pool).await.unwrap_or_default() {
+        let file_source: i64 = row.get("file_source");
+        notes
+            .entry(file_source)
+            .or_insert_with(|| row.get("note"));
+    }
+    notes
+}
+
 /// All `oc_filecache` rows in the subtree of `fc_path` whose `mtime >
 /// since_mtime`.
 ///
@@ -596,6 +687,55 @@ pub async fn list_custom_properties(
             )
         })
         .collect()
+}
+
+/// List custom properties for a user and a **batch** of paths in one query.
+///
+/// Same semantics as `list_custom_properties` (including the >250-char path
+/// hash from `format_property_path`); the returned map is keyed by the raw
+/// (unhashed) path as passed in.  Paths without properties are absent.
+pub async fn custom_properties_batch(
+    pool: &DbPool,
+    prefix: &str,
+    userid: &str,
+    paths: &[String],
+) -> std::collections::HashMap<String, Vec<(String, String, i16)>> {
+    if paths.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    // Key the map by the caller's raw path, query by the formatted path.
+    let raw_by_formatted: std::collections::HashMap<String, &str> = paths
+        .iter()
+        .map(|p| (format_property_path(p), p.as_str()))
+        .collect();
+    // $1 is the userid (bound first); the IN list starts at $2.
+    let placeholders = (2..=paths.len() + 1)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT propertypath, propertyname, propertyvalue, valuetype \
+         FROM {prefix}properties \
+         WHERE userid = $1 AND propertypath IN ({placeholders})",
+        prefix = prefix,
+    );
+    let mut query = sqlx::query(&sql).bind(userid);
+    for p in paths {
+        query = query.bind(format_property_path(p));
+    }
+    let mut out: std::collections::HashMap<String, Vec<(String, String, i16)>> =
+        std::collections::HashMap::new();
+    for row in query.fetch_all(pool).await.unwrap_or_default() {
+        let prop_path: String = row.get("propertypath");
+        if let Some(raw) = raw_by_formatted.get(prop_path.as_str()) {
+            out.entry((*raw).to_string()).or_default().push((
+                row.get("propertyname"),
+                row.get("propertyvalue"),
+                row.get("valuetype"),
+            ));
+        }
+    }
+    out
 }
 
 /// Upsert a custom property — delete-then-insert to avoid PK / composite-key
@@ -996,6 +1136,78 @@ pub async fn get_share_details(
         .collect()
 }
 
+/// Share details for a **batch** of files in one query, keyed by fileid.
+///
+/// Same filter and display-name resolution as `get_share_details`; the
+/// per-file row order matches what the single query returns (no ORDER BY).
+/// Files without shares are absent from the map.
+pub async fn share_details_batch(
+    pool: &DbPool,
+    prefix: &str,
+    uid: &str,
+    fileids: &[i64],
+) -> std::collections::HashMap<i64, Vec<ShareDetail>> {
+    if fileids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let n = fileids.len();
+    let placeholders = (1..=n)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT file_source, share_type, share_with \
+         FROM {prefix}share \
+         WHERE file_source IN ({placeholders}) \
+         AND share_type IN (0,1,3,4,6,7,10,12) \
+         AND (uid_owner = ${uid} OR uid_initiator = ${uid} OR share_with = ${uid})",
+        prefix = prefix,
+        uid = n + 1,
+    );
+    let mut query = sqlx::query(&sql);
+    for id in fileids {
+        query = query.bind(*id);
+    }
+    query = query.bind(uid);
+    let rows = match query.fetch_all(pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(uid, error = %e, "share_details_batch: SQL error");
+            return std::collections::HashMap::new();
+        }
+    };
+
+    // Batch-resolve display names for user-type shares (share_type = 0) —
+    // one query for every user across all files, same as the single query.
+    let user_withs: Vec<String> = rows
+        .iter()
+        .filter(|r| r.get::<i16, _>("share_type") == 0)
+        .filter_map(|r| r.get::<Option<String>, _>("share_with"))
+        .collect();
+    let display_names = batch_lookup_display_names(pool, prefix, &user_withs).await;
+
+    let mut out: std::collections::HashMap<i64, Vec<ShareDetail>> =
+        std::collections::HashMap::new();
+    for r in rows {
+        let file_source: i64 = r.get("file_source");
+        let share_type: i16 = r.get("share_type");
+        let share_with: Option<String> = r.get("share_with");
+        let displayname = match share_type {
+            0 => share_with
+                .as_ref()
+                .and_then(|sw| display_names.get(sw.as_str()).cloned())
+                .unwrap_or_else(|| share_with.clone().unwrap_or_default()),
+            _ => share_with.clone().unwrap_or_default(),
+        };
+        out.entry(file_source).or_default().push(ShareDetail {
+            share_type,
+            share_with,
+            share_with_displayname: displayname,
+        });
+    }
+    out
+}
+
 async fn batch_lookup_display_names(
     pool: &DbPool,
     prefix: &str,
@@ -1162,7 +1374,7 @@ pub async fn get_comments_unread(
          AND c.creation_timestamp > COALESCE( \
              (SELECT marker_datetime FROM {prefix}comments_read_markers \
               WHERE user_id = $3 AND object_type = 'files' AND object_id = $4), \
-             TIMESTAMP '1970-01-01 00:00:00' \
+             '1970-01-01 00:00:00' \
          )",
         prefix = prefix
     );
@@ -1177,6 +1389,94 @@ pub async fn get_comments_unread(
         .flatten()
         .flatten()
         .unwrap_or(0)
+}
+
+/// Comment counts for a **batch** of files in one query, keyed by fileid.
+///
+/// Mirrors `get_comments_count`; files without comments are absent from the
+/// map (callers fall back to the single query, which returns 0).
+pub async fn comments_counts_batch(
+    pool: &DbPool,
+    prefix: &str,
+    fileids: &[i64],
+) -> std::collections::HashMap<i64, i64> {
+    if fileids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let placeholders = (1..=fileids.len())
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT object_id, COUNT(*) AS n FROM {prefix}comments \
+         WHERE object_type = 'files' AND object_id IN ({placeholders}) \
+         GROUP BY object_id",
+        prefix = prefix,
+    );
+    let mut query = sqlx::query(&sql);
+    for id in fileids {
+        query = query.bind(id.to_string());
+    }
+    query
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            let object_id: String = r.get("object_id");
+            (object_id.parse::<i64>().unwrap_or(0), r.get::<i64, _>("n"))
+        })
+        .collect()
+}
+
+/// Unread comment counts for a **batch** of files in one query, keyed by fileid.
+///
+/// Mirrors `get_comments_unread` — same actor filter and read-marker
+/// comparison, with the marker subquery correlated per row.  Files with no
+/// unread comments are absent from the map (callers fall back to the single
+/// query, which returns 0).
+pub async fn comments_unread_batch(
+    pool: &DbPool,
+    prefix: &str,
+    fileids: &[i64],
+    uid: &str,
+) -> std::collections::HashMap<i64, i64> {
+    if fileids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let n = fileids.len();
+    let placeholders = (1..=n)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT c.object_id, COUNT(*) AS n FROM {prefix}comments c \
+         WHERE c.object_type = 'files' AND c.object_id IN ({placeholders}) \
+         AND c.actor_type = 'users' AND c.actor_id != ${uid} \
+         AND c.creation_timestamp > COALESCE( \
+             (SELECT marker_datetime FROM {prefix}comments_read_markers m \
+              WHERE m.user_id = ${uid} AND m.object_type = 'files' AND m.object_id = c.object_id), \
+             '1970-01-01 00:00:00' \
+         ) \
+         GROUP BY c.object_id",
+        prefix = prefix,
+        uid = n + 1,
+    );
+    let mut query = sqlx::query(&sql);
+    for id in fileids {
+        query = query.bind(id.to_string());
+    }
+    query = query.bind(uid);
+    query
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            let object_id: String = r.get("object_id");
+            (object_id.parse::<i64>().unwrap_or(0), r.get::<i64, _>("n"))
+        })
+        .collect()
 }
 
 /// Build the `{oc:}comments-href` URL, matching PHP
@@ -1323,6 +1623,52 @@ pub async fn get_system_tags_for_file(
             vec![]
         }
     }
+}
+
+/// System tags for a **batch** of files in one query, keyed by fileid.
+///
+/// Mirrors `get_system_tags_for_file` (user-visible only, sorted by
+/// case-insensitive name); the per-file order matches the single query.
+/// Files without tags are absent from the map.
+pub async fn system_tags_batch(
+    pool: &DbPool,
+    prefix: &str,
+    fileids: &[i64],
+) -> std::collections::HashMap<i64, Vec<SystemTagRow>> {
+    if fileids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let placeholders = (1..=fileids.len())
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT m.objectid, t.id, t.name, t.visibility, t.editable, t.color \
+         FROM {prefix}systemtag t \
+         JOIN {prefix}systemtag_object_mapping m ON m.systemtagid = t.id \
+         WHERE m.objectid IN ({placeholders}) AND m.objecttype = 'files' \
+         AND t.visibility = 1 \
+         ORDER BY LOWER(t.name)",
+        prefix = prefix,
+    );
+    let mut query = sqlx::query(&sql);
+    for id in fileids {
+        query = query.bind(id.to_string());
+    }
+    let mut out: std::collections::HashMap<i64, Vec<SystemTagRow>> =
+        std::collections::HashMap::new();
+    for row in query.fetch_all(pool).await.unwrap_or_default() {
+        let object_id: String = row.get("objectid");
+        let fileid = object_id.parse::<i64>().unwrap_or(0);
+        out.entry(fileid).or_default().push(SystemTagRow {
+            id: row.get("id"),
+            name: row.get("name"),
+            user_visible: row.get::<i16, _>("visibility") == 1,
+            user_assignable: row.get::<i16, _>("editable") == 1,
+            color: row.get("color"),
+        });
+    }
+    out
 }
 
 /// Format system tags as XML matching PHP `SystemTagList::xmlSerialize()`.
@@ -1542,6 +1888,350 @@ mod tests {
         let a = format_property_path(&path);
         let b = format_property_path(&path);
         assert_eq!(a, b);
+    }
+
+    // ── Batch-vs-single consistency (Phase 18.1) ──────────────────────────
+    //
+    // The `*_batch` queries must return exactly what the per-node queries
+    // return; the difftest suite is the real gate, these pin the mapping.
+
+    /// In-memory SQLite with the tables the batch PROPFIND queries read.
+    async fn fresh_batch_db() -> DbPool {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite");
+        sqlx::query(
+            "CREATE TABLE oc_filecache (
+                fileid BIGINT NOT NULL PRIMARY KEY, storage BIGINT NOT NULL,
+                path VARCHAR(4000) NOT NULL DEFAULT '', path_hash VARCHAR(32) NOT NULL DEFAULT '',
+                parent BIGINT NOT NULL DEFAULT 0, name VARCHAR(250),
+                mimetype BIGINT NOT NULL DEFAULT 0, mimepart BIGINT NOT NULL DEFAULT 0,
+                size BIGINT NOT NULL DEFAULT 0, mtime BIGINT NOT NULL DEFAULT 0,
+                storage_mtime BIGINT NOT NULL DEFAULT 0, etag VARCHAR(40),
+                permissions INTEGER NOT NULL DEFAULT 0, checksum VARCHAR(255)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("filecache");
+        sqlx::query(
+            "CREATE TABLE oc_share (
+                id BIGINT NOT NULL PRIMARY KEY, share_type SMALLINT NOT NULL DEFAULT 0,
+                share_with VARCHAR(255), uid_owner VARCHAR(64) NOT NULL DEFAULT '',
+                uid_initiator VARCHAR(64), file_source BIGINT, stime BIGINT NOT NULL DEFAULT 0,
+                note TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("share");
+        sqlx::query(
+            "CREATE TABLE oc_comments (
+                id BIGINT NOT NULL PRIMARY KEY, object_type VARCHAR(64) NOT NULL DEFAULT '',
+                object_id VARCHAR(64) NOT NULL DEFAULT '', actor_type VARCHAR(64) NOT NULL DEFAULT '',
+                actor_id VARCHAR(64) NOT NULL DEFAULT '', creation_timestamp TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("comments");
+        sqlx::query(
+            "CREATE TABLE oc_comments_read_markers (
+                user_id VARCHAR(64) NOT NULL, object_type VARCHAR(64) NOT NULL DEFAULT '',
+                object_id VARCHAR(64) NOT NULL DEFAULT '', marker_datetime TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("markers");
+        sqlx::query(
+            "CREATE TABLE oc_systemtag (
+                id BIGINT NOT NULL PRIMARY KEY, name VARCHAR(255) NOT NULL DEFAULT '',
+                visibility SMALLINT NOT NULL DEFAULT 1, editable SMALLINT NOT NULL DEFAULT 1,
+                color VARCHAR(255)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("systemtag");
+        sqlx::query(
+            "CREATE TABLE oc_systemtag_object_mapping (
+                objectid VARCHAR(64) NOT NULL DEFAULT '', objecttype VARCHAR(64) NOT NULL DEFAULT '',
+                systemtagid BIGINT NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("mapping");
+        sqlx::query(
+            "CREATE TABLE oc_users (uid VARCHAR(64) NOT NULL PRIMARY KEY, displayname VARCHAR(64))",
+        )
+        .execute(&pool)
+        .await
+        .expect("users");
+        sqlx::query(
+            "CREATE TABLE oc_properties (
+                id INTEGER NOT NULL PRIMARY KEY, userid VARCHAR(64) NOT NULL DEFAULT '',
+                propertypath VARCHAR(255) NOT NULL DEFAULT '', propertyname VARCHAR(255) NOT NULL DEFAULT '',
+                propertyvalue TEXT NOT NULL DEFAULT '', valuetype SMALLINT NOT NULL DEFAULT 1
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("properties");
+        pool
+    }
+
+    #[tokio::test]
+    async fn count_children_batch_matches_single() {
+        let pool = fresh_batch_db().await;
+        let prefix = "oc_";
+        // mimetype 2 = directory, 1 = file, all on storage 1.
+        for (id, parent, name, mime) in [
+            (1, 0, "files", 2),
+            (2, 1, "a", 2),     // dir with one subdir + one file
+            (3, 1, "b", 2),     // empty dir
+            (4, 1, "c.txt", 1), // file
+            (5, 2, "x.txt", 1),
+            (6, 2, "sub", 2),
+        ] {
+            sqlx::query(
+                "INSERT INTO oc_filecache (fileid, storage, path, parent, name, mimetype) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(1)
+            .bind(format!("files/{name}"))
+            .bind(parent)
+            .bind(name)
+            .bind(mime)
+            .execute(&pool)
+            .await
+            .expect("insert");
+        }
+        let batch = count_children_batch(&pool, prefix, &[2, 3, 4], 1, 2).await;
+        assert_eq!(batch.get(&2), Some(&(1, 1)), "a: sub + x.txt");
+        assert_eq!(batch.get(&3), None, "empty dir absent");
+        assert_eq!(batch.get(&4), None, "file absent");
+        for id in [2, 3, 4] {
+            let single = count_children(&pool, prefix, id, 1, 2).await;
+            assert_eq!(
+                batch.get(&id).copied().unwrap_or((0, 0)),
+                single,
+                "fileid {id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn share_notes_batch_matches_single() {
+        let pool = fresh_batch_db().await;
+        let prefix = "oc_";
+        for (id, fs, stime, note) in [
+            (1, 10, 100, "old"),
+            (2, 10, 200, "new"),
+            (3, 11, 300, "only"),
+            (4, 12, 400, ""),
+        ] {
+            sqlx::query("INSERT INTO oc_share (id, file_source, stime, note) VALUES (?, ?, ?, ?)")
+                .bind(id)
+                .bind(fs)
+                .bind(stime)
+                .bind(note)
+                .execute(&pool)
+                .await
+                .expect("insert");
+        }
+        let batch = share_notes_batch(&pool, prefix, &[10, 11, 12]).await;
+        assert_eq!(batch.get(&10).map(String::as_str), Some("new"));
+        assert_eq!(batch.get(&11).map(String::as_str), Some("only"));
+        assert_eq!(batch.get(&12), None);
+        for id in [10, 11, 12] {
+            assert_eq!(
+                batch.get(&id).cloned().unwrap_or_default(),
+                get_share_note(&pool, prefix, id).await,
+                "fileid {id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn share_details_batch_matches_single() {
+        let pool = fresh_batch_db().await;
+        let prefix = "oc_";
+        // alice owns files 10/11/12; bob shares his file 11 WITH alice.
+        for (id, stype, swith, owner, init, fs) in [
+            (1, 0, "bob", "alice", "alice", 10),
+            (2, 1, "staff", "alice", "alice", 10),
+            (3, 0, "alice", "bob", "bob", 11),
+            (4, 5, "x", "carol", "carol", 11), // share_type 5 — outside the filter
+            (5, 0, "dave", "alice", "alice", 12),
+        ] {
+            sqlx::query(
+                "INSERT INTO oc_share (id, share_type, share_with, uid_owner, uid_initiator, file_source) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(stype)
+            .bind(swith)
+            .bind(owner)
+            .bind(init)
+            .bind(fs)
+            .execute(&pool)
+            .await
+            .expect("insert");
+        }
+        sqlx::query("INSERT INTO oc_users (uid, displayname) VALUES (?, ?)")
+            .bind("bob")
+            .bind("Robert")
+            .execute(&pool)
+            .await
+            .expect("user");
+        let batch = share_details_batch(&pool, prefix, "alice", &[10, 11, 12]).await;
+        for id in [10, 11, 12] {
+            let single = get_share_details(&pool, prefix, "alice", id).await;
+            let batched = batch.get(&id).cloned().unwrap_or_default();
+            assert_eq!(batched.len(), single.len(), "fileid {id} len");
+            for (b, s) in batched.iter().zip(single.iter()) {
+                assert_eq!(b.share_type, s.share_type, "fileid {id} type");
+                assert_eq!(b.share_with, s.share_with, "fileid {id} with");
+                assert_eq!(
+                    b.share_with_displayname, s.share_with_displayname,
+                    "fileid {id} displayname"
+                );
+            }
+        }
+        // bob's user-share resolves the oc_users displayname; unknown dave falls back.
+        let t10 = batch.get(&10).unwrap();
+        assert!(t10.iter().any(|d| d.share_with_displayname == "Robert"));
+        assert_eq!(batch.get(&12).unwrap()[0].share_with_displayname, "dave");
+    }
+
+    #[tokio::test]
+    async fn comments_batches_match_singles() {
+        let pool = fresh_batch_db().await;
+        let prefix = "oc_";
+        for (id, obj, actor, ts) in [
+            (1, 10, "alice", "2024-01-01 10:00:00"),
+            (2, 10, "bob", "2024-01-02 10:00:00"),
+            (3, 10, "bob", "2024-01-03 10:00:00"),
+            (4, 11, "alice", "2024-01-01 10:00:00"),
+            (5, 12, "bob", "2024-01-05 10:00:00"),
+        ] {
+            sqlx::query(
+                "INSERT INTO oc_comments (id, object_type, object_id, actor_type, actor_id, creation_timestamp) \
+                 VALUES (?, 'files', ?, 'users', ?, ?)",
+            )
+            .bind(id)
+            .bind(obj.to_string())
+            .bind(actor)
+            .bind(ts)
+            .execute(&pool)
+            .await
+            .expect("insert");
+        }
+        // alice has read file 10 up to the day-02 marker: bob's day-03
+        // comment is unread; her own comments are excluded either way.
+        sqlx::query(
+            "INSERT INTO oc_comments_read_markers (user_id, object_type, object_id, marker_datetime) \
+             VALUES (?, 'files', ?, ?)",
+        )
+        .bind("alice")
+        .bind("10")
+        .bind("2024-01-02 10:00:00")
+        .execute(&pool)
+        .await
+        .expect("marker");
+        let counts = comments_counts_batch(&pool, prefix, &[10, 11, 12]).await;
+        let unreads = comments_unread_batch(&pool, prefix, &[10, 11, 12], "alice").await;
+        for id in [10, 11, 12] {
+            let c = counts.get(&id).copied().unwrap_or(0);
+            let u = unreads.get(&id).copied().unwrap_or(0);
+            assert_eq!(c, get_comments_count(&pool, prefix, id).await, "count {id}");
+            assert_eq!(
+                u,
+                get_comments_unread(&pool, prefix, id, "alice").await,
+                "unread {id}"
+            );
+        }
+        assert_eq!(counts.get(&10), Some(&3), "file 10 has 3 comments");
+        assert_eq!(unreads.get(&10), Some(&1), "file 10: only bob@day03 unread");
+        assert_eq!(counts.get(&12), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn system_tags_batch_matches_single() {
+        let pool = fresh_batch_db().await;
+        let prefix = "oc_";
+        for (id, name, vis) in [(1, "Beta", 1), (2, "alpha", 1), (3, "hidden", 0)] {
+            sqlx::query("INSERT INTO oc_systemtag (id, name, visibility, editable) VALUES (?, ?, ?, 1)")
+                .bind(id)
+                .bind(name)
+                .bind(vis)
+                .execute(&pool)
+                .await
+                .expect("tag");
+        }
+        for (obj, tag) in [("10", 1), ("10", 2), ("11", 3)] {
+            sqlx::query(
+                "INSERT INTO oc_systemtag_object_mapping (objectid, objecttype, systemtagid) \
+                 VALUES (?, 'files', ?)",
+            )
+            .bind(obj)
+            .bind(tag)
+            .execute(&pool)
+            .await
+            .expect("map");
+        }
+        let batch = system_tags_batch(&pool, prefix, &[10, 11]).await;
+        for id in [10, 11] {
+            let b = batch.get(&id).cloned().unwrap_or_default();
+            let s = get_system_tags_for_file(&pool, prefix, id).await;
+            assert_eq!(b.len(), s.len(), "len {id}");
+            for (x, y) in b.iter().zip(s.iter()) {
+                assert_eq!(x.id, y.id, "id {id}");
+                assert_eq!(x.name, y.name, "name {id}");
+            }
+        }
+        // file 10: alpha then Beta (LOWER-sorted), hidden tag excluded; file
+        // 11's only tag is hidden → absent from the batch map.
+        let t10 = batch.get(&10).unwrap();
+        assert_eq!(
+            t10.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "Beta"]
+        );
+        assert!(batch.get(&11).is_none());
+    }
+
+    #[tokio::test]
+    async fn custom_properties_batch_matches_single() {
+        let pool = fresh_batch_db().await;
+        let prefix = "oc_";
+        for (p, name, val) in [
+            ("files/a.txt", "{urn:x}one", "<v>1</v>"),
+            ("files/a.txt", "{urn:x}two", "<v>2</v>"),
+            ("files/b.txt", "{urn:x}one", "<v>3</v>"),
+        ] {
+            upsert_custom_property(&pool, prefix, "alice", p, name, val.as_bytes(), 1)
+                .await
+                .expect("upsert");
+        }
+        let paths = vec![
+            "files/a.txt".to_string(),
+            "files/b.txt".to_string(),
+            "files/c.txt".to_string(),
+        ];
+        let batch = custom_properties_batch(&pool, prefix, "alice", &paths).await;
+        for p in ["files/a.txt", "files/b.txt", "files/c.txt"] {
+            let b = batch.get(p).cloned().unwrap_or_default();
+            let s = list_custom_properties(&pool, prefix, "alice", p).await;
+            assert_eq!(b, s, "{p}");
+        }
+        assert_eq!(batch.get("files/a.txt").unwrap().len(), 2);
+        assert!(batch.get("files/c.txt").is_none());
     }
 
     // ── oc_properties CRUD smoke test (SQLite in-memory) ─────────────────
