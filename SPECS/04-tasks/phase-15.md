@@ -4,7 +4,7 @@ Task tracking for [`SPECS/03-implementation-plan/plan/15-edge-security-hardening
 
 ## Wave 0 — Decision spikes
 
-- [x] **0.1 Session resolution: direct store read vs. hardened round-trip — DECIDED 2026-08-10 (go, conditional).** Session files are encrypted (`encrypted_session_data|s:N:"cipher|iv|hmac|3"`, plaintext = JSON); the `oc_sessionPassphrase` cookie is the plaintext passphrase; decryption needs a phpseclib-exact crypto port (HKDF-SHA512 + PBKDF2 quirk + AES-CBC + HMAC) pinned against a live session file. Direct read it is — first milestone: decrypt a captured real session file in a test.
+- [x] **0.1 Session resolution: direct store read vs. hardened round-trip — DECIDED 2026-08-10 (feasible, NOT worth it — hardened round-trip).** Evidence: session files are encrypted (`encrypted_session_data|s:N:"cipher|iv|hmac|3"`, plaintext = JSON), the `oc_sessionPassphrase` cookie is the plaintext passphrase, decryption needs a phpseclib-exact port. Decided against: it serves only browser requests (sync = app tokens unaffected), pins an undocumented PHP runtime format (crypto exactness = silent wrong identity), and requires a shared session path in split topologies. F3 → negative caching + concurrency cap; revocation → cache-TTL knob.
 - [x] **0.2 Verify PHP-FPM `$_COOKIE` population — DECIDED 2026-08-10.** FPM DOES populate `$_COOKIE` (probe dumped `["probe"=>"1","session"=>"sess123"]`); the shim's manual parse is redundant — keep as defense-in-depth, correct the comment.
 
 ## Wave 1 — Production gate
@@ -15,7 +15,7 @@ Task tracking for [`SPECS/03-implementation-plan/plan/15-edge-security-hardening
 
 ## Wave 2 — Resource governance
 
-- [ ] **2.1 Session-resolution exhaustion (F3).** Per the 0.1 decision (direct read): no negative caching needed on the direct path; keep the concurrency cap on the remember-me `__session_resolve` call; drop the positive session cache (revocation lag → ~0).
+- [ ] **2.1 Session-resolution exhaustion (F3).** Hardened round-trip in full: negative caching (5 s TTL) of failed `__session_resolve` results, concurrency semaphore (`pm.max_children / 2`), optional per-IP rate limit; keep the positive session cache (revocation knob: TTL 60 s → 10-15 s).
 - [ ] **2.2 Body limits with correct status (F4).** 413 (not 502) on `to_bytes` overflow; global in-flight body semaphore (documented RSS ceiling, 503 + `Retry-After: 1` beyond it).
 - [ ] **2.3 Response-body deadline (F5).** Per-chunk idle timeout on `CgiBodyStream` (60 s default, `fastcgi_timeout_ms`-adjacent config); delete the wrong "transport enforces it" comment.
 - [ ] **2.4 CGI header accumulator cap (F8, partial).** 64 KiB cap while scanning for `\r\n\r\n`; overflow → 502 + `warn!`.
@@ -32,4 +32,5 @@ Task tracking for [`SPECS/03-implementation-plan/plan/15-edge-security-hardening
 
 ## Changes
 
+- **2026-08-10 — 0.1 revised: feasible, not worth it.** The spike proved the direct session read is implementable (encrypted store, plaintext passphrase cookie, phpseclib port needed) but the goal analysis landed on the hardened round-trip: browser-only benefit, PHP-internal format coupling, deployment constraint. Wave 2.1 = negative caching + concurrency cap + TTL knob.
 - **2026-08-10 — 1.1 closed by the Phase 18.1 whitelist; task doc created.** The static whitelist (a Phase 18 *performance* change) mechanically satisfies F1: only `/core /dist /themes /apps` + `robots.txt` + `index.html` are served, 404 before the fs stat, strictly stronger than the proposed deny list. The security property is currently an unasserted side effect — the 1.1-remainder item promotes it to tested invariants. Task doc records waves 0-3 + corpus as checkboxes.

@@ -70,7 +70,7 @@ Decision criteria:
 - **Go** if the file-store reader is correct across PHP's session serialization edge cases (lazy write, `session_regenerate_id` rename races, locked-session semantics — PHP holds an exclusive lock on `sess_{id}` while a request runs; Rust reads must tolerate partial/locked files): implement the direct read; keep `__session_resolve` only for the remember-me (`nc_token`) path, which must run PHP's `loginWithCookie()` for token rotation side effects.
 - **No-go** if the serialization/locking edge cases prove fragile: harden the round-trip instead (Wave 2.1, in full).
 
-### 0.1 DECISION (2026-08-10) — Go, conditional: direct file read, with a crypto port
+### 0.1 DECISION (2026-08-10, revised) — Feasible but NOT worth it: hardened round-trip selected
 
 Experiment evidence:
 
@@ -90,16 +90,35 @@ Experiment evidence:
   not from memory); AES-CBC; encrypt-then-MAC: HMAC-SHA512 over
   hex(cipher)+hex(iv); blob version `3`.
 
-**Decision**: implement the direct read. Rust has the cookie + config secret;
-the primitives are standard (hkdf, hmac, sha2, aes, cbc, pbkdf2). The **new
-cost the original spike did not anticipate is the crypto port** — it must match
-phpseclib byte-for-byte, so the first milestone is a test that decrypts a real
-captured session file. Lock semantics are acceptable: PHP's exclusive flock
-means the reader sees the last *committed* state (correct revocation
-semantics — a revoking request's changes appear once it commits); partial
-writes fail the parse → bounded retry. Keep `__session_resolve` for the
-remember-me path only. Wave 2.1 shrinks accordingly (no negative caching
-needed on the direct path; keep the concurrency cap on the remember-me call).
+**First verdict (2026-08-10):** go, conditional — the port is implementable
+(Rust has the cookie + config secret; hkdf/hmac/sha2/aes/cbc/pbkdf2 are
+standard; lock semantics are acceptable — PHP's exclusive flock means the
+reader sees the last *committed* state, partial writes fail the parse →
+bounded retry).
+
+**Revised verdict (2026-08-10): do not build the direct read.** Weighed
+against the project goals, the cost exceeds the benefit:
+
+1. It serves only cookie-authenticated **browser** requests — sync clients
+   (app tokens) never touch the session resolver, and the 60 s positive cache
+   already amortizes the PHP bootstrap to ≤1 per session per minute. The perf
+   goal's primary audience is unaffected.
+2. It pins an **undocumented, version-coupled PHP runtime format** (session
+   serialization + phpseclib crypto). The parity corpus cannot diff it (it is
+   not HTTP behavior), and crypto exactness is unforgiving — a wrong byte is a
+   silent wrong identity, not a red test.
+3. **Deployment constraint**: Rust must read PHP-FPM's session files — a
+   shared, permission-accessible session path in any topology where the two
+   are not co-located.
+
+The two problems it would solve have cheaper fixes in the hardened path:
+- F3 (exhaustion) → 2.1 negative caching + concurrency cap (pure Rust, no
+  format coupling).
+- Revocation lag → the positive cache TTL is a knob (60 s → 10-15 s).
+
+**Consequence**: Wave 2.1 is the hardened round-trip in full (negative
+caching + concurrency cap + optional per-IP rate limit); `__session_resolve`
+stays the session path.
 
 ### 0.2 DECISION (2026-08-10) — FPM DOES populate `$_COOKIE`; the shim's manual parse is redundant
 
@@ -202,9 +221,8 @@ Depends on Wave 1.2 only for per-IP rate limiting (2.1, optional); 2.2-2.4 are i
 
 ### 2.1 Session-resolution exhaustion (F3)
 
-If Wave 0.1 decided **go** (direct store read), this section shrinks to: keep `__session_resolve` for the remember-me path only, cap its concurrency (below), and delete the positive session cache (revocation lag → ~0).
-
-If **no-go**, harden the round-trip:
+**DECIDED (Wave 0.1): no-go on the direct store read** — the hardened
+round-trip in full:
 1. **Negative caching:** cache `uid: null` results under the same SHA-256 cookie key with a short TTL — initial value 5 s, tunable; long enough to absorb an attacker's request burst, short enough that a just-completed PHP login is barely delayed. This alone kills the amplification: repeated junk-cookie requests hit memory, not FPM.
 2. **Concurrency cap:** `tokio::sync::Semaphore` around `resolve_session` with permits ≈ `pm.max_children / 2` (configurable) — FPM-saturating traffic must not be able to come entirely from resolution. Excess waits with a bounded timeout, then falls through anonymous.
 3. **Optional, needs Wave 1.2:** per-IP resolution rate limit reusing the brute-force machinery under a distinct action key (`session_resolve`). Skip if negative caching + semaphore prove sufficient under load — don't add throttle-key semantics speculatively.
