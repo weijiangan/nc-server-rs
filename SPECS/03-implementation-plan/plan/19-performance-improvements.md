@@ -163,7 +163,7 @@ PROPFIND, latency unchanged on the local hot DB — the win materializes on
 slower storage where each round trip costs ms). The remaining per-request
 work, ranked for a slow-disk / low-CPU deployment:
 
-### Task 11 — Throttle the `last_activity` UPDATE to PHP's interval (parity + write removal)
+### Task 11 — (done) Throttle the `last_activity` UPDATE to PHP's interval (parity + write removal)
 
 Verified against the PHP reference: `PublicKeyTokenProvider::updateTokenActivity`
 (`lib/private/Authentication/Token/PublicKeyTokenProvider.php:296`) writes only
@@ -175,7 +175,7 @@ when `last_activity < now − token_auth_activity_update` (system value, **defau
 the token lookup + cache entry, and skip the update when within the 60 s
 window. Net: ~1 write/60 s per token instead of 1/request; also a parity fix.
 
-### Task 12 — Fold `sharing_disabled` + display name into `cached_user_state`
+### Task 12 — (done) Fold `sharing_disabled` + display name into `cached_user_state`
 
 `sharing_disabled_for_user` runs 2-3 queries per PROPFIND root:
 `oc_appconfig` `shareapi_exclude_groups` + `shareapi_exclude_groups_list`
@@ -185,7 +185,7 @@ the 60 s TTL cache next to the admin check). The `{oc:}owner-display-name`
 lookup (uid-only) joins the same cache entry. Net: ~3 queries off every
 PROPFIND root, depth-0 and depth-1 alike.
 
-### Task 13 — Raise the bruteforce COUNT cache TTL (2 s → 30-60 s)
+### Task 13 — (done) Raise the bruteforce COUNT cache TTL (2 s → 30-60 s)
 
 At low request rates the 2 s TTL (Phase 18.3) still pays both COUNT queries on
 nearly every request. The staleness argument that justified 2 s (counts change

@@ -515,67 +515,6 @@ pub async fn count_children_batch(
         .collect()
 }
 
-/// Look up the display name for a user, matching PHP's
-/// `$owner->getDisplayName()` → `User::getDisplayName()`
-/// (`lib/private/User/User.php:84`), which reads the user backend —
-/// `oc_users.displayname` — and falls back to the UID.
-///
-/// `oc_accounts.data` (JSON `{"displayname":{"value":…}}`) is consulted only
-/// as a secondary source: the AccountManager populates it from
-/// `$user->getDisplayName()` via an event-driven sync
-/// (`lib/private/Accounts/AccountManager.php:665-666`), so it can lag the
-/// backend (e.g. right after `occ user:setting … displayName`). Reading it
-/// first — as an earlier revision did — serves the stale value and diverges
-/// from PHP.
-pub async fn lookup_user_display_name(pool: &DbPool, prefix: &str, uid: &str) -> String {
-    // 1. oc_users.displayname — PHP's primary source (User::getDisplayName →
-    //    backend GET_DISPLAYNAME).
-    let users_sql = format!("SELECT displayname FROM {prefix}users WHERE uid = $1");
-    if let Ok(Some(dn)) = sqlx::query_scalar::<_, Option<String>>(&users_sql)
-        .bind(uid)
-        .fetch_optional(pool)
-        .await
-    {
-        if let Some(dn) = dn {
-            if !dn.is_empty() {
-                return dn;
-            }
-        }
-    }
-
-    // 2. Fall back to oc_accounts.data (PHP IAccountManager), which the
-    //    AccountManager syncs from the backend but which can lag it.
-    let accounts_sql = format!("SELECT data FROM {prefix}accounts WHERE uid = $1");
-    let accounts_data: Option<String> = sqlx::query_scalar(&accounts_sql)
-        .bind(uid)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-    if let Some(ref data) = accounts_data {
-        if let Some(dn) = extract_displayname_from_accounts_json(data) {
-            return dn;
-        }
-    }
-
-    // 3. Fall back to UID.
-    uid.to_string()
-}
-
-/// Extract the display name from an `oc_accounts.data` JSON value.
-///
-/// PHP stores: `{"displayname":{"value":"Tan Siew Kin","scope":"...","verified":"0"},...}`
-fn extract_displayname_from_accounts_json(data: &str) -> Option<String> {
-    // Use simple JSON parsing via serde_json.
-    let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
-    parsed
-        .get("displayname")?
-        .get("value")?
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
 /// Look up the string ID for a storage row by its numeric ID.
 ///
 /// Used in `get_props()` to determine whether a file's storage is a home
@@ -998,95 +937,6 @@ pub async fn update_custom_properties_path_subtree(
 
 // ─── Phase 12.3: sharing mask (PHP SetupManager sharing_mask wrapper) ─────────
 
-/// Check whether sharing is disabled for a user, replicating PHP
-/// `ShareDisableChecker::sharingDisabledForUser()`.
-///
-/// Reads `shareapi_exclude_groups` and `shareapi_exclude_groups_list` from
-/// `oc_appconfig`, then checks the user's group membership in `oc_group_user`.
-///
-/// PHP's `sharing_mask` storage wrapper (`SetupManager.php:176-189`) wraps
-/// storages with `PermissionsMask(mask=PERMISSION_ALL-SHARE=15)` whenever this
-/// returns `true`, stripping the SHARE bit from every cache read.  Rust must
-/// replicate this check so permissions match PHP byte-for-byte.
-pub async fn sharing_disabled_for_user(pool: &DbPool, prefix: &str, uid: &str) -> bool {
-    // Read shareapi_exclude_groups from oc_appconfig.
-    let key = "shareapi_exclude_groups";
-    let sql = format!(
-        "SELECT configvalue FROM {prefix}appconfig WHERE appid = 'core' AND configkey = $1"
-    );
-    let exclude_groups: Option<String> = sqlx::query_scalar(&sql)
-        .bind(key)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-
-    match exclude_groups.as_deref() {
-        None | Some("no") | Some("") => {
-            // Sharing is not restricted by group — enabled for everyone.
-            false
-        }
-        Some(mode @ ("yes" | "allow")) => {
-            // Read the group list.
-            let list_sql = format!(
-                "SELECT configvalue FROM {prefix}appconfig WHERE appid = 'core' AND configkey = 'shareapi_exclude_groups_list'"
-            );
-            let list_val: Option<String> = sqlx::query_scalar(&list_sql)
-                .fetch_optional(pool)
-                .await
-                .ok()
-                .flatten();
-
-            let excluded_groups: Vec<String> = match list_val.as_deref() {
-                Some(s) if !s.is_empty() => {
-                    // PHP tries json_decode first, then explodes on comma.
-                    serde_json::from_str::<Vec<String>>(s)
-                        .unwrap_or_else(|_| s.split(',').map(|g| g.trim().to_string()).collect())
-                }
-                _ => vec![],
-            };
-
-            if excluded_groups.is_empty() {
-                return false;
-            }
-
-            // Query the user's group memberships.
-            let groups_sql = format!("SELECT gid FROM {prefix}group_user WHERE uid = $1");
-            let user_groups: Vec<String> = match sqlx::query_scalar::<_, String>(&groups_sql)
-                .bind(uid)
-                .fetch_all(pool)
-                .await
-            {
-                Ok(g) => g,
-                Err(_) => return false,
-            };
-
-            if mode == "allow" {
-                // Allowlist: sharing allowed only if user is in at least one allowed group.
-                // If user is in no groups at all, they can't be in an allowed group → disabled.
-                let in_allowed = user_groups.iter().any(|g| excluded_groups.contains(g));
-                !in_allowed
-            } else {
-                // Exclude mode: sharing disabled only if ALL user groups are excluded.
-                // PHP: if (!empty($usersGroups)) guards the diff; empty groups → falls
-                // through to return false (sharing NOT disabled).
-                if user_groups.is_empty() {
-                    false
-                } else {
-                    user_groups.iter().all(|g| excluded_groups.contains(g))
-                }
-            }
-        }
-        Some(other) => {
-            tracing::warn!(
-                %other,
-                "unexpected value for shareapi_exclude_groups; treating as sharing enabled"
-            );
-            false
-        }
-    }
-}
-
 /// Apply the sharing mask to raw `oc_filecache.permissions`, matching PHP's
 /// `PermissionsMask` storage wrapper (`SetupManager.php:176-189`).
 ///
@@ -1385,6 +1235,20 @@ async fn batch_lookup_display_names(
     }
 
     display_names
+}
+
+/// Extract the display name from an `oc_accounts.data` JSON value.
+///
+/// PHP stores: `{"displayname":{"value":"Tan Siew Kin","scope":"...","verified":"0"},...}`
+fn extract_displayname_from_accounts_json(data: &str) -> Option<String> {
+    // Use simple JSON parsing via serde_json.
+    let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
+    parsed
+        .get("displayname")?
+        .get("value")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// Format share types as XML matching PHP `ShareTypeList::xmlSerialize()`.

@@ -30,8 +30,10 @@ const MAX_DELAY_MS: u64 = 25_000;
 /// Phase 18: per-(action, subnet) count cache.  The two COUNT queries run on
 /// every request; the counts only change when `record_attempt` inserts a row,
 /// so a short TTL is safe — the DB stays the source of truth on miss, and a
-/// ≤2 s staleness on the exponential delay formula is immaterial.
-const COUNT_CACHE_TTL: Duration = Duration::from_secs(2);
+/// ≤30 s staleness on the exponential delay formula is immaterial (round-4
+/// Task 13 raised the TTL from 2 s so low-cadence servers — where requests
+/// are spaced beyond the old window — do not re-query on every request).
+const COUNT_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Cached counts: (short-window count, long-window count, cached_at).
 type CountEntry = (i64, i64, Instant);

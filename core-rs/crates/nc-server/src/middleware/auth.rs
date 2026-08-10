@@ -181,9 +181,11 @@ pub async fn auth_layer(
             .await
             {
                 Some(cached) => {
-                    // Fire-and-forget last_activity update (task 3.4).
+                    // Fire-and-forget last_activity update (task 3.4),
+                    // throttled to PHP's 60 s interval (round-4 Task 11).
                     nc_auth::bearer::spawn_last_activity_update(
                         cached.id,
+                        cached.last_activity,
                         state.pool.clone(),
                         state.table_prefix.clone(),
                     );

@@ -359,6 +359,40 @@ req/s / 2.27 ms; capabilities 1669 req/s; status.php 2227 req/s.
 55 nc-auth tests (incl. cache-serves-after-DB-flip); **diff-test 20/20 on
 the first run** — no restart-flake this round.
 
+## Phase 18.3 — round-4 per-request query reductions (2026-08-10)
+
+Three remaining per-request costs, planned in `19-performance-improvements.md`
+§Round 4, all landed:
+
+1. **`last_activity` write-back throttled to PHP's interval** (nc-auth
+   `spawn_last_activity_update`): PHP's `PublicKeyTokenProvider::updateTokenActivity`
+   writes at most once per `token_auth_activity_update` (default 60 s, clamp
+   0-300); Rust wrote on **every** authenticated request — a DB write per
+   request (a seek + journal write on slow storage). The middleware now passes
+   the cached `last_activity` and the update is skipped within the 60 s window.
+2. **Sharing mask + display name folded into `cached_user_state`**: the
+   `shareapi_exclude_groups` config, the group-membership query, and the
+   `oc_users` → `oc_accounts.data` display-name lookup moved from nc-dav's
+   per-request once-caches into the 60 s TTL user-state cache (SQL ported
+   verbatim — allow/exclude modes, unknown-value warn, accounts-JSON fallback
+   preserved). The `PropfindBatch` once-cache fields were removed.
+3. **Bruteforce COUNT cache TTL 2 s → 30 s**: at low request cadence the old
+   window re-queried on nearly every request; staleness is immaterial for the
+   exponential delay.
+
+**Measured** (Postgres statement log, warm depth-1 PROPFIND): no display-name
+or sharing-config queries (TTL cache serves them); no `last_activity` UPDATEs
+in the window. Statement floor per request class unchanged in count but the
+remaining set is now: auth (token lookup + cached user state + bruteforce
+counts every 30 s) + read_dir batch + the root's 8 documented per-file
+singles.
+
+**Verification**: 56 nc-auth tests (incl. allow-mode sharing and the
+accounts-JSON display-name fallback) + 312 nc-dav tests; diff-test 20/20 (two
+first-run inventory flakes cleared on rerun). Also fixed the pre-existing
+`registry_scans_real_apps_dir` test (it navigated to the repo root — no
+`apps/` — instead of the `workspace/server` PHP submodule).
+
 ### Concurrent write probe (4 workers, same file, token auth)
 
 | metric | before | after (deadlock fix) |

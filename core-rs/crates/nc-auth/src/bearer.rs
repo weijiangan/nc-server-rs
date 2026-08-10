@@ -143,12 +143,30 @@ pub fn evict(raw_token: &str, app_secret: &str, token_cache: &SharedTokenCache) 
 
 /// Fire-and-forget `oc_authtoken.last_activity` update (3.4).
 ///
-/// Spawns a `tokio` task; the caller is never delayed.
-pub fn spawn_last_activity_update(token_id: i64, pool: DbPool, prefix: String) {
+/// Spawns a `tokio` task; the caller is never delayed.  Throttled to
+/// [`ACTIVITY_UPDATE_INTERVAL`] like PHP (round-4 Task 11).
+pub fn spawn_last_activity_update(token_id: i64, last_activity: i64, pool: DbPool, prefix: String) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if now - last_activity < ACTIVITY_UPDATE_INTERVAL {
+        return;
+    }
     tokio::spawn(async move {
         update_last_activity(token_id, &pool, &prefix).await;
     });
 }
+
+/// Interval for the async `oc_authtoken.last_activity` write-back — PHP
+/// parity.  PHP's `PublicKeyTokenProvider::updateTokenActivity`
+/// (lib/private/Authentication/Token/PublicKeyTokenProvider.php:296) writes at
+/// most once per `token_auth_activity_update` (system value, default 60 s,
+/// clamped 0-300); Rust used to write on every authenticated request — a DB
+/// write per request PHP would not do for a minute (a seek + journal write per
+/// request on slow storage).  The check uses the cached `last_activity`
+/// (≤ token-cache TTL stale), so the write rate is at most ~1/60 s per token.
+const ACTIVITY_UPDATE_INTERVAL: i64 = 60;
 
 /// Blocking portion of the last_activity update (called from the spawned task).
 pub async fn update_last_activity(token_id: i64, pool: &DbPool, prefix: &str) {

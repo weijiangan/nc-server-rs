@@ -119,11 +119,6 @@ pub(crate) struct PropfindBatch {
     /// `fc_path` → metadata, keyed trailing-slash-normalized.  Serves
     /// `load_meta` so `get_props` never re-fetches a row `read_dir` holds.
     pub(crate) meta: Arc<Mutex<HashMap<String, NcMetaData>>>,
-    /// Resolved once per request: the `oc_users`/`oc_accounts` display name
-    /// of `uid` (`{oc:}owner-display-name`).
-    pub(crate) display_name: Arc<Mutex<Option<String>>>,
-    /// Resolved once per request: `shareapi_exclude_groups` state for `uid`.
-    pub(crate) sharing_disabled: Arc<Mutex<Option<bool>>>,
     /// fileid → (dir_count, file_count) for `{nc:}contained-*-count`.
     pub(crate) dir_counts: Arc<Mutex<HashMap<i64, (i64, i64)>>>,
     /// fileid → share rows for `{oc:}share-types` / `{nc:}sharees`.
@@ -2507,35 +2502,30 @@ impl DavFileSystem for NcFileSystem {
                 (0, 0)
             };
 
-            // Resolve {oc:}owner-display-name: oc_users.displayname, then oc_accounts, then UID (REQ §6.5 / §4.8).
-            // Falls back to the raw UID when no display name is set.
-            // Phase 18.1: the value depends only on `uid`, so resolve once
-            // per request instead of once per node.
-            let owner_display_name = {
-                let cached = self
-                    .propfind_batch
-                    .display_name
-                    .lock()
-                    .expect("propfind batch lock")
-                    .clone();
-                match cached {
-                    Some(d) => d,
-                    None => {
-                        let d = row::lookup_user_display_name(
-                            &self.state.pool,
-                            &self.state.table_prefix,
-                            &self.uid,
-                        )
-                        .await;
-                        *self
-                            .propfind_batch
-                            .display_name
-                            .lock()
-                            .expect("propfind batch lock") = Some(d.clone());
-                        d
-                    }
+            // Resolve {oc:}owner-display-name and the sharing mask from the
+            // per-uid user-state cache (round-4 Task 12): the auth middleware
+            // resolved the entry earlier in the request, so this is a cache
+            // hit; on failure default to uid / sharing-enabled with a warning.
+            let user_state = nc_auth::cached_user_state(
+                &self.uid,
+                &self.state.pool,
+                &self.state.table_prefix,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    uid = %self.uid,
+                    error = %e,
+                    "user-state resolution failed — defaulting"
+                );
+                nc_auth::UserState {
+                    is_admin: false,
+                    twofa_enabled: false,
+                    sharing_disabled: false,
+                    display_name: self.uid.clone(),
                 }
-            };
+            });
+            let owner_display_name = user_state.display_name.clone();
 
             // ── Phase 7.6: is_mounted, share_permissions, download_url, note ──
             //
@@ -2565,33 +2555,9 @@ impl DavFileSystem for NcFileSystem {
             // storage wrapper.  When sharing is disabled via shareapi config, the
             // SHARE bit is stripped from ALL cache reads; when sharing is enabled
             // (the normal case) this is a passthrough.
-            // Phase 18.1: the sharing mask is uid-only — resolve once per
-            // request instead of once per node.
-            let sharing_disabled = {
-                let cached = self
-                    .propfind_batch
-                    .sharing_disabled
-                    .lock()
-                    .expect("propfind batch lock")
-                    .clone();
-                match cached {
-                    Some(s) => s,
-                    None => {
-                        let s = row::sharing_disabled_for_user(
-                            &self.state.pool,
-                            &self.state.table_prefix,
-                            &self.uid,
-                        )
-                        .await;
-                        *self
-                            .propfind_batch
-                            .sharing_disabled
-                            .lock()
-                            .expect("propfind batch lock") = Some(s);
-                        s
-                    }
-                }
-            };
+            // Round-4 Task 12: from the per-uid user-state cache (resolved
+            // above with the display name).
+            let sharing_disabled = user_state.sharing_disabled;
             let effective_permissions = row::apply_sharing_mask(meta.permissions, sharing_disabled);
 
             // NOTE (correction, 2026-07-31): an earlier revision unconditionally
