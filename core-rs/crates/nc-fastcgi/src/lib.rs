@@ -1447,14 +1447,14 @@ mod tests {
 
     /// Verify the registry correctly scans the real apps/ tree in this repo.
     ///
-    /// This test uses the actual `apps/` directory committed to the repository
-    /// (located at `{workspace_root}/../../..` relative to the crate manifest
-    /// directory `core-rs/crates/nc-fastcgi/`).
+    /// This test uses the actual `apps/` directory of the pinned PHP reference
+    /// submodule (located at `{workspace_root}/../../../workspace/server`
+    /// relative to the crate manifest directory `core-rs/crates/nc-fastcgi/`).
     #[test]
     fn registry_scans_real_apps_dir() {
-        // Navigate from core-rs/crates/nc-fastcgi/ → nc-server root
+        // Navigate from core-rs/crates/nc-fastcgi/ → workspace/server
         let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let nc_root = crate_dir.join("../../..").canonicalize().unwrap();
+        let nc_root = crate_dir.join("../../../workspace/server").canonicalize().unwrap();
 
         let entries = build_route_registry(&nc_root);
 
