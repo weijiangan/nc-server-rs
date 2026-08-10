@@ -80,17 +80,48 @@ async fn try_static_files_check(
 /// handler in the original auth middleware and does the same here.
 pub(crate) async fn http_middleware_stack(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    // 1. Static files (outermost — bypasses auth; JS/CSS/images are public).
+    // Phase 15 F2: resolve the client identity once per request — ported
+    // from PHP's Request (getRemoteAddress/getServerProtocol/
+    // getInsecureServerHost) — and enforce trusted domains (base.php:872-912).
+    let identity = crate::client_identity::resolve(&req.headers(), peer.ip(), &state.nc_config);
+
+    // 1. Static files (outermost — bypasses auth, enforcement, maintenance;
+    //    JS/CSS/images are public, exactly like the webserver serving them
+    //    before PHP boots).
     if let Some(resp) = try_static_files_check(&state, &mut req).await {
         return resp;
+    }
+    // 1b. Trusted-domain enforcement (PHP runs it inside OC::init for every
+    //     booted request).  The css exemption mirrors PATH_INFO semantics:
+    //     a leading /index.php script segment is stripped first.
+    {
+        let path = req.uri().path();
+        let path_info = path.strip_prefix("/index.php").unwrap_or(path);
+        let uri_with_query = match req.uri().query() {
+            Some(q) => format!("{path}?{q}"),
+            None => path.to_string(),
+        };
+        if let Some(resp) = crate::client_identity::trusted_domains_response(
+            &state.nc_config,
+            peer.ip(),
+            &req.headers(),
+            &uri_with_query,
+            path_info,
+        ) {
+            return resp;
+        }
     }
     // 2. Maintenance guard (503 except /status.php, /heartbeat).
     if let Some(resp) = maintenance_check(&state, req.uri().path()).await {
         return resp;
     }
+    // The identity is consumed by auth (throttle key, SameSite is_https) and
+    // the FastCGI proxy (REMOTE_ADDR / SERVER_NAME / SERVER_PORT / HTTPS).
+    req.extensions_mut().insert(identity);
     // 3. Auth (bearer/basic/session) — attaches `AuthInfo` or rejects.
     let set_cookies = match auth_check(&state, &mut req).await {
         Ok(cookies) => cookies,

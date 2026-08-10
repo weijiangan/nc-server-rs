@@ -476,3 +476,22 @@ pre-locking the parent rows `FOR UPDATE … ORDER BY path_hash` inside an
 explicit transaction (Postgres only; SQLite has whole-file locking). Stalls and
 pool churn gone; residual p50 is lock serialization on the shared directory
 row — inherent to concurrent same-directory writes, not a Rust artifact.
+
+## Phase 15.1.2 — trusted proxies + client identity (F2, 2026-08-10)
+
+Native port of PHP's client-identity resolution (`Request::getRemoteAddress` /
+`getServerProtocol` / `getInsecureServerHost`, `IpUtils::checkIp` CIDR
+matching, `TrustedDomainHelper` wildcards) in `client_identity.rs`, consumed
+by the auth middleware (throttle key, SameSite scheme) and the FastCGI proxy
+(`REMOTE_ADDR`/`SERVER_NAME`/`SERVER_PORT`/`HTTPS`). Trusted-domain
+enforcement for native routes mirrors `base.php:872-912` with the exact
+`{"error": "Trusted domain error.", "code": 15}` body.
+
+**Live-verified** (A/B against the PHP oracle): spoofed `X-Forwarded-For` from
+an untrusted peer is ignored (records the real peer); trusted-proxy XFF honors
+the rightmost untrusted entry; an untrusted `Host` → 400 with the exact JSON
+body on `/status.php` while DAV paths stay reachable (matching PHP, which
+exempts `remote.php`).
+
+**Not a perf change** — identity resolution is a per-request constant (~µs of
+header parsing); the diff-test suite's per-scenario cost is unchanged.

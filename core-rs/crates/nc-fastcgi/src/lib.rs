@@ -213,43 +213,27 @@ pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> R
     let content_type = header_str(&parts.headers, header::CONTENT_TYPE);
     let content_length = header_str(&parts.headers, header::CONTENT_LENGTH);
 
-    // Extract client IP (honouring X-Forwarded-For).
-    let remote_addr = parts
-        .headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(str::trim)
-        .unwrap_or("127.0.0.1")
-        .to_string();
-
-    // Parse Host header for SERVER_NAME / SERVER_PORT.
-    // Honour X-Forwarded-Host / X-Forwarded-Port when behind a reverse proxy.
-    let host_str = parts
-        .headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| parts.headers.get("host").and_then(|v| v.to_str().ok()))
-        .unwrap_or("localhost")
-        .to_owned();
-
-    let (server_name, server_port) = split_host_port(&host_str);
-    // Honour X-Forwarded-Port (takes priority over Host header port).
-    let server_port: u16 = parts
-        .headers
-        .get("x-forwarded-port")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(server_port);
-    // Honour X-Forwarded-Proto to set HTTPS flag.
-    let is_https = parts
-        .headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|p| p.eq_ignore_ascii_case("https"))
-        .unwrap_or(false);
-
-    let server_name = server_name.to_owned();
+    // Phase 15 F2: the client identity was resolved once by the request
+    // middleware (trusted-proxy XFF walk, gated X-Forwarded-Proto/Host) —
+    // REMOTE_ADDR / SERVER_NAME / SERVER_PORT / HTTPS all come from it, so
+    // client-supplied forwarding headers cannot spoof any of them.
+    let identity = parts
+        .extensions
+        .get::<nc_auth::ClientIdentity>();
+    let (remote_addr, server_name, server_port, is_https) = match identity {
+        Some(id) => (
+            id.ip.to_string(),
+            id.host.clone(),
+            id.port,
+            id.https,
+        ),
+        None => {
+            // No resolved identity (requests bypassing the composite, e.g.
+            // tests): fall back to the peer-less defaults.  In production the
+            // composite always resolves first.
+            ("127.0.0.1".to_string(), "localhost".to_string(), 80u16, false)
+        }
+    };
 
     // ── 5. Build FastCGI params ───────────────────────────────────────────────
     let document_root = fpm.nc_root.to_string_lossy().to_string();

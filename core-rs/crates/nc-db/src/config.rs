@@ -33,6 +33,9 @@ impl std::fmt::Debug for Sensitive {
 pub struct NcConfig {
     // ── Database ────────────────────────────────────────────────────────────
     /// `pgsql` or `sqlite3`
+    /// `pgsql` or `sqlite3`.  Defaults to Sqlite so config fragments (and
+    /// tests) can deserialize without the field.
+    #[serde(default = "default_dbtype")]
     pub dbtype: DbType,
     /// Host (and optional `:port`)
     pub dbhost: Option<String>,
@@ -66,6 +69,25 @@ pub struct NcConfig {
     pub secret: Option<String>,
     pub version: Option<String>,
     pub trusted_domains: Option<Vec<String>>,
+    /// Phase 15 F2: proxies whose `REMOTE_ADDR`/`X-Forwarded-*` headers are
+    /// honoured (CIDR entries allowed).  PHP: `getSystemValue('trusted_proxies', [])`.
+    #[serde(default)]
+    pub trusted_proxies: Option<Vec<String>>,
+    /// Server-param names to read forwarded-for entries from, in priority
+    /// order.  PHP default: `['HTTP_X_FORWARDED_FOR']` — deliberately one
+    /// default only, "so we cannot ship an insecure product out of the box".
+    #[serde(default)]
+    pub forwarded_for_headers: Option<Vec<String>>,
+    /// `overwritehost` — always-trusted host override (F2).
+    #[serde(default)]
+    pub overwritehost: Option<String>,
+    /// `overwriteprotocol` — forces the scheme when the condition matches.
+    #[serde(default)]
+    pub overwriteprotocol: Option<String>,
+    /// `overwritecondaddr` — PCRE matched against `REMOTE_ADDR`; gates
+    /// `overwritehost`/`overwriteprotocol`.
+    #[serde(default)]
+    pub overwritecondaddr: Option<String>,
 
     // ── Public URL ──────────────────────────────────────────────────────────
     #[serde(rename = "overwrite.cli.url")]
@@ -207,6 +229,9 @@ pub enum DbType {
     Sqlite,
 }
 
+fn default_dbtype() -> DbType {
+    DbType::Sqlite
+}
 fn default_table_prefix() -> String {
     "oc_".to_string()
 }

@@ -2001,6 +2001,7 @@ dependencies = [
  "percent-encoding",
  "pprof",
  "prost",
+ "regex-lite",
  "serde",
  "serde_json",
  "sqlx",

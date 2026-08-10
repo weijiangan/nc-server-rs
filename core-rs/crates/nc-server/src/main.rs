@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod handlers;
+mod client_identity;
 mod middleware;
 mod preview;
 mod preview_gen;
@@ -248,8 +249,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(listen = %args.listen, "HTTP listener ready");
 
     // ── Graceful shutdown on SIGTERM ─────────────────────────────────────────
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
         .await
         .context("HTTP server error")?;
 

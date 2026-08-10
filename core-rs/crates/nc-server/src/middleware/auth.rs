@@ -99,7 +99,15 @@ pub async fn auth_check(
         .unwrap_or(false);
 
     let is_dav = is_dav_path(&path);
-    let client_ip = extract_client_ip(&req);
+    // Phase 15 F2: the composite resolved the client identity (trusted-proxy
+    // XFF walk); the throttle key must use it, not the raw header.
+    let client_ip = match req.extensions().get::<crate::client_identity::ClientIdentity>() {
+        Some(identity) => identity.ip.to_string(),
+        None => {
+            tracing::warn!("auth_check without a resolved ClientIdentity extension");
+            "127.0.0.1".to_string()
+        }
+    };
 
     // REQ §18: `secret` is a system config key in `config.php`, NOT an
     // app config — it does not live in `oc_appconfig`.  Token hashing uses
@@ -121,11 +129,12 @@ pub async fn auth_check(
         .unwrap_or("")
         .to_string();
 
+    // Phase 15 F2: scheme from the resolved identity (X-Forwarded-Proto is
+    // honoured only from trusted proxies).
     let is_https = req
-        .headers()
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|p| p == "https")
+        .extensions()
+        .get::<crate::client_identity::ClientIdentity>()
+        .map(|i| i.https)
         .unwrap_or(false);
 
     use nc_auth::session::{check_samesite_cookies, CookieCheck};
@@ -544,17 +553,6 @@ pub(crate) fn dav_session_guard(uid: &str, dav_authenticated_uid: Option<&str>) 
     }
 }
 
-/// Extract the real client IP, honouring `X-Forwarded-For` if present.
-fn extract_client_ip(req: &Request<Body>) -> String {
-    req.headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(str::trim)
-        .unwrap_or("127.0.0.1")
-        .to_string()
-}
-
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -595,6 +593,11 @@ mod tests {
             version: None,
             trusted_domains: None,
             overwrite_cli_url: None,
+            trusted_proxies: None,
+            forwarded_for_headers: None,
+            overwritehost: None,
+            overwriteprotocol: None,
+            overwritecondaddr: None,
             bruteforce_protection_enabled: false,
             oauth2_enable_oc_clients: false,
             memcache_distributed: None,
@@ -666,12 +669,15 @@ mod tests {
                 crate::router::http_middleware_stack,
             ));
 
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method("GET")
             .uri("/dav/files/alice")
             // Deliberately empty Cookie header — no session cookies.
             .body(Body::empty())
             .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
 
         let resp = app.oneshot(req).await.unwrap();
         // Middleware passes through; handler returns 200 OK.
@@ -724,13 +730,16 @@ mod tests {
 
         // Session cookie present but SameSite guard cookies absent — would be
         // 412 without the OCS-APIRequest bypass.
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method("GET")
             .uri("/ocs/v2.php/cloud/capabilities")
             .header("cookie", "oc1abc=somesessionid")
             .header("OCS-APIRequest", "true")
             .body(Body::empty())
             .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
 
         let resp = app.oneshot(req).await.unwrap();
         assert_ne!(resp.status(), StatusCode::PRECONDITION_FAILED);
@@ -751,7 +760,7 @@ mod tests {
             ));
 
         // Valid session cookie + guard cookies, but fastcgi = None.
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method("GET")
             .uri("/dav/files/alice")
             .header(
@@ -760,6 +769,9 @@ mod tests {
             )
             .body(Body::empty())
             .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
 
         let resp = app.oneshot(req).await.unwrap();
         // No FastCGI resolver → anonymous → downstream handler returns 200.
@@ -784,12 +796,15 @@ mod tests {
 
         // `oc1abc` session cookie is present (triggers the SameSite check) but
         // neither guard cookie is present → `StrictCheckFailed` → 412.
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method("GET")
             .uri("/remote.php/webdav/")
             .header("cookie", "oc1abc=somesessionid")
             .body(Body::empty())
             .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);

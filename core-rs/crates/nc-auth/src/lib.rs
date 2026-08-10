@@ -259,6 +259,25 @@ async fn lookup_user_display_name(pool: &DbPool, prefix: &str, uid: &str) -> Str
     uid.to_string()
 }
 
+/// The resolved client identity for one request (Phase 15 F2) — shared by
+/// the auth middleware (throttle key, SameSite scheme) and the FastCGI proxy
+/// (`REMOTE_ADDR` / `SERVER_NAME` / `SERVER_PORT` / `HTTPS` params), which is
+/// why it lives in `nc-auth` rather than the server crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientIdentity {
+    /// The client IP: peer address, or the rightmost-untrusted
+    /// `X-Forwarded-For` entry when the peer is a trusted proxy.
+    pub ip: std::net::IpAddr,
+    /// Effective scheme (`X-Forwarded-Proto` from a trusted proxy, or
+    /// `overwriteprotocol` when the overwrite condition matches).
+    pub https: bool,
+    /// Effective host (`X-Forwarded-Host` / `overwritehost` from a trusted
+    /// proxy, else `Host`).
+    pub host: String,
+    /// Numeric port from the host authority, else the scheme default.
+    pub port: u16,
+}
+
 /// How the authenticated identity was established.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
