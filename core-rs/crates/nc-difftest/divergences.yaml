@@ -157,7 +157,7 @@
   revisit: "quiesce the job loop for the replay, or drop the configvalue from the appconfig key"
   scenarios: []
   table: oc_appconfig
-  key: "backgroundjob|lastjob"
+  key: "backgroundjob\u0001lastjob"
   columns: []
 
 - id: background-job-lastcron-heartbeat
@@ -168,8 +168,9 @@
   revisit: "with background-job-lastjob-heartbeat"
   scenarios: []
   table: oc_appconfig
-  key: "core|lastcron"
+  key: "core\u0001lastcron"
   columns: []
+
 
 - id: circles-maintenance-heartbeat
   why: >-
@@ -180,7 +181,7 @@
   revisit: "with background-job-lastjob-heartbeat"
   scenarios: []
   table: oc_appconfig
-  key: "circles|maintenance_update"
+  key: "circles\u0001maintenance_update"
   columns: []
 
 # The preview-lifecycle timing class (the async queue drain + generation

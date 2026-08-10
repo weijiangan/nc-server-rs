@@ -90,12 +90,22 @@ pub async fn count_table(dsn: &str, table: &str) -> Result<i64> {
 /// The oc_jobs id of the previewgenerator's PreviewJob.  The snowflake ids
 /// are per-instance (the SUT and oracle have independent oc_jobs tables), so
 /// the quiescence drain looks each side's id up before forcing the job.
+///
+/// The class is matched exactly — a bare `LIKE '%PreviewJob'` also matches
+/// `OC\Preview\BackgroundCleanupJob` (and the core PreviewMigration /
+/// ExpirePreviews jobs), and ORDER BY id picks the oldest of those, which
+/// drains nothing (the queue only drains via the generator job).  If the job
+/// is missing (the app was installed without its info.xml registration, or
+/// `down -v` wiped oc_jobs before the fork's enable-preview-imaginary.sh
+/// re-ran), the caller warns and skips the drain.
 pub async fn preview_job_id(dsn: &str) -> Result<Option<i64>> {
     let pool = PgPool::connect(dsn)
         .await
         .with_context(|| format!("connecting to {dsn}"))?;
     let id: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM oc_jobs WHERE class LIKE '%PreviewJob' ORDER BY id LIMIT 1",
+        "SELECT id FROM oc_jobs \
+         WHERE class = 'OCA\\PreviewGenerator\\BackgroundJob\\PreviewJob' \
+         ORDER BY id LIMIT 1",
     )
     .fetch_optional(&pool)
     .await

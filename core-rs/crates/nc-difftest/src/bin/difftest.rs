@@ -148,11 +148,13 @@ async fn quiesce_background(cfg: &Config) -> Result<()> {
     if s0 == 0 && o0 == 0 {
         return Ok(());
     }
+    let mut ran = false;
     for (inst, dsn) in [(&cfg.sut, &cfg.sut.dsn), (&cfg.oracle, &cfg.oracle.dsn)] {
         let Some(job_id) = db::preview_job_id(dsn).await? else {
             tracing::warn!(container = %inst.container, "no PreviewJob in oc_jobs — skipping drain");
             continue;
         };
+        ran = true;
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             tokio::process::Command::new("docker")
@@ -178,6 +180,18 @@ async fn quiesce_background(cfg: &Config) -> Result<()> {
             Ok(Err(e)) => tracing::warn!(container = %inst.container, error = %e, "docker exec background-job:execute failed"),
             Err(_) => tracing::warn!(container = %inst.container, "background-job:execute timed out after 60s"),
         }
+    }
+    // No drainer registered anywhere (oc_jobs is shared) — the queue cannot
+    // drain, so polling 30 s would just burn the full bound per scenario.
+    // Fail loudly instead of silently eating the time (the install flow for
+    // the previewgenerator app registers the job — see the fork's
+    // enable-preview-imaginary.sh).
+    if !ran {
+        anyhow::bail!(
+            "oc_preview_generation has rows but no OCA\\PreviewGenerator\\BackgroundJob\\PreviewJob \
+             is registered in oc_jobs — re-run the app install (occ app:disable/enable previewgenerator) \
+             or the queue never drains and every scenario stalls"
+        );
     }
     let mut last = (1i64, 1i64);
     for _ in 0..30 {
