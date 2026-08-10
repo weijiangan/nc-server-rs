@@ -415,32 +415,48 @@ composite), diff-test 20/20 on the first run, static probes
 ## Phase 20 — query-count budget gate (2026-08-10)
 
 `make perf-gate` fails when any request class exceeds its statement budget —
-the "bundle-size budget" for queries. Budgets in `core-rs/perf-budget.yaml`
-(2x measured floor); measured by enabling Postgres `log_statement` on the SUT
-and counting `execute sqlx` lines (Rust's prepared statements only —
-PHP/Doctrine logs as `<unnamed>` and is excluded by construction; the podman
-docker shim emits the container log on stderr, which the gate merges).
+the "bundle-size budget" for queries. **Strict policy: budgets equal the
+current measured counts — a hard ceiling with no headroom; lowering a count
+is the only way to lower a budget.** Budgets in `core-rs/perf-budget.yaml`.
 
-First gate run on the current code (app-token auth, warm caches):
+Measurement: enable Postgres `log_statement` on the SUT; per class, warm up
++ 800 ms settle, then three measured requests each in its own window
+(median-of-3); count `execute sqlx` lines whose **PG log timestamp** (ms) is
+inside the window (podman's ingestion time lags and batches — counting by the
+PG timestamp makes windows exact). The `execute sqlx` filter excludes PHP
+(Doctrine logs as `<unnamed>`); the podman shim emits the container log on
+stderr, which the gate merges.
+
+Gate run on the current code (app-token auth, warm caches), stable across
+repeated runs:
 
 | class | statements | budget |
 |---|---|---|
-| status | 0 | 5 |
-| get_file | 5 | 12 |
-| propfind_depth0 | 13 | 20 |
-| propfind_depth1 | 20 | 30 |
-| put_new | 16 | 30 |
-| **scaling delta** (depth1 − depth0) | **7** | **10** |
+| status | 0 | 0 |
+| get_file | 5 | 5 |
+| propfind_depth0 | 11 | 11 |
+| propfind_depth1 | 20 | 20 |
+| put_new | 16 | 16 |
+| **scaling delta** (depth1 − depth0) | **9** | **9** |
 
 The delta row is the keystone: depth-1's extra cost over depth-0 is exactly
 the fixed batch cost (7 batch queries + JOIN listing + tag prefetch) — any
 per-child query reintroduction breaches it at N ≥ 1.
 
 **Regression proof**: temporarily forcing one per-child `get_share_details`
-query pushed depth-1 to 31 (> 30, BREACH) and the scaling delta to 20
-(> 10, BREACH); reverted, the gate passes again. The measurement also
+query pushed depth-1 to 31 (> 20, BREACH) and the scaling delta to 20
+(> 9, BREACH); reverted, the gate passes again. The measurement also
 validated the round-3/4 work end-to-end: warm get_file = 5 statements,
 put_new = 16 (was ~23 pre-round-4).
+
+Measurement bugs found while hardening the gate: (1) the probe must consume
+the response body — dav-server-rs streams PROPFIND responses and read_dir +
+the batch queries run inside the stream, so dropping the response skipped the
+work being measured (silent undercount of depth-1); (2) podman stamps log
+lines with its ingestion time, which lags Postgres's write time — windows
+must filter by the line's own PG timestamp; (3) second-truncated windows let
+the warmup's statements and the previous class's stragglers leak in — the
+windows use millisecond precision.
 
 ### Concurrent write probe (4 workers, same file, token auth)
 

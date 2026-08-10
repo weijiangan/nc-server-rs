@@ -16,22 +16,25 @@ child**: depth-1 PROPFIND on an N-child directory must cost `base + 8`
 statements (7 batch queries + JOIN listing + tag prefetch), never `base + 11N`.
 Any reintroduced per-child query breaches the scaling delta at N ≥ 1.
 
-## Budgets (measured floors, app-token auth, warm caches, Postgres statement log)
+## Budgets (STRICT: budgets = current measured counts, no headroom)
 
-Source of truth: `core-rs/perf-budget.yaml`. Budgets = 2× measured floor.
+Source of truth: `core-rs/perf-budget.yaml`. The gate is a hard ceiling —
+any statement added to a request class fails `make perf-gate`; reducing a
+count is the only way to lower a budget.
 
 | class | request | measured | budget |
 |---|---|---|---|
-| status | `GET /status.php` | 0-2 | 5 |
-| get_file | `GET /remote.php/webdav/hello.txt` | ~8 | 12 |
-| propfind_depth0 | `PROPFIND /remote.php/webdav/` depth 0 | ~12-15 | 20 |
-| propfind_depth1 | `PROPFIND /remote.php/webdav/` depth 1 | ~19-26 | 30 |
-| put_new | `PUT /remote.php/webdav/q-budget-<ts>.txt` | ~23 | 30 |
-| **scaling delta** | depth1 − depth0 | ~8 | **10** |
+| status | `GET /status.php` | 0 | 0 |
+| get_file | `GET /remote.php/webdav/hello.txt` | 5 | 5 |
+| propfind_depth0 | `PROPFIND /remote.php/webdav/` depth 0 | 11 | 11 |
+| propfind_depth1 | `PROPFIND /remote.php/webdav/` depth 1 | 20 | 20 |
+| put_new | `PUT /remote.php/webdav/q-budget-<ts>.txt` | 16 | 16 |
+| **scaling delta** | depth1 − depth0 | 9 | **9** |
 
-The scaling delta is the regression detector: the batch queries are fixed-cost
-regardless of N, so any per-child query reintroduction shows up as a linear
-slope.
+The scaling delta is the regression detector: depth-1's extra cost over
+depth-0 is exactly the fixed batch cost (7 batch queries + JOIN listing +
+tag prefetch) — any per-child query reintroduction breaches it at N ≥ 1.
+Measured with app-token auth, warm caches, median-of-3 windows.
 
 ## Measurement mechanism (Phase 1)
 
@@ -41,12 +44,19 @@ links no `nc-*` server crate):
 1. Load `perf-budget.yaml`.
 2. Create an app token on the SUT (existing `auth::create_token`).
 3. Enable `log_statement='all'` on the SUT's Postgres (superuser DSN).
-4. Per class: one unmeasured warmup request → open a counting window →
-   run the probe once → count `execute sqlx` lines in the SUT container's
-   Postgres log since the window start.
+4. Per class: one unmeasured warmup request + 800 ms settle (lets the
+   fire-and-forget `last_activity` write land before the window) → three
+   measured requests, each inside its own counting window → median-of-3.
+   Counting counts `execute sqlx` lines whose **PG log timestamp**
+   (millisecond precision) falls inside the window — not podman's ingestion
+   time, which lags and batches — so the window is exact.
    - The `execute sqlx` filter counts only Rust's prepared statements;
      PHP/Doctrine logs as `<unnamed>` and background cron is excluded by
      construction.
+   - **The probe must consume the response body**: dav-server-rs streams
+     PROPFIND responses, and `read_dir` + the per-child batch queries run
+     inside the stream — dropping the response without reading it skips the
+     very work being measured (the gate's original silent undercount).
 5. PUT uses a unique path per run and cleans it up after the window.
 6. `depth1 − depth0` scaling-delta check.
 7. Disable logging; print the table; exit non-zero on any breach.

@@ -1,12 +1,15 @@
 # Per-request-class statement budgets (Phase 20).
 #
+# STRICT policy: budgets equal the current measured counts — the gate is a
+# hard ceiling with NO headroom.  Any statement added to a request class
+# fails `make perf-gate`; reducing a count is the only way to lower a budget.
+#
 # Measured with app-token auth, warm caches, on the dev docker stack, by
 # counting `execute sqlx` lines in the SUT's Postgres statement log (Rust's
 # prepared statements only — PHP/Doctrine logs as `<unnamed>` and is excluded
-# by construction).  Budgets = 2x measured floor, so a single regression that
-# pushes a class over its floor trips the gate.
-#
-# `make perf-gate` runs the `nc-bench budget` subcommand against this file.
+# by construction).  The class warmup inside the gate keeps the token /
+# user-state / bruteforce caches warm, so the counts below are the steady
+# state.
 #
 # The scaling delta is the keystone: depth-1's extra cost over depth-0 must
 # stay at the fixed batch cost (7 batch queries + JOIN listing + tag
@@ -16,25 +19,25 @@ classes:
   - name: status
     method: GET
     path: /status.php
-    budget: 5
+    budget: 0
   - name: get_file
     method: GET
     path: /remote.php/webdav/hello.txt
-    budget: 12
+    budget: 5
   - name: propfind_depth0
     method: PROPFIND
     path: /remote.php/webdav/
     depth: 0
-    budget: 20
+    budget: 11
   - name: propfind_depth1
     method: PROPFIND
     path: /remote.php/webdav/
     depth: 1
-    budget: 30
+    budget: 20
   - name: put_new
     method: PUT
     path: /remote.php/webdav/q-budget-<ts>.txt
     unique_path: true
-    budget: 30
+    budget: 16
 
-scaling_delta_budget: 10
+scaling_delta_budget: 9
