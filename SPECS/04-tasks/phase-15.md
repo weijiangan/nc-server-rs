@@ -4,8 +4,8 @@ Task tracking for [`SPECS/03-implementation-plan/plan/15-edge-security-hardening
 
 ## Wave 0 — Decision spikes
 
-- [ ] **0.1 Session resolution: direct store read vs. hardened round-trip.** Prototype a `sess_{id}` file reader (PHP default serialization, `__ACTIVE_USER` / `AUTHENTICATED_TO_DAV_BACKEND` keys); tolerate PHP's exclusive session lock and partial/locked files. Go = direct read (keep `__session_resolve` only for the remember-me path); no-go = harden the round-trip (2.1 in full).
-- [ ] **0.2 Verify PHP-FPM `$_COOKIE` population.** 10-line probe script behind the dev FPM socket with `HTTP_COOKIE: probe=1`; dump `$_COOKIE` + `$_SERVER['HTTP_COOKIE']` — settles whether the shim's manual cookie parse is load-bearing or redundant.
+- [x] **0.1 Session resolution: direct store read vs. hardened round-trip — DECIDED 2026-08-10 (go, conditional).** Session files are encrypted (`encrypted_session_data|s:N:"cipher|iv|hmac|3"`, plaintext = JSON); the `oc_sessionPassphrase` cookie is the plaintext passphrase; decryption needs a phpseclib-exact crypto port (HKDF-SHA512 + PBKDF2 quirk + AES-CBC + HMAC) pinned against a live session file. Direct read it is — first milestone: decrypt a captured real session file in a test.
+- [x] **0.2 Verify PHP-FPM `$_COOKIE` population — DECIDED 2026-08-10.** FPM DOES populate `$_COOKIE` (probe dumped `["probe"=>"1","session"=>"sess123"]`); the shim's manual parse is redundant — keep as defense-in-depth, correct the comment.
 
 ## Wave 1 — Production gate
 
@@ -15,7 +15,7 @@ Task tracking for [`SPECS/03-implementation-plan/plan/15-edge-security-hardening
 
 ## Wave 2 — Resource governance
 
-- [ ] **2.1 Session-resolution exhaustion (F3).** Per the 0.1 decision: negative caching + concurrency semaphore (`pm.max_children / 2`) on `__session_resolve`; keep the positive cache TTL / drop it for direct-read.
+- [ ] **2.1 Session-resolution exhaustion (F3).** Per the 0.1 decision (direct read): no negative caching needed on the direct path; keep the concurrency cap on the remember-me `__session_resolve` call; drop the positive session cache (revocation lag → ~0).
 - [ ] **2.2 Body limits with correct status (F4).** 413 (not 502) on `to_bytes` overflow; global in-flight body semaphore (documented RSS ceiling, 503 + `Retry-After: 1` beyond it).
 - [ ] **2.3 Response-body deadline (F5).** Per-chunk idle timeout on `CgiBodyStream` (60 s default, `fastcgi_timeout_ms`-adjacent config); delete the wrong "transport enforces it" comment.
 - [ ] **2.4 CGI header accumulator cap (F8, partial).** 64 KiB cap while scanning for `\r\n\r\n`; overflow → 502 + `warn!`.

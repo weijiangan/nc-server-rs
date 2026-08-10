@@ -70,6 +70,56 @@ Decision criteria:
 - **Go** if the file-store reader is correct across PHP's session serialization edge cases (lazy write, `session_regenerate_id` rename races, locked-session semantics — PHP holds an exclusive lock on `sess_{id}` while a request runs; Rust reads must tolerate partial/locked files): implement the direct read; keep `__session_resolve` only for the remember-me (`nc_token`) path, which must run PHP's `loginWithCookie()` for token rotation side effects.
 - **No-go** if the serialization/locking edge cases prove fragile: harden the round-trip instead (Wave 2.1, in full).
 
+### 0.1 DECISION (2026-08-10) — Go, conditional: direct file read, with a crypto port
+
+Experiment evidence:
+
+- **Session store**: file-backed at `/tmp` (save_path unset → PHP default on this
+  image), PHP default serialization wrapper, **content encrypted**:
+  `encrypted_session_data|s:N:"<ciphertext-hex>|<iv-hex>|<hmac-hex>|3"` — the
+  plaintext inside is `json_encode($sessionValues)` (`CryptoSessionData.php:190`).
+  The plan's original assumption (plain `__ACTIVE_USER` readable in the file) is
+  wrong on NC 30+ — the file only holds the sealed blob.
+- **Passphrase**: `oc_sessionPassphrase` cookie, **plaintext**
+  (`CryptoWrapper.php:47` reads it directly; 128 random chars when absent).
+  Rust already reads the Cookie header → has it.
+- **Decryption scheme** (`Crypto.php:encrypt`, phpseclib 2.x `Crypt\AES`):
+  HKDF-SHA512(passphrase) → 32 B AES-key material + 32 B HMAC key; AES key =
+  **phpseclib's PBKDF2-SHA1 quirk** (`setPassword($keyMaterial)` → pbkdf2 with
+  password-as-salt, 1000 iterations, 16 B output — pin against the live stack,
+  not from memory); AES-CBC; encrypt-then-MAC: HMAC-SHA512 over
+  hex(cipher)+hex(iv); blob version `3`.
+
+**Decision**: implement the direct read. Rust has the cookie + config secret;
+the primitives are standard (hkdf, hmac, sha2, aes, cbc, pbkdf2). The **new
+cost the original spike did not anticipate is the crypto port** — it must match
+phpseclib byte-for-byte, so the first milestone is a test that decrypts a real
+captured session file. Lock semantics are acceptable: PHP's exclusive flock
+means the reader sees the last *committed* state (correct revocation
+semantics — a revoking request's changes appear once it commits); partial
+writes fail the parse → bounded retry. Keep `__session_resolve` for the
+remember-me path only. Wave 2.1 shrinks accordingly (no negative caching
+needed on the direct path; keep the concurrency cap on the remember-me call).
+
+### 0.2 DECISION (2026-08-10) — FPM DOES populate `$_COOKIE`; the shim's manual parse is redundant
+
+Experiment evidence: a hand-built FastCGI request (`HTTP_COOKIE: probe=1;
+session=sess123`) to the dev FPM socket (bypassing the shim) executed a probe
+script dumping `$_COOKIE` and `$_SERVER['HTTP_COOKIE']`:
+
+```
+array(2) { ["probe"]=> string(1) "1", ["session"]=> string(7) "sess123" }
+string(24) "probe=1; session=sess123"
+```
+
+**Decision**: the shim's manual cookie parse (`php-shim/index.php:531-562`) is
+redundant — FPM's `sapi_activate` already parses `HTTP_COOKIE` into `$_COOKIE`.
+Keep the parse as defense-in-depth (it costs nothing and protects deployments
+that don't forward `HTTP_COOKIE`), but **correct the comment**: the documented
+claim ("FPM does not populate $_COOKIE") is false on PHP 8.4 FPM; record the
+verification. Proxied routes see cookies natively — PHP-side session/CSRF
+behavior on them is consistent with the canonical stack.
+
 ### 0.2 Verify PHP-FPM `$_COOKIE` population (runtime experiment)
 
 This is the one item that cannot be settled from source: the shim asserts PHP-FPM does **not** populate `$_COOKIE` from the `HTTP_COOKIE` FastCGI param and parses cookies manually (`php-shim/index.php:531-562`). Standard FPM internals (`fpm_main.c` sets `SG(request_info).cookie_data` from `HTTP_COOKIE`; `sapi_activate` parses it into `$_COOKIE`) suggest otherwise — but the shim author presumably observed what they documented.
