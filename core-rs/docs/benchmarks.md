@@ -107,6 +107,54 @@ Two complementary tools:
    counterpart to an xhprof/excimer breakdown on the PHP side (the image ships
    excimer/blackfire for future PHP-side profiles).
 
+### Measuring a deployed server with `perf`
+
+`perf` profiles whatever binary is deployed — no `NC_PROFILE_DIR`, no special
+build baked into the image. Two project-specific caveats and the recipe:
+
+**1. The deployed binary is stripped.** `[profile.release]` sets `strip =
+true`, so `perf` on the production binary resolves no user-space names. For a
+measurement window, deploy the `profiling` profile binary (same
+optimizations, `strip=false`), ideally with frame pointers so the cheap `fp`
+unwinder works:
+
+```bash
+cargo build --release --profile profiling --bin nc-server \
+  --config 'build.rustflags=["-C","force-frame-pointers=yes"]'
+```
+
+Without frame pointers, use `--call-graph dwarf` (slower, more data, but
+works from the debug info alone).
+
+**2. The server is I/O-bound, and `perf` samples CPU.** All flame-graph
+work here was done against a server waiting on Postgres ~99% of the time —
+under light load a `perf` dump shows the same idle/await-scaffolding picture
+(see the round-2 sample-poverty note in the Phase 18 section). Measure under
+real load with enough concurrency to saturate CPU, and for the *blocked* time
+(the actual latency budget) use off-CPU analysis — BCC/bpftrace
+`offcputime -p <pid> 30` — which shows where the server waits (sqlx pool,
+Postgres socket).
+
+```bash
+# permissions: kernel.perf_event_paranoid <= 1 (or root / CAP_PERFMON);
+# kernel.kptr_restrict=0 adds kernel-side (network/disc) symbols
+sysctl kernel.perf_event_paranoid=1
+
+perf record -F 99 --call-graph dwarf -p $(systemctl show -p MainPID --value nc-server) sleep 30
+perf report -g graph                      # interactive TUI
+perf script | stackcollapse-perf.pl | flamegraph.pl > nc-server.svg   # Brendan Gregg's tools
+
+perf stat -p <pid> sleep 30   # context switches, instructions/cycle, cache misses —
+                              # useful since the server CPU differs from the dev host
+perf top -p <pid>             # live view while load runs
+```
+
+Containerized deployments: run `perf` on the **host** with `-p
+<container-pid>`; inside the container it needs `privileged` + host PID
+namespace. `perf` adds what pprof-rs cannot: kernel-side visibility (network
+stack, block I/O, futex/spinlock waits) and hardware counters for a different
+CPU.
+
 ## Baseline — 2026-08-10 (dev docker, host arch, app-token auth)
 
 Measured on the Phase 17 bring-up stack (`make diff-up`), app-token auth
