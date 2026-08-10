@@ -63,14 +63,22 @@ links no `nc-*` server crate):
 
 Gate wiring: `make perf-gate` (prerequisites: `make diff-up`-style stack up).
 
-## Phase 2 (follow-up, not in this phase)
+## Phase 2 (decided: NOT an in-process counter)
 
-An in-process per-request query counter (task-local + counting `Executor`
-wrapper around the pool) exposed as a per-request trace and an optional
-`NC_QUERY_BUDGET` env that logs a warning when a request class exceeds its
-budget — the same enforcement on deployments where the Postgres log is not
-accessible (e.g. the HDD-RAID production target, where each round trip is
-expensive). The budget file is shared.
+An in-process per-request query counter was originally proposed as the
+production guard. Decision (2026-08-10): **dropped.** The dev-stack gate is
+the enforcement point — every change ships through `make perf-gate`, so a
+regression fails before it reaches a deployment. A permanent counter would
+instrument the hottest code in the project (a counting `Executor` wrapper
+around the pool used by every query) for a signal that is only a proxy — on
+slow storage the query count already surfaces as latency, which `perf` and
+the slow-query log measure directly.
+
+Deployed-server verification is instead a **one-shot check after each
+deploy**: on the production Postgres, `pg_stat_statements_reset()`, run one
+request per class (app-token auth), then sum the per-shape call deltas from
+`pg_stat_statements` (or a temporary `log_statement='all'` window) and
+compare against `perf-budget.yaml`. No code changes, ~5 minutes.
 
 ## What else the gate covers (future classes)
 
