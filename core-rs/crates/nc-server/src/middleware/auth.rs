@@ -6,6 +6,13 @@ use axum::{
 
 use nc_auth::{AuthInfo, AuthMethod};
 
+/// How long a request waits for a `__session_resolve` concurrency permit
+/// before falling through anonymous (F3, Wave 2.1).  The resolution itself
+/// carries a 5 s timeout in `nc_fastcgi::resolve_session`; this bound is
+/// about *queueing*, not the round-trip — under saturation, excess requests
+/// degrade to anonymous quickly instead of piling onto FPM.
+const RESOLVE_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 use crate::state::AppState;
 
 // ── Public paths that do NOT require any auth (even for error responses) ──────
@@ -418,25 +425,75 @@ pub async fn auth_check(
             // ── Session identity cache lookup (§7.9.5) ──────────────────────
             // Key: SHA-256(raw PHP session cookie value).
             let cache_key = nc_auth::make_cache_key(&raw_val);
-            let identity = if let Some(cached) = nc_auth::cache_lookup(session_cache, &cache_key) {
-                cached
-            } else {
-                // Cache miss — ask PHP-FPM to run the auth chain.
-                match nc_fastcgi::resolve_session(fpm, &cookie_header).await {
-                    Some(result) => {
-                        nc_auth::cache_insert(session_cache, cache_key, result.identity.clone());
-                        // Remember-me token rotation: forward any
-                        // Set-Cookie headers the shim emitted so the
-                        // browser receives the refreshed nc_token /
-                        // nc_username / nc_session_id cookies (§7.9.3).
-                        pending_set_cookies = result.set_cookies;
-                        result.identity
+            let positive_ttl = std::time::Duration::from_secs(
+                state.nc_config.session_cache_ttl.unwrap_or(60),
+            );
+            let identity = match nc_auth::cache_lookup(session_cache, &cache_key, positive_ttl) {
+                nc_auth::CacheLookup::Positive(cached) => cached,
+                // F3 (Wave 2.1): a fresh negative entry — a junk cookie or
+                // expired session resolved within the last 5 s — is treated
+                // exactly like a fresh failed resolution (anonymous) without
+                // touching PHP-FPM.  This is what absorbs an attacker's
+                // request burst.
+                nc_auth::CacheLookup::Negative => return Ok(Vec::new()),
+                nc_auth::CacheLookup::Miss => {
+                    // F3 concurrency cap: at most `session_resolve_concurrency`
+                    // `__session_resolve` round-trips in flight, so FPM
+                    // saturation is not reachable through resolution alone.
+                    // Excess requests wait a bounded time, then fall through
+                    // anonymous (the handler may still 401).
+                    let sem = fpm.session_resolve_semaphore.clone();
+                    match tokio::time::timeout(
+                        RESOLVE_ACQUIRE_TIMEOUT,
+                        sem.acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_permit)) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "session-resolve: semaphore closed");
+                            return Ok(Vec::new());
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "session-resolve: concurrency cap busy for {RESOLVE_ACQUIRE_TIMEOUT:?} — \
+                                 falling through anonymous"
+                            );
+                            return Ok(Vec::new());
+                        }
                     }
-                    None => {
-                        // PHP says the session is invalid or unauthenticated.
-                        // Fall through as anonymous — the route handler
-                        // decides whether to reject with 401.
-                        return Ok(Vec::new());
+                    // Cache miss — ask PHP-FPM to run the auth chain.
+                    match nc_fastcgi::resolve_session(fpm, &cookie_header).await {
+                        Some(result) => {
+                            nc_auth::cache_insert(
+                                session_cache,
+                                cache_key,
+                                result.identity.clone(),
+                            );
+                            // Remember-me token rotation: forward any
+                            // Set-Cookie headers the shim emitted so the
+                            // browser receives the refreshed nc_token /
+                            // nc_username / nc_session_id cookies (§7.9.3).
+                            //
+                            // NOTE (F3): rotation runs on cache miss only —
+                            // a cached identity skips PHP's
+                            // loginWithCookie(), so remember-me tokens
+                            // rotate at most once per positive-TTL window,
+                            // not per request.  Deliberate: the cache TTL
+                            // (the revocation knob) bounds it.
+                            pending_set_cookies = result.set_cookies;
+                            result.identity
+                        }
+                        None => {
+                            // PHP says the session is invalid or
+                            // unauthenticated.  Cache the negative result
+                            // (5 s TTL) so a burst of junk cookies hits
+                            // memory, not FPM (F3) — and fall through as
+                            // anonymous; the route handler decides whether
+                            // to reject with 401.
+                            nc_auth::cache_insert_negative(session_cache, cache_key);
+                            return Ok(Vec::new());
+                        }
                     }
                 }
             };
@@ -572,6 +629,15 @@ mod tests {
     /// `fastcgi` and `session_cache` are left as `None` — these tests exercise
     /// the middleware paths that do not require a live PHP-FPM connection.
     async fn make_test_state(instanceid: &str) -> AppState {
+        make_test_state_with_root(instanceid, std::path::PathBuf::from(".")).await
+    }
+
+    /// Same, with an explicit `nc_root` (the static-file whitelist resolves
+    /// candidates against it).
+    async fn make_test_state_with_root(
+        instanceid: &str,
+        nc_root: std::path::PathBuf,
+    ) -> AppState {
         sqlx::any::install_default_drivers();
         let pool = sqlx::AnyPool::connect("sqlite::memory:").await.unwrap();
         let appconfig_cache = Arc::new(RwLock::new(AppConfigCache::default()));
@@ -619,6 +685,8 @@ mod tests {
             preview_concurrency_all: None,
             fastcgi_socket: None,
             fastcgi_timeout_ms: 30_000,
+            session_cache_ttl: None,
+            session_resolve_concurrency: None,
             php_binary: None,
             forbidden_filenames: vec![".htaccess".to_owned()],
             forbidden_filename_basenames: vec![],
@@ -638,7 +706,7 @@ mod tests {
             capability_cache,
             token_cache: nc_auth::new_token_cache(),
             nc_config: Arc::new(nc_config),
-            nc_root: std::path::PathBuf::from("."),
+            nc_root,
             table_prefix: "oc_".to_owned(),
             fastcgi: None,
             instanceid: instanceid.to_owned(),
@@ -808,5 +876,118 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    // ── Static-file whitelist deny-path pins (15.1 remainder) ────────────────
+    //
+    // The `try_static_files_check` whitelist (`/core/ /dist/ /themes/ /apps/`
+    // + `robots.txt` + `index.html`, Phase 18.1) is the F1 static-serving
+    // control: paths outside it never reach the filesystem.  These tests pin
+    // that the deny side holds even when a real file exists at the denied
+    // path — the property is whitelist-first, not "check the filesystem".
+
+    /// Scratch root with the given (relative path → content) files; removed on
+    /// drop.  Unique per test+process so parallel runs cannot collide.
+    struct ScratchRoot(std::path::PathBuf);
+    impl ScratchRoot {
+        fn new(name: &str, files: &[(&str, &str)]) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "nc-static-{}-{name}",
+                std::process::id()
+            ));
+            for (rel, content) in files {
+                let p = dir.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, content).unwrap();
+            }
+            ScratchRoot(dir)
+        }
+    }
+    impl Drop for ScratchRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// GET `uri` through the composite middleware with `root` as `nc_root`;
+    /// returns the final status.
+    async fn static_request(root: &ScratchRoot, uri: &str) -> StatusCode {
+        let state = make_test_state_with_root("oc1abc", root.0.clone()).await;
+        let app = Router::new()
+            .route("/dav/files/alice", get(ok_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::router::http_middleware_stack,
+            ));
+        let mut req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    /// `/data/` is not a whitelisted root — `.ocdata` (or any file) under it
+    /// is never served as static, even when present on disk.
+    #[tokio::test]
+    async fn static_denies_data_directory() {
+        let root = ScratchRoot::new("data-dir", &[("data/.ocdata", "x")]);
+        assert_eq!(static_request(&root, "/data/.ocdata").await, StatusCode::NOT_FOUND);
+    }
+
+    /// Root-level dotfiles (`.htaccess`, `.user.ini`, …) are not whitelisted
+    /// and are never served, even when present on disk.
+    #[tokio::test]
+    async fn static_denies_dotfile_path() {
+        let root = ScratchRoot::new("dotfile", &[(".htaccess", "x")]);
+        assert_eq!(static_request(&root, "/.htaccess").await, StatusCode::NOT_FOUND);
+    }
+
+    /// `3rdparty/` (PHP's bundled libraries) is not a whitelisted root — a
+    /// real file under it is still denied; real nginx installs deny it too.
+    #[tokio::test]
+    async fn static_denies_3rdparty() {
+        let root = ScratchRoot::new("thirdparty", &[("3rdparty/autoload.php", "x")]);
+        assert_eq!(
+            static_request(&root, "/3rdparty/autoload.php").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// The whitelist is case-sensitive (like nginx's literal `try_files`):
+    /// `/CORE/…` does NOT match `/core/…` and is denied even when the file
+    /// exists on disk (a case-insensitive read would serve it).
+    #[tokio::test]
+    async fn static_denied_prefix_case_insensitive() {
+        let root = ScratchRoot::new("case", &[("CORE/img/logo.svg", "x")]);
+        assert_eq!(
+            static_request(&root, "/CORE/img/logo.svg").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Traversal segments inside a whitelisted root are rejected before the
+    /// fs stat (`path.contains("..")`), so `/core/../…` cannot escape.
+    #[tokio::test]
+    async fn static_denies_traversal_segment() {
+        let root = ScratchRoot::new("traversal", &[("data/.ocdata", "x")]);
+        assert_eq!(
+            static_request(&root, "/core/../../data/.ocdata").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Positive control: a real file under a whitelisted root IS served — the
+    /// whitelist gates, it does not disable static serving entirely.
+    #[tokio::test]
+    async fn static_serves_whitelisted_asset() {
+        let root = ScratchRoot::new("serves", &[("core/img/logo.svg", "<svg/>")]);
+        assert_eq!(
+            static_request(&root, "/core/img/logo.svg").await,
+            StatusCode::OK
+        );
     }
 }

@@ -11,10 +11,11 @@ pub mod twofa;
 
 pub use token::{new_token_cache, SharedTokenCache};
 pub use session::{
-    SessionIdentity, SessionResolveResult,
+    SessionIdentity, SessionResolveResult, CacheLookup,
     SessionCache, SharedSessionCache,
-    new_session_cache, make_cache_key, cache_insert, cache_lookup, cache_evict_expired,
-    SESSION_CACHE_TTL, SESSION_CACHE_EVICT_INTERVAL,
+    new_session_cache, make_cache_key, cache_insert, cache_insert_negative,
+    cache_lookup, cache_evict_expired,
+    SESSION_CACHE_TTL, SESSION_NEGATIVE_CACHE_TTL, SESSION_CACHE_EVICT_INTERVAL,
 };
 
 use std::sync::OnceLock;

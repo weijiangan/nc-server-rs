@@ -20,6 +20,9 @@ nc-db.workspace = true
 nc-auth.workspace = true
 fastcgi-client = { workspace = true, features = ["runtime-tokio"] }
 regex-lite.workspace = true
+# Already in the tree via axum; needed to name `LengthLimitError` when
+# distinguishing a 413-worthy oversized body from a genuine stream error.
+http-body-util = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

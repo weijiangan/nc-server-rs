@@ -193,6 +193,23 @@ pub struct NcConfig {
     #[serde(default = "default_fastcgi_timeout_ms")]
     pub fastcgi_timeout_ms: u64,
 
+    // ── Session resolution (F3, Wave 2.1) ─────────────────────────────────────
+    /// Positive session-identity cache TTL in seconds — the remember-me
+    /// **revocation knob**: lower values propagate PHP session logout
+    /// faster at the cost of one `__session_resolve` round-trip per browser
+    /// request per window (recommended operating range 10-15 s when
+    /// revocation latency matters).  Key: `session_cache_ttl`.
+    /// Default: `60` ([`nc_auth::session::SESSION_CACHE_TTL`]).
+    #[serde(default)]
+    pub session_cache_ttl: Option<u64>,
+    /// Max concurrent `__session_resolve` round-trips to PHP-FPM (the
+    /// F3 concurrency cap).  Set it around `pm.max_children / 2` — FPM
+    /// saturation must not be reachable from resolution alone; excess
+    /// requests wait briefly then fall through anonymous.  Key:
+    /// `session_resolve_concurrency`.  Default: `8`.
+    #[serde(default)]
+    pub session_resolve_concurrency: Option<u32>,
+
     // ── PHP CLI ────────────────────────────────────────────────────────────────
     /// PHP CLI interpreter for parsing `config.php` and the imagick startup
     /// probe.  Key: `php_binary` (path or `$PATH` name).  Default: `php`.

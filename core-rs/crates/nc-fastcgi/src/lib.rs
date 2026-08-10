@@ -41,6 +41,7 @@
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::{body::Body, response::Response};
@@ -81,6 +82,12 @@ pub struct FastCgiState {
     /// compiled-in packaged default ([`DEFAULT_SHIM_PATH`], when present on
     /// disk) → in-tree development layout `{nc_root}/core-rs/php-shim/index.php`.
     pub shim_path: PathBuf,
+    /// Concurrency cap for `__session_resolve` round-trips (F3, Wave 2.1):
+    /// at most this many browser requests may hold an FPM worker slot for
+    /// session resolution at once.  Permits ≈ `pm.max_children / 2`; excess
+    /// requests wait a bounded time, then fall through anonymous.  The
+    /// caller acquires a permit before calling [`resolve_session`].
+    pub session_resolve_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl FastCgiState {
@@ -109,11 +116,16 @@ impl FastCgiState {
             );
         }
 
+        let session_resolve_permits = config.session_resolve_concurrency.unwrap_or(8).max(1) as usize;
+
         Some(Self {
             socket_path,
             timeout_ms: config.fastcgi_timeout_ms,
             nc_root: nc_root.to_path_buf(),
             shim_path,
+            session_resolve_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                session_resolve_permits,
+            )),
         })
     }
 }
@@ -155,6 +167,55 @@ fn resolve_shim_path_from(
     nc_root.join("core-rs/php-shim/index.php")
 }
 
+// ── build_fcgi_params ──────────────────────────────────────────────────────────
+
+/// Build the `HTTP_*` params forwarded from client headers (F7, Wave 3.1).
+///
+/// PURE: headers in → params out, no I/O — the proxy's security-relevant
+/// transformation, extracted so the invariant is unit-testable.
+///
+/// The identity headers are stripped so a malicious client cannot set any
+/// `HTTP_X_NC_*` param:
+/// - `x-nc-user`, `x-nc-session-token`, `x-nc-is-admin` — impersonation
+///   (§7.3); the Rust-validated `AuthInfo` is injected by the caller instead.
+/// - `x-nc-proxied` — the proxy trust marker, INJECT-ONLY.  It must never be
+///   client-derived, even though the params map's insert-order would
+///   overwrite it today: the strip list is the invariant, not the HashMap.
+/// - `content-type` / `content-length` — forwarded as the dedicated CGI
+///   params (step 5), not as `HTTP_*`.
+///
+/// The `HTTP_` key mapping mirrors PHP's header-to-server-var convention:
+/// `X-Forwarded-For` → `HTTP_X_FORWARDED_FOR`.  Header-name case cannot
+/// bypass the strip: `X-Nc-UsEr` maps to the same `HTTP_X_NC_USER` key that
+/// the lowercase strip list rejects.
+fn build_fcgi_params(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
+    const STRIPPED: [&str; 6] = [
+        "content-type",
+        "content-length",
+        "x-nc-user",
+        "x-nc-session-token",
+        "x-nc-is-admin",
+        "x-nc-proxied",
+    ];
+    let mut out = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        let name_lower = name.as_str().to_ascii_lowercase();
+        if STRIPPED.contains(&name_lower.as_str()) {
+            continue;
+        }
+        if let Ok(val) = value.to_str() {
+            out.push((
+                format!(
+                    "HTTP_{}",
+                    name.as_str().to_ascii_uppercase().replace('-', "_")
+                ),
+                val.to_owned(),
+            ));
+        }
+    }
+    out
+}
+
 // ── proxy_handler ─────────────────────────────────────────────────────────────
 
 /// Forward an HTTP request to PHP-FPM via FastCGI (Phase 7.1).
@@ -179,7 +240,10 @@ fn resolve_shim_path_from(
 /// # Error responses
 /// - `502 Bad Gateway`: PHP-FPM socket unavailable or FastCGI protocol error.
 /// - `504 Gateway Timeout`: timeout exceeded during connect, or during the
-///   header phase (body streaming timeout is enforced by the transport layer).
+///   header phase (the response BODY streams without a wall-clock cap —
+///   F5's per-chunk idle deadline is the planned knob, see phase-15 2.3).
+/// - `413 Payload Too Large`: request body exceeds the 64 MiB buffer cap
+///   (F4 — a client condition, not an upstream failure).
 #[tracing::instrument(skip_all, level = "debug", fields(method = %req.method(), path = %req.uri().path()))]
 pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> Response {
     use axum::http::header;
@@ -259,28 +323,12 @@ pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> R
 
     // ── 6. Forward HTTP headers as HTTP_* params ──────────────────────────────
     //
-    // Security (§7.3): strip client-supplied identity headers from incoming
-    // requests so a malicious client cannot impersonate a different user.
-    // The real values are injected from the Rust-validated AuthInfo below.
-    for (name, value) in &parts.headers {
-        let name_lower = name.as_str().to_ascii_lowercase();
-        if matches!(
-            name_lower.as_str(),
-            "content-type"
-                | "content-length"
-                | "x-nc-user"
-                | "x-nc-session-token"
-                | "x-nc-is-admin"
-        ) {
-            continue;
-        }
-        if let Ok(val) = value.to_str() {
-            let key = format!(
-                "HTTP_{}",
-                name.as_str().to_ascii_uppercase().replace('-', "_")
-            );
-            params = params.custom(key, val.to_owned());
-        }
+    // Security (§7.3 / F7, Wave 3.1): `build_fcgi_params` strips the
+    // identity headers — including the `x-nc-proxied` trust marker, which is
+    // INJECT-ONLY — so no client input can set any `HTTP_X_NC_*` param.  The
+    // real values are injected from the Rust-validated AuthInfo below.
+    for (key, val) in build_fcgi_params(&parts.headers) {
+        params = params.custom(key, val);
     }
 
     // ── 7. Inject Rust-validated identity ────────────────────────────────────
@@ -315,11 +363,21 @@ pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> R
     //
     // PHP-FPM dispatched routes handle API calls and web UI; large file
     // uploads are served natively by the DAV layer.  64 MiB cap matches a
-    // generous OCS/REST payload; POST bodies larger than this return 413.
+    // generous OCS/REST payload.  An oversized body is a CLIENT condition —
+    // 413 (Payload Too Large), matching nginx/Apache — while a genuine
+    // stream error stays 502 (F4, Wave 2.1).
     const MAX_BODY: usize = 64 * 1024 * 1024; // 64 MiB
     let body_bytes: Bytes = match axum::body::to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
         Err(e) => {
+            let is_limit = std::error::Error::source(&e)
+                .is_some_and(|src| src.is::<http_body_util::LengthLimitError>());
+            if is_limit {
+                tracing::warn!(
+                    "fastcgi: request body exceeds 64 MiB cap — returning 413 (client condition)"
+                );
+                return error_response(413, "Request body too large\n");
+            }
             tracing::warn!(error = %e, "fastcgi: failed to read request body");
             return error_response(502, "Failed to read request body\n");
         }
@@ -504,12 +562,29 @@ where
     S: fastcgi_client::io::AsyncRead + Unpin,
 {
     const SEP: &[u8] = b"\r\n\r\n";
+    // F8 (Wave 2.1): cap the header accumulator while scanning for the
+    // separator.  Legitimate CGI header blocks are a few hundred bytes (the
+    // shim's own responses are under 1 KiB), so 64 KiB is generous headroom;
+    // anything beyond it is a misbehaving app and this is pure containment —
+    // without the cap a runaway app can make the buffer grow without bound.
+    const MAX_HEADER_BLOCK: usize = 64 * 1024;
     let mut header_accum = BytesMut::new();
 
     loop {
         match stream.next().await {
             Some(Ok(Content::Stdout(chunk))) => {
                 header_accum.extend_from_slice(&chunk);
+
+                if header_accum.len() > MAX_HEADER_BLOCK {
+                    tracing::warn!(
+                        accum_len = header_accum.len(),
+                        "fastcgi: CGI header block exceeds 64 KiB cap — aborting (misbehaving app)"
+                    );
+                    return Err(error_response(
+                        502,
+                        "FastCGI header block too large\n",
+                    ));
+                }
 
                 if let Some(sep_pos) = header_accum.windows(SEP.len()).position(|w| w == SEP) {
                     // Split at the separator.
@@ -1738,5 +1813,116 @@ mod tests {
             DEFAULT_SHIM_PATH.ends_with("/php-shim/index.php"),
             "DEFAULT_SHIM_PATH must end in /php-shim/index.php, got: {DEFAULT_SHIM_PATH}"
         );
+    }
+
+    // ── build_fcgi_params (F7, Wave 3.1) ───────────────────────────────────────
+
+    fn header_map(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+        let mut m = axum::http::HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+        }
+        m
+    }
+
+    /// No client-supplied header of any case can set an `HTTP_X_NC_*` param —
+    /// the inject-only invariant for the identity headers AND the proxy
+    /// trust marker.
+    #[test]
+    fn no_client_input_can_set_http_x_nc() {
+        let headers = header_map(&[
+            ("x-nc-user", "evil"),
+            ("X-NC-Session-Token", "evil"),
+            ("X-Nc-Is-Admin", "1"),
+            ("x-nc-proxied", "1"),
+            // Case permutations map to the same HTTP_ key the lowercase
+            // strip list rejects.
+            ("X-Nc-UsEr", "evil2"),
+        ]);
+        let params = build_fcgi_params(&headers);
+        let xnc: Vec<&(String, String)> = params
+            .iter()
+            .filter(|(k, _)| k.starts_with("HTTP_X_NC_"))
+            .collect();
+        assert!(
+            xnc.is_empty(),
+            "client-supplied X-NC-* headers must never become params, got: {xnc:?}"
+        );
+    }
+
+    /// The strip is exact for the five identity/marker headers; ordinary
+    /// headers still forward with the PHP `HTTP_*` naming convention.
+    #[test]
+    fn ordinary_headers_forward_and_identity_headers_are_stripped() {
+        let headers = header_map(&[
+            ("accept", "application/json"),
+            ("user-agent", "nc-test/1.0"),
+            ("x-nc-proxied", "forged"),
+            ("x-nc-user", "forged"),
+        ]);
+        let params = build_fcgi_params(&headers);
+        let map: std::collections::HashMap<&str, &str> = params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(map.get("HTTP_ACCEPT"), Some(&"application/json"));
+        assert_eq!(map.get("HTTP_USER_AGENT"), Some(&"nc-test/1.0"));
+        assert!(map.get("HTTP_X_NC_PROXIED").is_none());
+        assert!(map.get("HTTP_X_NC_USER").is_none());
+    }
+
+    /// Content headers are forwarded as the dedicated CGI params, never as
+    /// `HTTP_*` duplicates.
+    #[test]
+    fn content_headers_are_not_forwarded_as_http_params() {
+        let headers = header_map(&[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("content-length", "123"),
+        ]);
+        let params = build_fcgi_params(&headers);
+        assert!(params.is_empty());
+    }
+
+    // ── body limit (F4, Wave 2.1) ─────────────────────────────────────────────
+
+    fn test_fpm_state() -> FastCgiState {
+        FastCgiState {
+            socket_path: std::path::PathBuf::from("/nonexistent/nc-fpm.sock"),
+            timeout_ms: 30_000,
+            nc_root: std::path::PathBuf::from("/nonexistent"),
+            shim_path: std::path::PathBuf::from("/nonexistent/index.php"),
+            session_resolve_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        }
+    }
+
+    /// An oversized request body is a CLIENT condition: 413 (Payload Too
+    /// Large, parity with nginx/Apache), not 502 (which would blame the
+    /// upstream).  The body is buffered (step 8) before the socket connect
+    /// (step 9), so no socket is needed for this test.
+    #[tokio::test]
+    async fn body_over_limit_returns_413_not_502() {
+        let fpm = test_fpm_state();
+        let req = axum::extract::Request::builder()
+            .method("POST")
+            .uri("/index.php/apps/profiler/")
+            .body(axum::body::Body::from(vec![0u8; 64 * 1024 * 1024 + 1]))
+            .unwrap();
+        let resp = proxy_handler(&fpm, req).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// A body within the cap is buffered and the request proceeds — here it
+    /// fails later at the socket connect (502), proving the 413 path is the
+    /// limit, not the read.
+    #[tokio::test]
+    async fn body_within_limit_proceeds_to_connect() {
+        let fpm = test_fpm_state();
+        let req = axum::extract::Request::builder()
+            .method("POST")
+            .uri("/index.php/apps/profiler/")
+            .body(axum::body::Body::from(vec![0u8; 1024]))
+            .unwrap();
+        let resp = proxy_handler(&fpm, req).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_GATEWAY);
     }
 }

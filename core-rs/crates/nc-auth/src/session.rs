@@ -25,10 +25,22 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// TTL for entries in the session identity cache.
+/// Default TTL for positive entries in the session identity cache.
 ///
-/// PHP session logout/invalidation takes effect within this window.
+/// PHP session logout/invalidation takes effect within this window.  This is
+/// the remember-me **revocation knob** (Wave 2.1): lowering it trades one
+/// FastCGI round-trip per browser request for faster logout propagation
+/// (10-15 s is the recommended operating range when revocation latency
+/// matters); the per-request effective value comes from `session_cache_ttl`
+/// in `config.php` when set.
 pub const SESSION_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// TTL for negative entries — a failed `__session_resolve` (junk cookie,
+/// expired session, unauthenticated) is cached for this long so an
+/// attacker's request burst hits memory, not PHP-FPM (F3, Wave 2.1).
+/// Long enough to absorb a burst, short enough that a just-completed PHP
+/// login is barely delayed.
+pub const SESSION_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// How often expired entries are proactively evicted.
 pub const SESSION_CACHE_EVICT_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -36,11 +48,19 @@ pub const SESSION_CACHE_EVICT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Key type: `SHA-256` of the raw PHP session cookie value.
 pub type SessionCacheKey = [u8; 32];
 
+/// One cache entry: a resolved identity (positive) or a failed resolution
+/// (negative).  Negative entries expire on [`SESSION_NEGATIVE_CACHE_TTL`],
+/// positive ones on the positive TTL — both are evicted together.
+#[derive(Debug, Clone)]
+pub enum SessionCacheEntry {
+    Positive(SessionIdentity, Instant),
+    Negative(Instant),
+}
+
 /// Shared session-identity cache (§7.9.5).
 ///
 /// `DashMap` gives lock-free concurrent reads on the hot path.
-/// Each entry holds `(identity, inserted_at)`.
-pub type SessionCache = dashmap::DashMap<SessionCacheKey, (SessionIdentity, Instant)>;
+pub type SessionCache = dashmap::DashMap<SessionCacheKey, SessionCacheEntry>;
 pub type SharedSessionCache = Arc<SessionCache>;
 
 /// Compute the `DashMap` cache key for a PHP session cookie value.
@@ -59,35 +79,80 @@ pub fn new_session_cache() -> SharedSessionCache {
     Arc::new(SessionCache::new())
 }
 
-/// Insert or replace an identity in the cache.
+/// Insert or replace a resolved identity in the cache.
 ///
 /// The `inserted_at` timestamp is set to `Instant::now()`.
 pub fn cache_insert(cache: &SessionCache, key: SessionCacheKey, identity: SessionIdentity) {
-    cache.insert(key, (identity, Instant::now()));
+    cache.insert(key, SessionCacheEntry::Positive(identity, Instant::now()));
 }
 
-/// Look up a cached identity.
+/// Record a failed resolution under `key` (F3, Wave 2.1).
 ///
-/// Returns `Some(identity.clone())` when a non-expired entry exists.
-/// Returns `None` on a cache miss or when the entry has exceeded
-/// [`SESSION_CACHE_TTL`].
-pub fn cache_lookup(cache: &SessionCache, key: &SessionCacheKey) -> Option<SessionIdentity> {
-    if let Some(entry) = cache.get(key) {
-        let (ref identity, inserted_at) = *entry;
-        if inserted_at.elapsed() < SESSION_CACHE_TTL {
-            return Some(identity.clone());
+/// A negative entry makes [`cache_lookup`] report `CacheLookup::Negative`
+/// until it expires after [`SESSION_NEGATIVE_CACHE_TTL`] — the caller treats
+/// that exactly like a fresh failed `__session_resolve` (anonymous) but
+/// without touching PHP-FPM.
+pub fn cache_insert_negative(cache: &SessionCache, key: SessionCacheKey) {
+    cache.insert(key, SessionCacheEntry::Negative(Instant::now()));
+}
+
+/// Outcome of [`cache_lookup`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheLookup {
+    /// Fresh positive entry — the cached identity.
+    Positive(SessionIdentity),
+    /// Fresh negative entry — the last resolution for this cookie failed
+    /// within the negative TTL; treat as anonymous without re-resolving.
+    Negative,
+    /// No entry, or the entry has exceeded its TTL — resolve again.
+    Miss,
+}
+
+/// Look up a cached entry.
+///
+/// `positive_ttl` is the effective positive-entry TTL for this request (the
+/// `session_cache_ttl` config value, default [`SESSION_CACHE_TTL`]) — the
+/// revocation knob.  Negative entries always use
+/// [`SESSION_NEGATIVE_CACHE_TTL`].
+pub fn cache_lookup(cache: &SessionCache, key: &SessionCacheKey, positive_ttl: Duration) -> CacheLookup {
+    let Some(entry) = cache.get(key) else {
+        return CacheLookup::Miss;
+    };
+    match *entry.value() {
+        SessionCacheEntry::Positive(ref identity, inserted_at) => {
+            if inserted_at.elapsed() < positive_ttl {
+                CacheLookup::Positive(identity.clone())
+            } else {
+                CacheLookup::Miss
+            }
+        }
+        SessionCacheEntry::Negative(inserted_at) => {
+            if inserted_at.elapsed() < SESSION_NEGATIVE_CACHE_TTL {
+                CacheLookup::Negative
+            } else {
+                CacheLookup::Miss
+            }
         }
     }
-    None
 }
 
-/// Remove all entries older than [`SESSION_CACHE_TTL`].
+/// Remove all entries older than their own TTL (positive by
+/// [`SESSION_CACHE_TTL`], negative by [`SESSION_NEGATIVE_CACHE_TTL`]).
 ///
 /// Called periodically (every [`SESSION_CACHE_EVICT_INTERVAL`]) to prevent
 /// unbounded map growth.  TTL is the only eviction mechanism — there is no
-/// explicit logout invalidation.
+/// explicit logout invalidation.  A `session_cache_ttl` config value LOWER
+/// than the default only sharpens lookup-time expiry; the periodic eviction
+/// with the default TTL still bounds the map.
 pub fn cache_evict_expired(cache: &SessionCache) {
-    cache.retain(|_, (_, inserted_at)| inserted_at.elapsed() < SESSION_CACHE_TTL);
+    cache.retain(|_, entry| match entry {
+        SessionCacheEntry::Positive(_, inserted_at) => {
+            inserted_at.elapsed() < SESSION_CACHE_TTL
+        }
+        SessionCacheEntry::Negative(inserted_at) => {
+            inserted_at.elapsed() < SESSION_NEGATIVE_CACHE_TTL
+        }
+    });
 }
 
 /// Result of the strict-cookie guard.
@@ -366,16 +431,16 @@ mod tests {
         let key = make_cache_key("sessionid-abc");
         cache_insert(&cache, key, sample_identity());
 
-        let result = cache_lookup(&cache, &key);
-        assert_eq!(result, Some(sample_identity()));
+        let result = cache_lookup(&cache, &key, SESSION_CACHE_TTL);
+        assert_eq!(result, CacheLookup::Positive(sample_identity()));
     }
 
-    /// A cache miss returns `None`.
+    /// A cache miss returns `Miss`.
     #[test]
     fn session_cache_miss_for_unknown_key() {
         let cache = SessionCache::new();
         let key = make_cache_key("nonexistent");
-        assert_eq!(cache_lookup(&cache, &key), None);
+        assert_eq!(cache_lookup(&cache, &key, SESSION_CACHE_TTL), CacheLookup::Miss);
     }
 
     /// An entry inserted with a deliberately aged timestamp is treated as
@@ -392,10 +457,33 @@ mod tests {
         let old_time = Instant::now()
             .checked_sub(SESSION_CACHE_TTL + Duration::from_secs(1))
             .expect("instant subtraction should not underflow on test systems");
-        cache.insert(key, (sample_identity(), old_time));
+        cache.insert(key, SessionCacheEntry::Positive(sample_identity(), old_time));
 
-        // Should be considered expired → None.
-        assert_eq!(cache_lookup(&cache, &key), None);
+        // Should be considered expired → Miss.
+        assert_eq!(cache_lookup(&cache, &key, SESSION_CACHE_TTL), CacheLookup::Miss);
+    }
+
+    /// The `session_cache_ttl` revocation knob: a positive entry that the
+    /// default TTL would still serve is already `Miss` under a shorter TTL.
+    #[test]
+    fn session_cache_positive_ttl_is_a_knob() {
+        let cache = SessionCache::new();
+        let key = make_cache_key("knob-session");
+        let old_time = Instant::now()
+            .checked_sub(Duration::from_secs(30))
+            .expect("instant subtraction should not underflow on test systems");
+        cache.insert(key, SessionCacheEntry::Positive(sample_identity(), old_time));
+
+        assert_eq!(
+            cache_lookup(&cache, &key, Duration::from_secs(60)),
+            CacheLookup::Positive(sample_identity()),
+            "30 s old entry is fresh under the default 60 s TTL"
+        );
+        assert_eq!(
+            cache_lookup(&cache, &key, Duration::from_secs(10)),
+            CacheLookup::Miss,
+            "same entry is expired under a 10 s revocation knob"
+        );
     }
 
     /// `cache_evict_expired` removes entries older than TTL and retains fresh ones.
@@ -413,7 +501,7 @@ mod tests {
         let old_time = Instant::now()
             .checked_sub(SESSION_CACHE_TTL + Duration::from_secs(1))
             .expect("instant subtraction should not underflow on test systems");
-        cache.insert(stale_key, (sample_identity(), old_time));
+        cache.insert(stale_key, SessionCacheEntry::Positive(sample_identity(), old_time));
 
         assert_eq!(cache.len(), 2);
 
@@ -422,5 +510,64 @@ mod tests {
         assert_eq!(cache.len(), 1, "stale entry should have been evicted");
         assert!(cache.get(&fresh_key).is_some(), "fresh entry must be retained");
         assert!(cache.get(&stale_key).is_none(), "stale entry must be gone");
+    }
+
+    // ── Negative caching (F3, Wave 2.1) ─────────────────────────────────────
+
+    /// A negative entry is served within its TTL — repeated junk cookies hit
+    /// memory, not PHP-FPM.
+    #[test]
+    fn negative_result_cached_within_ttl() {
+        let cache = SessionCache::new();
+        let key = make_cache_key("junk-cookie");
+        cache_insert_negative(&cache, key);
+
+        let result = cache_lookup(&cache, &key, SESSION_CACHE_TTL);
+        assert_eq!(result, CacheLookup::Negative);
+    }
+
+    /// A negative entry expires after [`SESSION_NEGATIVE_CACHE_TTL`] — a
+    /// just-completed PHP login is barely delayed (the next request resolves
+    /// again).
+    #[test]
+    fn negative_cache_expires_after_ttl() {
+        let cache = SessionCache::new();
+        let key = make_cache_key("expiring-junk");
+        let old_time = Instant::now()
+            .checked_sub(SESSION_NEGATIVE_CACHE_TTL + Duration::from_secs(1))
+            .expect("instant subtraction should not underflow on test systems");
+        cache.insert(key, SessionCacheEntry::Negative(old_time));
+
+        assert_eq!(
+            cache_lookup(&cache, &key, SESSION_CACHE_TTL),
+            CacheLookup::Miss,
+            "negative entry past its TTL must be re-resolvable"
+        );
+    }
+
+    /// Positive and negative entries share the same map and eviction — the
+    /// periodic sweep drops both kinds past their own TTLs and keeps both
+    /// kinds when fresh.
+    #[test]
+    fn positive_and_negative_entries_share_eviction() {
+        let cache = SessionCache::new();
+
+        let fresh_pos = make_cache_key("fresh-pos");
+        let fresh_neg = make_cache_key("fresh-neg");
+        let stale_neg = make_cache_key("stale-neg");
+
+        cache_insert(&cache, fresh_pos, sample_identity());
+        cache_insert_negative(&cache, fresh_neg);
+        let stale_time = Instant::now()
+            .checked_sub(SESSION_NEGATIVE_CACHE_TTL + Duration::from_secs(1))
+            .expect("instant subtraction should not underflow on test systems");
+        cache.insert(stale_neg, SessionCacheEntry::Negative(stale_time));
+
+        assert_eq!(cache.len(), 3);
+        cache_evict_expired(&cache);
+        assert_eq!(cache.len(), 2, "stale negative evicted, fresh of both kinds kept");
+        assert!(cache.get(&fresh_pos).is_some());
+        assert!(cache.get(&fresh_neg).is_some());
+        assert!(cache.get(&stale_neg).is_none());
     }
 }
