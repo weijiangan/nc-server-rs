@@ -365,7 +365,29 @@ pub async fn run_ops(
                 client.copy(&interpolate(from, vars), &interpolate(to, vars)).await?
             }
             Op::Propfind { path, depth } => {
-                client.propfind(&interpolate(path, vars), depth.unwrap_or(0), None).await?
+                let resp = client
+                    .propfind(&interpolate(path, vars), depth.unwrap_or(0), None)
+                    .await?;
+                let status = resp.status();
+                // Consume the response body: dav-server-rs streams PROPFIND
+                // responses, and read_dir + the batch queries run inside the
+                // stream — dropping the body skips the very work the replay
+                // must reproduce (the oracle's PHP builds the response
+                // eagerly).  Phase-21 milestone: the SUT's depth-1 read side
+                // effects (lazy cache row, batches) never ran in the replay.
+                // The body is deliberately NOT recorded for comparison — the
+                // propfind XML shapes differ in known ways (prolog, namespace
+                // prefixes, etag quote-escaping); the delta diff is the
+                // propfind's parity surface.
+                let _ = resp.text().await.with_context(|| "reading propfind body")?;
+                results.push(OpResult {
+                    op: describe(op),
+                    status: status.as_u16(),
+                    body: None,
+                    body_bytes: None,
+                    elapsed: start.elapsed(),
+                });
+                continue;
             }
             Op::Proppatch { path, body } => client.proppatch(&interpolate(path, vars), body).await?,
             Op::ShareCreate {
