@@ -1367,19 +1367,55 @@ impl DavFileSystem for NcFileSystem {
                 .fileid,
             };
 
-            // Fetch all direct children with their extended metadata in one
-            // LEFT JOIN (round-3 Task 9) — the same single-query shape as
-            // PHP's `Cache::getFolderContentsById` (`selectFileCache` +
-            // `selectMetadata`, Cache.php:214).  Previously two queries
-            // (list_children + list_extended_batch); children without an
-            // extended row get zero times, as before.
-            let (children, extended_map) = row::list_children_with_ext(
-                &self.state.pool,
-                &self.state.table_prefix,
-                dir_fileid,
-                self.storage_id,
-            )
-            .await;
+            // Fetch all direct children with their extended metadata — the
+            // same single-query shape as PHP's
+            // `Cache::getFolderContentsById` (`selectFileCache` +
+            // `selectMetadata`, Cache.php:214).
+            // Resolved once at startup (phase-21 S3) — the read path never
+            // re-looks it up.
+            let dir_mime_id = self.state.dir_mime_id;
+            // PHASE-22 T7: on Postgres the whole child fan-out (listing +
+            // dir counts + shares/notes + comments + system tags) is ONE
+            // statement — the CTE's `kids` rows are exactly these children +
+            // extended rows.  SQLite keeps the JOIN listing and the batched
+            // families.
+            let (children, extended_map, cte) = if self.state.pool.is_postgres() {
+                let cte = row::propfind_batch_cte(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    dir_fileid,
+                    self.storage_id,
+                    dir_mime_id,
+                    &self.uid,
+                )
+                .await;
+                let row::PropfindCte {
+                    children,
+                    extended,
+                    dir_counts,
+                    share_details,
+                    share_notes,
+                    comments,
+                    system_tags,
+                } = cte;
+                let cte = Some((
+                    dir_counts,
+                    share_details,
+                    share_notes,
+                    comments,
+                    system_tags,
+                ));
+                (children, extended, cte)
+            } else {
+                let (children, extended_map) = row::list_children_with_ext(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    dir_fileid,
+                    self.storage_id,
+                )
+                .await;
+                (children, extended_map, None)
+            };
 
             // Phase-21 milestone fix: PHP lazily materializes the user's
             // `cache/` row on the first home-root read (fresh-install
@@ -1396,9 +1432,6 @@ impl DavFileSystem for NcFileSystem {
             }
 
             let child_ids: Vec<i64> = children.iter().map(|c| c.fileid).collect();
-            // Resolved once at startup (phase-21 S3) — the read path never
-            // re-looks it up.
-            let dir_mime_id = self.state.dir_mime_id;
             // Only directory children can have children of their own (T6.2):
             // keep the dir-count batch's parent list to directories so files
             // never enter the IN list or the GROUP BY scan.
@@ -1505,58 +1538,135 @@ impl DavFileSystem for NcFileSystem {
                     )
                 }),
             };
-            let (counts, share_maps, cc_unreads, tags, props, _) = tokio::join!(
-                async {
-                    if want_dir_counts {
-                        row::count_children_batch(
-                            &self.state.pool,
-                            &self.state.table_prefix,
-                            &dir_child_ids,
-                            self.storage_id,
-                            dir_mime_id,
-                        )
-                        .await
-                    } else {
-                        std::collections::HashMap::new()
+            // PHASE-22 T7: on Postgres the CTE already carried dir counts,
+            // shares/notes, comments and system tags — fill the batch maps
+            // directly (the per-family statements do not exist on this path).
+            if let Some((dir_counts, share_details, share_notes, comments, system_tags)) = cte {
+                if !child_ids.is_empty() {
+                    batch
+                        .dir_counts
+                        .lock()
+                        .expect("propfind batch lock")
+                        .extend(dir_counts);
+                    batch
+                        .share_details
+                        .lock()
+                        .expect("propfind batch lock")
+                        .extend(share_details);
+                    batch
+                        .share_notes
+                        .lock()
+                        .expect("propfind batch lock")
+                        .extend(share_notes);
+                    {
+                        let mut comments = batch.comments.lock().expect("propfind batch lock");
+                        for id in &child_ids {
+                            let (c, u) = comments.get(id).copied().unwrap_or((0, 0));
+                            comments.insert(*id, (c, u));
+                        }
                     }
-                },
-                async {
-                    if want_shares {
-                        row::share_details_and_notes_batch(
-                            &self.state.pool,
-                            &self.state.table_prefix,
-                            &self.uid,
-                            &child_ids,
-                        )
-                        .await
-                    } else {
-                        (
-                            std::collections::HashMap::new(),
-                            std::collections::HashMap::new(),
-                        )
-                    }
-                },
-                async {
-                    if want_comments {
-                        row::comments_counts_batch(
-                            &self.state.pool,
-                            &self.state.table_prefix,
-                            &child_ids,
-                            &self.uid,
-                        )
-                        .await
-                    } else {
-                        std::collections::HashMap::new()
-                    }
-                },
-                async {
-                    if want_system_tags {
-                        row::system_tags_batch(&self.state.pool, &self.state.table_prefix, &child_ids)
+                    batch
+                        .system_tags
+                        .lock()
+                        .expect("propfind batch lock")
+                        .extend(system_tags);
+                }
+            } else {
+                // SQLite: the batched families (T6.1/T6.3 merges), gated per
+                // T6.6 like the families above.
+                let (counts, share_maps, cc_unreads, tags) = tokio::join!(
+                    async {
+                        if want_dir_counts {
+                            row::count_children_batch(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                &dir_child_ids,
+                                self.storage_id,
+                                dir_mime_id,
+                            )
                             .await
-                    } else {
-                        std::collections::HashMap::new()
+                        } else {
+                            std::collections::HashMap::new()
+                        }
+                    },
+                    async {
+                        if want_shares {
+                            row::share_details_and_notes_batch(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                &self.uid,
+                                &child_ids,
+                            )
+                            .await
+                        } else {
+                            (
+                                std::collections::HashMap::new(),
+                                std::collections::HashMap::new(),
+                            )
+                        }
+                    },
+                    async {
+                        if want_comments {
+                            row::comments_counts_batch(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                &child_ids,
+                                &self.uid,
+                            )
+                            .await
+                        } else {
+                            std::collections::HashMap::new()
+                        }
+                    },
+                    async {
+                        if want_system_tags {
+                            row::system_tags_batch(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                &child_ids,
+                            )
+                            .await
+                        } else {
+                            std::collections::HashMap::new()
+                        }
+                    },
+                );
+                let (details, notes) = share_maps;
+                if !child_ids.is_empty() {
+                    batch
+                        .dir_counts
+                        .lock()
+                        .expect("propfind batch lock")
+                        .extend(counts);
+                    batch
+                        .share_details
+                        .lock()
+                        .expect("propfind batch lock")
+                        .extend(details);
+                    batch
+                        .share_notes
+                        .lock()
+                        .expect("propfind batch lock")
+                        .extend(notes);
+                    {
+                        let mut comments = batch.comments.lock().expect("propfind batch lock");
+                        for id in &child_ids {
+                            let (c, u) = cc_unreads.get(id).copied().unwrap_or((0, 0));
+                            comments.insert(*id, (c, u));
+                        }
                     }
-                },
+                    batch
+                        .system_tags
+                        .lock()
+                        .expect("propfind batch lock")
+                        .extend(tags);
+                }
+            }
+            // Custom props + the tag prefetch — both paths, gated (T6.6).
+            // Custom props cannot fold into the CTE (the property-path hash
+            // is Rust-side and the children's names only exist after the
+            // query); the prefetch covers oc_vcategory, a different shape.
+            let (props, _) = tokio::join!(
                 async {
                     if want_custom_props {
                         row::custom_properties_batch(
@@ -1588,35 +1698,7 @@ impl DavFileSystem for NcFileSystem {
                     }
                 },
             );
-            let (details, notes) = share_maps;
             if !child_ids.is_empty() {
-                batch
-                    .dir_counts
-                    .lock()
-                    .expect("propfind batch lock")
-                    .extend(counts);
-                batch
-                    .share_details
-                    .lock()
-                    .expect("propfind batch lock")
-                    .extend(details);
-                batch
-                    .share_notes
-                    .lock()
-                    .expect("propfind batch lock")
-                    .extend(notes);
-                {
-                    let mut comments = batch.comments.lock().expect("propfind batch lock");
-                    for id in &child_ids {
-                        let (c, u) = cc_unreads.get(id).copied().unwrap_or((0, 0));
-                        comments.insert(*id, (c, u));
-                    }
-                }
-                batch
-                    .system_tags
-                    .lock()
-                    .expect("propfind batch lock")
-                    .extend(tags);
                 batch
                     .custom_props
                     .lock()

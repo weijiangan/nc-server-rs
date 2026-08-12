@@ -571,3 +571,31 @@ JOIN listing plus the depth-0 root's fixed single-row fallbacks. A
 desktop-like set (`d:getetag` + `oc:favorite` + `nc:system-tags`) runs
 exactly the requested families in batch form. Allprop requests are
 unchanged (bare PROPFIND → allprop → all families, the budget above).
+
+## Phase 22 — single-query CTE PROPFIND, T7 (2026-08-13)
+
+**Budget gate** (re-measured, budgets lowered again in `perf-budget.yaml`):
+
+| class | statements | budget |
+|---|---|---|
+| status | 0 | 0 |
+| get_file | 5 | 5 |
+| propfind_depth0 | 11 | 11 |
+| propfind_depth1 | **14** | **14** |
+| put_new | 16 | 16 |
+| **scaling delta** (depth1 − depth0) | **3** | **3** |
+
+The 18 → 14 drop is the T7 CTE: the five per-family batch statements
+(counts, shares, comments, system tags, custom props) collapse into one
+`WITH kids AS (…)` + correlated `json_agg` sub-selects — 14 = depth-0's
+11 + CTE(1) + display-name lookup(1) + custom props(1). Custom props stay
+separate (the property-path hash is Rust-side; see phase-22 deviations).
+
+**SC=14** (30-iteration, single window): root 2.40 / Media 2.57 /
+total 5.20 ms p50, ratio ~9.3× vs PHP — flat within local jitter, as
+expected: the CTE removes statements and round trips, and local
+statements cost ~0.1-0.2 ms.
+
+**Correctness**: allprop children etags byte-match PHP on both the root
+and /Media listings; explicit `<prop>` responses unchanged (the gated
+getetag-only request still returns 1093 B).

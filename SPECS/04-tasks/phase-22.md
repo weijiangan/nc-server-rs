@@ -78,8 +78,8 @@ Goal: the whole child fan-out in one statement — `LATERAL` + `json_agg` sub-se
 | S0 | T7.1 | Core families in the CTE (children + extended + dir counts); perf-gate re-measured (delta drops hard — re-measure, then lower). |
 | S1 | T7.2 | Shares/comments/tags/props families; perf-gate; milestone suite. |
 
-- [ ] **T7.1** The `WITH kids AS (SELECT fc.*, fe.metadata_etag, … FROM … WHERE parent = $1 AND storage = $2)` + `LATERAL`/`json_agg` sub-selects for children + extended + `count(*) FILTER` dir counts; decode in Rust.
-- [ ] **T7.2** Add the remaining families (shares+notes from the merged scan, comments counts+unread, system tags, custom props) as `LATERAL` sub-selects; drop the corresponding batch calls; re-measure and lower the budgets.
+- [x] **T7.1** The `WITH kids AS (SELECT fc.*, fe.metadata_etag, … FROM … WHERE parent = $1 AND storage = $2)` + `LATERAL`/`json_agg` sub-selects for children + extended + `count(*) FILTER` dir counts; decode in Rust.
+- [x] **T7.2** Add the remaining families (shares+notes from the merged scan, comments counts+unread, system tags, custom props) as `LATERAL` sub-selects; drop the corresponding batch calls; re-measure and lower the budgets.
 
 ---
 
@@ -158,6 +158,7 @@ Goal: verify the index claims against the live DB — verification only. Plan fi
 
 ## Deviations from the task descriptions
 
+- **T7.2** — `custom_properties_batch` is NOT folded into the CTE (it stays a separate gated statement). The `>250`-char property-path hash (`format_property_path`) is Rust-side, and the children's names — needed to build those paths — only exist after the query returns, so a CTE sub-select would need pgcrypto (not guaranteed) or an `unnest` indirection over paths built from a second query. One statement either way; the CTE still collapses 5 families → 1.
 - **T3.3** — "builds without the `any` feature" is not achievable within T3: the `Executor` delegation and the `string_to_array` SQL are Any-typed by construction (a single `DbPool` type serving both backends forces `Database = Any` at unmigrated call sites — verified against sqlx 0.8.6's `Executor`/`IntoArguments`/`AnyConnection` APIs). T3 sheds the Any *machinery* (AnyPool/AnyPoolOptions/`install_default_drivers`, the driver registry, the global `backend_is_postgres` latch) and builds native pools; the `any` cargo feature + the array-interim SQL stay until T4/T7 migrate the call sites to per-variant native queries, at which point the feature can be dropped for real.
 - **T6.6** — the task scopes prop-set gating to `read_dir`; the `{oc:}favorite`/`{oc:}tags` family additionally gates `get_props`'s `get_tag_info` call. Without it, skipping the prefetch turns one batch query into one query per child (the N+1 the batch exists to prevent) — the task's own goal would fail. Same predicate on both sides; behavior-neutral (PropWriter's 12.1 filter drops the props either way).
 

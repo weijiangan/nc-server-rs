@@ -33,11 +33,11 @@ classes:
     method: PROPFIND
     path: /remote.php/webdav/
     depth: 1
-    budget: 18
+    budget: 14
   - name: put_new
     method: PUT
     path: /remote.php/webdav/q-budget-<ts>.txt
     unique_path: true
     budget: 16
 
-scaling_delta_budget: 7
+scaling_delta_budget: 3
