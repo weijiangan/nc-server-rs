@@ -21,6 +21,8 @@ Each phase lives in its own file for context-size management:
 | 10 — PHP-Parity Discrepancy Remediation | [phase-10.md](phase-10.md) | ⬜ Not started |
 | 11 — Native Preview / Thumbnail Fast Path | [phase-11.md](phase-11.md) | ⬜ Not started |
 | 16 — Differential Integration-Test Harness | [phase-16.md](phase-16.md) | ⬜ Not started |
+| 18 — Performance improvements (flamegraph rounds 1-4) | [phase-18.md](phase-18.md) | ✅ Complete |
+| 21 — DAV read-path round-trip reduction, Tier 1 | [phase-21.md](phase-21.md) | 🔧 In progress |
 
 | Deferred improvements (nice-to-have) | [../02-specifications/improvements.md](../02-specifications/improvements.md) | ⬜ |
 
