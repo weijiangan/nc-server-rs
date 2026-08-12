@@ -4,7 +4,7 @@
 //! All queries are parameterised and use the table prefix from `NcDavState`.
 
 use md5::{Digest, Md5};
-use nc_db::pool::DbPool;
+use nc_db::pool::{backend_is_postgres, DbPool};
 use sqlx::Row;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -394,19 +394,35 @@ pub async fn list_extended_batch(
         return std::collections::HashMap::new();
     }
 
-    // Build an IN clause with numbered $N placeholders per fileid.
-    let placeholders = (1..=fileids.len())
-        .map(|i| format!("${i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT fileid, metadata_etag, creation_time, upload_time \
-         FROM {prefix}filecache_extended WHERE fileid IN ({placeholders})"
-    );
+    // Stable statement text per dialect (phase-21 S2): one text bind expanded
+    // server-side on Postgres, one bind per id on SQLite.
+    let pg = backend_is_postgres();
+    let sql = if pg {
+        format!(
+            "SELECT fileid, metadata_etag, creation_time, upload_time \
+             FROM {prefix}filecache_extended \
+             WHERE fileid = ANY(string_to_array($1, ',')::bigint[])",
+            prefix = prefix,
+        )
+    } else {
+        let placeholders = (1..=fileids.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT fileid, metadata_etag, creation_time, upload_time \
+             FROM {prefix}filecache_extended WHERE fileid IN ({placeholders})",
+            prefix = prefix,
+        )
+    };
 
     let mut query = sqlx::query(&sql);
-    for id in fileids {
-        query = query.bind(*id);
+    if pg {
+        query = query.bind(ids_csv(fileids));
+    } else {
+        for id in fileids {
+            query = query.bind(*id);
+        }
     }
 
     query
@@ -481,26 +497,51 @@ pub async fn count_children_batch(
         return std::collections::HashMap::new();
     }
     let n = parent_ids.len();
-    // $1 is the directory mimetype id (bound first); the IN list starts at $2.
-    let placeholders = (2..=n + 1)
-        .map(|i| format!("${i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT parent, \
-         SUM(CASE WHEN mimetype = $1 THEN 1 ELSE 0 END) AS dirs, \
-         SUM(CASE WHEN mimetype != $1 THEN 1 ELSE 0 END) AS files \
-         FROM {prefix}filecache \
-         WHERE parent IN ({placeholders}) AND storage = ${storage} \
-         GROUP BY parent",
-        prefix = prefix,
-        storage = n + 2,
-    );
-    let mut query = sqlx::query(&sql).bind(dir_mimetype_id);
-    for id in parent_ids {
-        query = query.bind(*id);
+    // Dialect-aware list binding (phase-21 S2): Postgres gets one text bind
+    // expanded server-side via string_to_array (stable statement text — no
+    // distinct prepared statement per child count); SQLite keeps one bind
+    // per id via `IN`.  Same statements, same results on both backends.
+    let pg = backend_is_postgres();
+    let sql = if pg {
+        format!(
+            "SELECT parent, \
+             SUM(CASE WHEN mimetype = $2 THEN 1 ELSE 0 END) AS dirs, \
+             SUM(CASE WHEN mimetype != $2 THEN 1 ELSE 0 END) AS files \
+             FROM {prefix}filecache \
+             WHERE parent = ANY(string_to_array($1, ',')::bigint[]) AND storage = $3 \
+             GROUP BY parent",
+            prefix = prefix,
+        )
+    } else {
+        // $1 is the directory mimetype id (bound first); the IN list starts at $2.
+        let placeholders = (2..=n + 1)
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT parent, \
+             SUM(CASE WHEN mimetype = $1 THEN 1 ELSE 0 END) AS dirs, \
+             SUM(CASE WHEN mimetype != $1 THEN 1 ELSE 0 END) AS files \
+             FROM {prefix}filecache \
+             WHERE parent IN ({placeholders}) AND storage = ${storage} \
+             GROUP BY parent",
+            prefix = prefix,
+            storage = n + 2,
+        )
+    };
+    let mut query = sqlx::query(&sql);
+    if pg {
+        query = query
+            .bind(ids_csv(parent_ids))
+            .bind(dir_mimetype_id)
+            .bind(storage);
+    } else {
+        query = query.bind(dir_mimetype_id);
+        for id in parent_ids {
+            query = query.bind(*id);
+        }
+        query = query.bind(storage);
     }
-    query = query.bind(storage);
     query
         .fetch_all(pool)
         .await
@@ -592,19 +633,33 @@ pub async fn share_notes_batch(
     if fileids.is_empty() {
         return std::collections::HashMap::new();
     }
-    let placeholders = (1..=fileids.len())
-        .map(|i| format!("${i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT file_source, note FROM {prefix}share \
-         WHERE file_source IN ({placeholders}) AND note != '' \
-         ORDER BY file_source, stime DESC",
-        prefix = prefix,
-    );
+    let pg = backend_is_postgres();
+    let sql = if pg {
+        format!(
+            "SELECT file_source, note FROM {prefix}share \
+             WHERE file_source = ANY(string_to_array($1, ',')::bigint[]) AND note != '' \
+             ORDER BY file_source, stime DESC",
+            prefix = prefix,
+        )
+    } else {
+        let placeholders = (1..=fileids.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT file_source, note FROM {prefix}share \
+             WHERE file_source IN ({placeholders}) AND note != '' \
+             ORDER BY file_source, stime DESC",
+            prefix = prefix,
+        )
+    };
     let mut query = sqlx::query(&sql);
-    for id in fileids {
-        query = query.bind(*id);
+    if pg {
+        query = query.bind(ids_csv(fileids));
+    } else {
+        for id in fileids {
+            query = query.bind(*id);
+        }
     }
     let mut notes = std::collections::HashMap::new();
     for row in query.fetch_all(pool).await.unwrap_or_default() {
@@ -733,6 +788,10 @@ pub async fn custom_properties_batch(
         .iter()
         .map(|p| (format_property_path(p), p.as_str()))
         .collect();
+    // NOTE (phase-21 S2): stays on `IN (...)` — the values are raw fc paths,
+    // which may contain commas, so the comma-joined `string_to_array` bind
+    // used elsewhere is unsafe here.  Revisit with a real `text[]` bind when
+    // the native PgPool lands (plan finding 3/4, Tier 3).
     // $1 is the userid (bound first); the IN list starts at $2.
     let placeholders = (2..=paths.len() + 1)
         .map(|i| format!("${i}"))
@@ -1087,22 +1146,38 @@ pub async fn share_details_batch(
         return std::collections::HashMap::new();
     }
     let n = fileids.len();
-    let placeholders = (1..=n)
-        .map(|i| format!("${i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT file_source, share_type, share_with \
-         FROM {prefix}share \
-         WHERE file_source IN ({placeholders}) \
-         AND share_type IN (0,1,3,4,6,7,10,12) \
-         AND (uid_owner = ${uid} OR uid_initiator = ${uid} OR share_with = ${uid})",
-        prefix = prefix,
-        uid = n + 1,
-    );
+    let pg = backend_is_postgres();
+    let sql = if pg {
+        format!(
+            "SELECT file_source, share_type, share_with \
+             FROM {prefix}share \
+             WHERE file_source = ANY(string_to_array($1, ',')::bigint[]) \
+             AND share_type IN (0,1,3,4,6,7,10,12) \
+             AND (uid_owner = $2 OR uid_initiator = $2 OR share_with = $2)",
+            prefix = prefix,
+        )
+    } else {
+        let placeholders = (1..=n)
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT file_source, share_type, share_with \
+             FROM {prefix}share \
+             WHERE file_source IN ({placeholders}) \
+             AND share_type IN (0,1,3,4,6,7,10,12) \
+             AND (uid_owner = ${uid} OR uid_initiator = ${uid} OR share_with = ${uid})",
+            prefix = prefix,
+            uid = n + 1,
+        )
+    };
     let mut query = sqlx::query(&sql);
-    for id in fileids {
-        query = query.bind(*id);
+    if pg {
+        query = query.bind(ids_csv(fileids));
+    } else {
+        for id in fileids {
+            query = query.bind(*id);
+        }
     }
     query = query.bind(uid);
     let rows = match query.fetch_all(pool).await {
@@ -1160,19 +1235,33 @@ async fn batch_lookup_display_names(
     // 1. Batch-query oc_users.displayname first — PHP's primary source
     //    (User::getDisplayName → backend); see lookup_user_display_name for
     //    why oc_accounts is only a (potentially stale) fallback.
-    let placeholders = uids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("${}", i + 1))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let users_sql = format!(
-        "SELECT uid, displayname FROM {prefix}users WHERE uid IN ({placeholders})",
-        prefix = prefix
-    );
+    //    Uids are comma-safe (Nextcloud usernames: letters/digits/`_.@-'`).
+    let pg = backend_is_postgres();
+    let users_sql = if pg {
+        format!(
+            "SELECT uid, displayname FROM {prefix}users \
+             WHERE uid = ANY(string_to_array($1, ',')::text[])",
+            prefix = prefix
+        )
+    } else {
+        let placeholders = uids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("${}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT uid, displayname FROM {prefix}users WHERE uid IN ({placeholders})",
+            prefix = prefix
+        )
+    };
     let mut query = sqlx::query(&users_sql);
-    for uid in uids {
-        query = query.bind(uid);
+    if pg {
+        query = query.bind(uids.join(","));
+    } else {
+        for uid in uids {
+            query = query.bind(uid);
+        }
     }
     let user_rows = query.fetch_all(pool).await.unwrap_or_default();
     for row in user_rows {
@@ -1193,19 +1282,36 @@ async fn batch_lookup_display_names(
     // 2. Batch-query oc_accounts for the remaining UIDs (display names in
     //    JSON under data->'displayname'->>'value').
     if !unresolved.is_empty() {
-        let users_placeholders = unresolved
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("${}", i + 1))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let accounts_sql = format!(
-            "SELECT uid, data FROM {prefix}accounts WHERE uid IN ({users_placeholders})",
-            prefix = prefix
-        );
+        let accounts_sql = if pg {
+            format!(
+                "SELECT uid, data FROM {prefix}accounts \
+                 WHERE uid = ANY(string_to_array($1, ',')::text[])",
+                prefix = prefix
+            )
+        } else {
+            let users_placeholders = unresolved
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("${}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "SELECT uid, data FROM {prefix}accounts WHERE uid IN ({users_placeholders})",
+                prefix = prefix
+            )
+        };
         let mut query = sqlx::query(&accounts_sql);
-        for uid in &unresolved {
-            query = query.bind(uid);
+        if pg {
+            let csv = unresolved
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            query = query.bind(csv);
+        } else {
+            for uid in &unresolved {
+                query = query.bind(uid);
+            }
         }
         let account_rows: Vec<(String, String)> = query
             .fetch_all(pool)
@@ -1353,19 +1459,34 @@ pub async fn comments_counts_batch(
     if fileids.is_empty() {
         return std::collections::HashMap::new();
     }
-    let placeholders = (1..=fileids.len())
-        .map(|i| format!("${i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT object_id, COUNT(*) AS n FROM {prefix}comments \
-         WHERE object_type = 'files' AND object_id IN ({placeholders}) \
-         GROUP BY object_id",
-        prefix = prefix,
-    );
+    let pg = backend_is_postgres();
+    let sql = if pg {
+        format!(
+            "SELECT object_id, COUNT(*) AS n FROM {prefix}comments \
+             WHERE object_type = 'files' \
+             AND object_id = ANY(string_to_array($1, ',')::text[]) \
+             GROUP BY object_id",
+            prefix = prefix,
+        )
+    } else {
+        let placeholders = (1..=fileids.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT object_id, COUNT(*) AS n FROM {prefix}comments \
+             WHERE object_type = 'files' AND object_id IN ({placeholders}) \
+             GROUP BY object_id",
+            prefix = prefix,
+        )
+    };
     let mut query = sqlx::query(&sql);
-    for id in fileids {
-        query = query.bind(id.to_string());
+    if pg {
+        query = query.bind(ids_csv(fileids));
+    } else {
+        for id in fileids {
+            query = query.bind(id.to_string());
+        }
     }
     query
         .fetch_all(pool)
@@ -1395,26 +1516,47 @@ pub async fn comments_unread_batch(
         return std::collections::HashMap::new();
     }
     let n = fileids.len();
-    let placeholders = (1..=n)
-        .map(|i| format!("${i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT c.object_id, COUNT(*) AS n FROM {prefix}comments c \
-         WHERE c.object_type = 'files' AND c.object_id IN ({placeholders}) \
-         AND c.actor_type = 'users' AND c.actor_id != ${uid} \
-         AND c.creation_timestamp > COALESCE( \
-             (SELECT marker_datetime FROM {prefix}comments_read_markers m \
-              WHERE m.user_id = ${uid} AND m.object_type = 'files' AND m.object_id = c.object_id), \
-             '1970-01-01 00:00:00' \
-         ) \
-         GROUP BY c.object_id",
-        prefix = prefix,
-        uid = n + 1,
-    );
+    let pg = backend_is_postgres();
+    let sql = if pg {
+        format!(
+            "SELECT c.object_id, COUNT(*) AS n FROM {prefix}comments c \
+             WHERE c.object_type = 'files' \
+             AND c.object_id = ANY(string_to_array($1, ',')::text[]) \
+             AND c.actor_type = 'users' AND c.actor_id != $2 \
+             AND c.creation_timestamp > COALESCE( \
+                 (SELECT marker_datetime FROM {prefix}comments_read_markers m \
+                  WHERE m.user_id = $2 AND m.object_type = 'files' AND m.object_id = c.object_id), \
+                 '1970-01-01 00:00:00' \
+             ) \
+             GROUP BY c.object_id",
+            prefix = prefix,
+        )
+    } else {
+        let placeholders = (1..=n)
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT c.object_id, COUNT(*) AS n FROM {prefix}comments c \
+             WHERE c.object_type = 'files' AND c.object_id IN ({placeholders}) \
+             AND c.actor_type = 'users' AND c.actor_id != ${uid} \
+             AND c.creation_timestamp > COALESCE( \
+                 (SELECT marker_datetime FROM {prefix}comments_read_markers m \
+                  WHERE m.user_id = ${uid} AND m.object_type = 'files' AND m.object_id = c.object_id), \
+                 '1970-01-01 00:00:00' \
+             ) \
+             GROUP BY c.object_id",
+            prefix = prefix,
+            uid = n + 1,
+        )
+    };
     let mut query = sqlx::query(&sql);
-    for id in fileids {
-        query = query.bind(id.to_string());
+    if pg {
+        query = query.bind(ids_csv(fileids));
+    } else {
+        for id in fileids {
+            query = query.bind(id.to_string());
+        }
     }
     query = query.bind(uid);
     query
@@ -1588,22 +1730,39 @@ pub async fn system_tags_batch(
     if fileids.is_empty() {
         return std::collections::HashMap::new();
     }
-    let placeholders = (1..=fileids.len())
-        .map(|i| format!("${i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT m.objectid, t.id, t.name, t.visibility, t.editable, t.color \
-         FROM {prefix}systemtag t \
-         JOIN {prefix}systemtag_object_mapping m ON m.systemtagid = t.id \
-         WHERE m.objectid IN ({placeholders}) AND m.objecttype = 'files' \
-         AND t.visibility = 1 \
-         ORDER BY LOWER(t.name)",
-        prefix = prefix,
-    );
+    let pg = backend_is_postgres();
+    let sql = if pg {
+        format!(
+            "SELECT m.objectid, t.id, t.name, t.visibility, t.editable, t.color \
+             FROM {prefix}systemtag t \
+             JOIN {prefix}systemtag_object_mapping m ON m.systemtagid = t.id \
+             WHERE m.objectid = ANY(string_to_array($1, ',')::text[]) AND m.objecttype = 'files' \
+             AND t.visibility = 1 \
+             ORDER BY LOWER(t.name)",
+            prefix = prefix,
+        )
+    } else {
+        let placeholders = (1..=fileids.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT m.objectid, t.id, t.name, t.visibility, t.editable, t.color \
+             FROM {prefix}systemtag t \
+             JOIN {prefix}systemtag_object_mapping m ON m.systemtagid = t.id \
+             WHERE m.objectid IN ({placeholders}) AND m.objecttype = 'files' \
+             AND t.visibility = 1 \
+             ORDER BY LOWER(t.name)",
+            prefix = prefix,
+        )
+    };
     let mut query = sqlx::query(&sql);
-    for id in fileids {
-        query = query.bind(id.to_string());
+    if pg {
+        query = query.bind(ids_csv(fileids));
+    } else {
+        for id in fileids {
+            query = query.bind(id.to_string());
+        }
     }
     let mut out: std::collections::HashMap<i64, Vec<SystemTagRow>> =
         std::collections::HashMap::new();
@@ -1700,22 +1859,37 @@ pub async fn lookup_by_ids(
     if fileids.is_empty() {
         return std::collections::HashMap::new();
     }
-    let placeholders = fileids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("${}", i + 1))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
-         size, mtime, storage_mtime, etag, permissions, checksum, \
-         creation_time, upload_time \
-         FROM {prefix}filecache WHERE fileid IN ({placeholders})",
-        prefix = prefix
-    );
+    let pg = backend_is_postgres();
+    let sql = if pg {
+        format!(
+            "SELECT fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+             size, mtime, storage_mtime, etag, permissions, checksum, \
+             creation_time, upload_time \
+             FROM {prefix}filecache WHERE fileid = ANY(string_to_array($1, ',')::bigint[])",
+            prefix = prefix
+        )
+    } else {
+        let placeholders = fileids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("${}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+             size, mtime, storage_mtime, etag, permissions, checksum, \
+             creation_time, upload_time \
+             FROM {prefix}filecache WHERE fileid IN ({placeholders})",
+            prefix = prefix
+        )
+    };
     let mut query = sqlx::query(&sql);
-    for id in fileids {
-        query = query.bind(*id);
+    if pg {
+        query = query.bind(ids_csv(fileids));
+    } else {
+        for id in fileids {
+            query = query.bind(*id);
+        }
     }
     query
         .fetch_all(pool)
@@ -1730,6 +1904,15 @@ pub async fn lookup_by_ids(
 }
 
 // ─── private helper ───────────────────────────────────────────────────────────
+
+/// i64 ids as one comma-joined string for the Postgres `string_to_array`
+/// bind.  The Any driver cannot bind arrays (sqlx-core any/value.rs has no
+/// Array kind), so batch lists become one text bind on Postgres vs one bind
+/// per id on SQLite (phase-21 S2).  Statement text is then stable — no
+/// distinct prepared statement per list size.
+fn ids_csv(ids: &[i64]) -> String {
+    ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+}
 
 fn fc_row_from_any(r: &sqlx::any::AnyRow) -> FileCacheRow {
     FileCacheRow {

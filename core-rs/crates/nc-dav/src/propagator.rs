@@ -164,26 +164,23 @@ impl Propagator {
             .begin()
             .await
             .map_err(|e| format!("propagate BEGIN failed: {e}"))?;
+        let pg = tx.backend_name() == "PostgreSQL";
 
         // Pre-lock the parent rows in a deterministic order (see the doc
         // comment above).  Postgres-only: SQLite has whole-file locking (no
         // row locks, no deadlock hazard) and does not support `FOR UPDATE`.
-        // Binds: $1..$N = path_hashes, $(N+1) = storage.
-        if tx.backend_name() == "PostgreSQL" {
+        // Binds (phase-21 S2): $1 = path_hashes csv (md5 hex — comma-safe),
+        // expanded server-side via string_to_array; $2 = storage.
+        if pg {
             let lock_sql = format!(
                 "SELECT path_hash FROM {prefix}filecache \
-                 WHERE storage = ${storage_idx} AND path_hash IN ({in_clause}) \
+                 WHERE storage = $2 AND path_hash = ANY(string_to_array($1, ',')::text[]) \
                  ORDER BY path_hash FOR UPDATE",
                 prefix = self.prefix,
-                storage_idx = storage_idx,
-                in_clause = in_clause,
             );
-            let mut lock_q = sqlx::query(&lock_sql);
-            for h in parent_hashes {
-                lock_q = lock_q.bind(h);
-            }
-            lock_q = lock_q.bind(self.storage_id);
-            lock_q
+            sqlx::query(&lock_sql)
+                .bind(parent_hashes.join(","))
+                .bind(self.storage_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| format!("propagate pre-lock failed: {e}"))?;
@@ -192,31 +189,52 @@ impl Propagator {
         // Use CASE WHEN instead of GREATEST for cross-DB compatibility
         // (SQLite lacks GREATEST; PostgreSQL and MySQL support both).
         if size_difference != 0 {
-            // CASE WHEN size > -1 THEN MAX(size + $sizeDiff, -1) ELSE size END
-            let size_diff_idx = parent_hashes.len() + 4;
-
-            let sql = format!(
-                "UPDATE {prefix}filecache \
-                 SET mtime = CASE WHEN mtime < ${time_idx} THEN ${time_idx} ELSE mtime END, \
-                     etag = ${etag_idx}, \
-                     size = CASE WHEN size > -1 \
-                              THEN CASE WHEN size + ${size_diff_idx} < -1 THEN -1 \
-                                        ELSE size + ${size_diff_idx} END \
-                              ELSE size \
-                            END \
-                 WHERE storage = ${storage_idx} \
-                 AND path_hash IN ({in_clause})",
-                prefix = self.prefix,
-                time_idx = time_idx,
-                etag_idx = etag_idx,
-                size_diff_idx = size_diff_idx,
-                storage_idx = storage_idx,
-                in_clause = in_clause,
-            );
+            // CASE WHEN size > -1 THEN MAX(size + $sizeDiff, -1) ELSE size END.
+            // PG binds (phase-21 S2): $1 = hashes csv, $2 = storage, $3 = time,
+            // $4 = etag, $5 = size_difference — stable statement text.
+            let sql = if pg {
+                format!(
+                    "UPDATE {prefix}filecache \
+                     SET mtime = CASE WHEN mtime < $3 THEN $3 ELSE mtime END, \
+                         etag = $4, \
+                         size = CASE WHEN size > -1 \
+                                  THEN CASE WHEN size + $5 < -1 THEN -1 \
+                                            ELSE size + $5 END \
+                                  ELSE size \
+                                END \
+                     WHERE storage = $2 \
+                     AND path_hash = ANY(string_to_array($1, ',')::text[])",
+                    prefix = self.prefix,
+                )
+            } else {
+                let size_diff_idx = parent_hashes.len() + 4;
+                format!(
+                    "UPDATE {prefix}filecache \
+                     SET mtime = CASE WHEN mtime < ${time_idx} THEN ${time_idx} ELSE mtime END, \
+                         etag = ${etag_idx}, \
+                         size = CASE WHEN size > -1 \
+                                  THEN CASE WHEN size + ${size_diff_idx} < -1 THEN -1 \
+                                            ELSE size + ${size_diff_idx} END \
+                                  ELSE size \
+                                END \
+                     WHERE storage = ${storage_idx} \
+                     AND path_hash IN ({in_clause})",
+                    prefix = self.prefix,
+                    time_idx = time_idx,
+                    etag_idx = etag_idx,
+                    size_diff_idx = size_diff_idx,
+                    storage_idx = storage_idx,
+                    in_clause = in_clause,
+                )
+            };
 
             let mut query = sqlx::query(&sql);
-            for h in parent_hashes {
-                query = query.bind(h);
+            if pg {
+                query = query.bind(parent_hashes.join(","));
+            } else {
+                for h in parent_hashes {
+                    query = query.bind(h);
+                }
             }
             query = query.bind(self.storage_id);
             query = query.bind(time);
@@ -229,22 +247,37 @@ impl Propagator {
                 .map_err(|e| format!("propagate UPDATE with size failed: {e}"))?;
         } else {
             // No size change — only etag + mtime.
-            let sql = format!(
-                "UPDATE {prefix}filecache \
-                 SET mtime = CASE WHEN mtime < ${time_idx} THEN ${time_idx} ELSE mtime END, \
-                     etag = ${etag_idx} \
-                 WHERE storage = ${storage_idx} \
-                 AND path_hash IN ({in_clause})",
-                prefix = self.prefix,
-                time_idx = time_idx,
-                etag_idx = etag_idx,
-                storage_idx = storage_idx,
-                in_clause = in_clause,
-            );
+            let sql = if pg {
+                format!(
+                    "UPDATE {prefix}filecache \
+                     SET mtime = CASE WHEN mtime < $3 THEN $3 ELSE mtime END, \
+                         etag = $4 \
+                     WHERE storage = $2 \
+                     AND path_hash = ANY(string_to_array($1, ',')::text[])",
+                    prefix = self.prefix,
+                )
+            } else {
+                format!(
+                    "UPDATE {prefix}filecache \
+                     SET mtime = CASE WHEN mtime < ${time_idx} THEN ${time_idx} ELSE mtime END, \
+                         etag = ${etag_idx} \
+                     WHERE storage = ${storage_idx} \
+                     AND path_hash IN ({in_clause})",
+                    prefix = self.prefix,
+                    time_idx = time_idx,
+                    etag_idx = etag_idx,
+                    storage_idx = storage_idx,
+                    in_clause = in_clause,
+                )
+            };
 
             let mut query = sqlx::query(&sql);
-            for h in parent_hashes {
-                query = query.bind(h);
+            if pg {
+                query = query.bind(parent_hashes.join(","));
+            } else {
+                for h in parent_hashes {
+                    query = query.bind(h);
+                }
             }
             query = query.bind(self.storage_id);
             query = query.bind(time);
