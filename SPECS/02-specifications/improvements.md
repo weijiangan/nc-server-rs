@@ -143,3 +143,16 @@ Option 1 is recommended. Tracked as a future task because it requires rewriting 
 **Impact:** on CPU-starved hosts running mixed Rust + PHP generation, the effective generation concurrency can exceed the operator's intended `preview_concurrency_new` budget.
 
 **Fix:** optional config flag under which Rust also acquires the SysV semaphore around backend calls (`sem_get(0x07ea, n)` — system-wide, coordinates with FPM workers by design; no-op when the kernel lacks SysV IPC). Only worthwhile while the PHP fallback path still generates; once generation is fully native, the tokio semaphore alone is exact.
+
+## I.14 Index audit — deferred index additions (PHASE-22 T10)
+
+**Status:** audit complete 2026-08-13 — all candidate index additions explicitly **deferred** (no schema change).
+
+**Findings (EXPLAIN against the live dev stack, the depth-1 CTE + the unread LEFT JOIN):**
+
+- `oc_filecache(parent, storage)` — claimed missing by the phase-21 audit; confirmed missing (only `fs_parent(parent)` + `fs_parent_name_hash(parent, name)` exist). The depth-1 listing (`WHERE parent = $1 AND storage = $2`) and the per-kid dir-count sub-select currently seq-scan on the dev DB (tiny); at scale `fs_parent(parent)` serves both, and the `storage` residual filter rejects nothing for the home-storage case (a parent's rows live in one storage). Not load-bearing — deferred.
+- `oc_comments_read_markers` — the `comments_marker_object_index(object_type, object_id)` lacks a `user_id` leading column; the T6.4 `LEFT JOIN` probes it with a residual `user_id` filter. The marker table holds one row per (user, object) and the PK `(user_id, object_type, object_id)` exists — the residual filter is cheap. Deferred.
+- `oc_systemtag_object_mapping` — two single-column indexes (`systag_by_objectid(objectid)`, `systag_objecttype(objecttype)`); the CTE's per-kid tag lookup uses `systag_objecttype` + residual `objectid` filter on the dev DB. `systag_by_objectid` serves the direct lookup at scale. Deferred.
+- Load-bearing and confirmed present: `fs_storage_path_hash(storage, path_hash)` (every `lookup_by_path`/`load_meta` + the T9 propagation lock), `fs_parent(parent)`, `file_source_index(file_source)` (the merged share scan), `comments_object_index(object_type, object_id, creation_timestamp)` (the comments sub-select), `properties_path_index(userid, propertypath)` (custom props).
+
+**Why deferred:** the schema is Doctrine-owned — adding an index is an `occ db:add-missing-indices`-style operational change on the live system (or a new Doctrine migration), and the audit found no plan that the existing indexes cannot serve. Revisit if a production profile shows a missing-index scan.

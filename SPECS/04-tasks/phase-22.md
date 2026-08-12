@@ -152,7 +152,7 @@ Goal: verify the index claims against the live DB — verification only. Plan fi
 |---|---|---|
 | S0 | T10.1 | `EXPLAIN` on the hot queries (depth-1 batch, after T7; the unread join after T6.4) against the live DB; the decision record (no index changes without the `improvements.md` entry). |
 
-- [ ] **T10.1** `EXPLAIN` the current batch + unread-join plans on the live stack; record which claimed indexes matter, which are missing, and whether the planner uses them; write the `improvements.md` decision for anything that needs adding (or explicitly defer).
+- [x] **T10.1** `EXPLAIN` the current batch + unread-join plans on the live stack; record which claimed indexes matter, which are missing, and whether the planner uses them; write the `improvements.md` decision for anything that needs adding (or explicitly defer).
 
 ---
 
