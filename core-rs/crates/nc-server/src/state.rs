@@ -66,6 +66,9 @@ pub struct AppState {
     pub dir_mimepart_id: i64,
     /// Process-wide `oc_storages` numeric→string cache (negative entries).
     pub storage_cache: nc_dav::SharedStorageCache,
+    /// Storage ids whose lazy `cache/` row is materialized this process
+    /// (finding #8 read-path replication).
+    pub lazy_cache_ensured: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
 }
 
 /// Allow axum to extract `OcsState` from the top-level `AppState` using the
@@ -115,6 +118,7 @@ impl FromRef<AppState> for nc_dav::NcDavState {
             dir_mime_id: state.dir_mime_id,
             dir_mimepart_id: state.dir_mimepart_id,
             storage_cache: state.storage_cache.clone(),
+            lazy_cache_ensured: state.lazy_cache_ensured.clone(),
         }
     }
 }

@@ -1371,6 +1371,20 @@ impl DavFileSystem for NcFileSystem {
             )
             .await;
 
+            // Phase-21 milestone fix: PHP lazily materializes the user's
+            // `cache/` row on the first home-root read (fresh-install
+            // stacks); the delete flow already replicates it, the read path
+            // must too — once per storage per process, zero steady-state
+            // statements.
+            tracing::debug!(fc_path = %fc_path, storage_id = self.storage_id, "read_dir lazy-cache gate");
+            if fc_path.trim_end_matches('/') == "files" {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                ensure_lazy_cache_row(&self.state, self.storage_id, now).await;
+            }
+
             let child_ids: Vec<i64> = children.iter().map(|c| c.fileid).collect();
             let (metas, entries): (
                 Vec<(String, NcMetaData)>,
@@ -3181,6 +3195,67 @@ impl DavFileSystem for NcFileSystem {
 /// source).  The row is a scanner-insert: size 0, permissions 31, no extended
 /// row.  Create-if-missing so subsequent accesses are no-ops, matching PHP's
 /// one-shot behavior.
+/// Replicate PHP's lazy `cache/` row materialization on the **read** path.
+///
+/// PHP's `getCacheEntry` (View.php:1396-1417) shallow-scans the home root on
+/// first access when its row is incomplete, materializing the user's `cache/`
+/// filecache row (from the `data/<uid>/cache` dir the install flow seeds) and
+/// bumping the storage root's etag + storage_mtime.  The delete flow already
+/// replicates the row (see `move_to_trash`); the read path never did, so a
+/// fresh-install stack diverged on the first depth-1 PROPFIND (phase-21
+/// milestone fix, 2026-08-13 — live-verified: full-readiness no-fix stack
+/// diverged on scenario 01, the fixed binary matches the oracle's delta
+/// columns exactly).  Runs once per storage per process — after the first
+/// home-root read the row exists forever and the steady-state read path adds
+/// no statements.
+async fn ensure_lazy_cache_row(state: &NcDavState, storage_id: i64, now: i64) {
+    if state
+        .lazy_cache_ensured
+        .lock()
+        .expect("lazy cache set")
+        .contains(&storage_id)
+    {
+        tracing::debug!(storage_id, "lazy-cache: already ensured this process");
+        return;
+    }
+    if row::lookup_by_path(&state.pool, &state.table_prefix, storage_id, "cache")
+        .await
+        .is_some()
+    {
+        tracing::debug!(storage_id, "lazy-cache: row already present");
+        state
+            .lazy_cache_ensured
+            .lock()
+            .expect("lazy cache set")
+            .insert(storage_id);
+        return;
+    }
+    tracing::debug!(storage_id, "lazy-cache: materializing row");
+    ensure_lazy_dir_row(&state.pool, &state.table_prefix, storage_id, &state.mime_cache, "cache", now).await;
+    // PHP's shallow scan also bumps the storage root: new etag + storage_mtime
+    // (mtime untouched — matches the oracle's observed delta columns).
+    let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+    let sql = format!(
+        "UPDATE {prefix}filecache SET etag = $1, storage_mtime = $2 \
+         WHERE storage = $3 AND path = ''",
+        prefix = state.table_prefix,
+    );
+    if let Err(e) = sqlx::query(&sql)
+        .bind(&etag)
+        .bind(now)
+        .bind(storage_id)
+        .execute(&state.pool)
+        .await
+    {
+        tracing::warn!(error = %e, "lazy cache row: storage-root bump failed");
+    }
+    state
+        .lazy_cache_ensured
+        .lock()
+        .expect("lazy cache set")
+        .insert(storage_id);
+}
+
 pub(crate) async fn ensure_lazy_dir_row(
     pool: &DbPool,
     prefix: &str,
@@ -4021,6 +4096,7 @@ mod tests {
             dir_mime_id: 1,
             dir_mimepart_id: 1,
             storage_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            lazy_cache_ensured: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         let write_result: SharedWriteResult = Arc::new(std::sync::Mutex::new(None::<WriteResult>));
         let put_error: crate::SharedPutError = Arc::new(std::sync::Mutex::new(None));

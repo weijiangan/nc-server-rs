@@ -105,4 +105,9 @@ pub struct NcDavState {
     pub dir_mimepart_id: i64,
     /// Process-wide `oc_storages` numeric→string cache (negative entries).
     pub storage_cache: SharedStorageCache,
+    /// Storage ids whose lazy `cache/` row has been materialized this process
+    /// (finding #8 read-path replication, phase-21 milestone fix).  Gates the
+    /// once-per-storage ensure so the steady-state read path adds no
+    /// statements.
+    pub lazy_cache_ensured: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
 }

@@ -76,6 +76,8 @@ async fn main() -> anyhow::Result<()> {
         nc_db::mime::get_or_insert_mime_id(&pool, &table_prefix, &mime_cache, "httpd").await;
     let storage_cache: nc_dav::SharedStorageCache =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let lazy_cache_ensured: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<i64>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
     let appconfig_cache = nc_db::appconfig::load_appconfig_cache(&pool, prefix)
         .await
@@ -228,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
         dir_mime_id,
         dir_mimepart_id,
         storage_cache,
+        lazy_cache_ensured,
     };
 
     // ── Phase 7.7: Background capability refresh ──────────────────────────────
