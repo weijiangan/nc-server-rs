@@ -145,6 +145,68 @@ impl Propagator {
         size_difference: i64,
         etag: &str,
     ) -> Result<(), String> {
+        if self.pool.is_postgres() {
+            // PHASE-22 T9: ONE statement — the CTE pre-locks the parents in
+            // the deadlock-avoiding `ORDER BY path_hash` order and applies
+            // the UPDATE inside the same implicit transaction.  The locks
+            // release at statement end, after the UPDATE; concurrent
+            // propagations serialize on the same lock order, so the explicit
+            // BEGIN/pre-lock/COMMIT round trips are gone.  Binds: $1 =
+            // path_hashes (text[]), $2 = storage, $3 = time, $4 = etag,
+            // $5 = size_difference (size variant only).
+            let sql = if size_difference != 0 {
+                format!(
+                    "WITH locked AS ( \
+                         SELECT fileid FROM {prefix}filecache \
+                         WHERE storage = $2 AND path_hash = ANY($1::text[]) \
+                         ORDER BY path_hash FOR UPDATE \
+                     ) \
+                     UPDATE {prefix}filecache fc \
+                     SET mtime = CASE WHEN fc.mtime < $3 THEN $3 ELSE fc.mtime END, \
+                         etag = $4, \
+                         size = CASE WHEN fc.size > -1 \
+                                  THEN CASE WHEN fc.size + $5 < -1 THEN -1 \
+                                            ELSE fc.size + $5 END \
+                                  ELSE fc.size \
+                                END \
+                     FROM locked l WHERE fc.fileid = l.fileid",
+                    prefix = self.prefix,
+                )
+            } else {
+                format!(
+                    "WITH locked AS ( \
+                         SELECT fileid FROM {prefix}filecache \
+                         WHERE storage = $2 AND path_hash = ANY($1::text[]) \
+                         ORDER BY path_hash FOR UPDATE \
+                     ) \
+                     UPDATE {prefix}filecache fc \
+                     SET mtime = CASE WHEN fc.mtime < $3 THEN $3 ELSE fc.mtime END, \
+                         etag = $4 \
+                     FROM locked l WHERE fc.fileid = l.fileid",
+                    prefix = self.prefix,
+                )
+            };
+            match &self.pool {
+                DbPool::Pg(p) => {
+                    let mut q = sqlx::query::<Postgres>(&sql)
+                        .bind(parent_hashes)
+                        .bind(self.storage_id)
+                        .bind(time)
+                        .bind(etag);
+                    if size_difference != 0 {
+                        q = q.bind(size_difference);
+                    }
+                    q.execute(p)
+                        .await
+                        .map_err(|e| format!("propagate CTE failed: {e}"))?;
+                }
+                DbPool::Sqlite(_) => unreachable!("pg path is variant-gated"),
+            }
+            return Ok(());
+        }
+
+        // SQLite: the existing transaction path — whole-file locking, no row
+        // locks, no deadlock hazard, no `FOR UPDATE`.
         let placeholders: Vec<String> =
             (1..=parent_hashes.len()).map(|i| format!("${i}")).collect();
         let in_clause = placeholders.join(", ");
@@ -163,141 +225,67 @@ impl Propagator {
             .begin()
             .await
             .map_err(|e| format!("propagate BEGIN failed: {e}"))?;
-        // Pre-lock the parent rows in a deterministic order (see the doc
-        // comment above).  Postgres-only: SQLite has whole-file locking (no
-        // row locks, no deadlock hazard) and does not support `FOR UPDATE`.
-        // Native text[] bind (PHASE-22 T4): the path_hashes are md5 hex, so
-        // the array interim (21.3) is gone.
-        match &mut tx {
-            DbTxn::Pg(t) => {
-                let lock_sql = format!(
-                    "SELECT path_hash FROM {prefix}filecache \
-                     WHERE storage = $2 AND path_hash = ANY($1::text[]) \
-                     ORDER BY path_hash FOR UPDATE",
-                    prefix = self.prefix,
-                );
-                sqlx::query::<Postgres>(&lock_sql)
-                    .bind(parent_hashes)
-                    .bind(self.storage_id)
-                    .execute(&mut **t)
-                    .await
-                    .map_err(|e| format!("propagate pre-lock failed: {e}"))?;
-            }
-            DbTxn::Sqlite(_) => {}
-        }
 
         // Use CASE WHEN instead of GREATEST for cross-DB compatibility
-        // (SQLite lacks GREATEST; PostgreSQL and MySQL support both).
+        // (SQLite lacks GREATEST).
         if size_difference != 0 {
             // CASE WHEN size > -1 THEN MAX(size + $sizeDiff, -1) ELSE size END.
-            // Native text[] bind (PHASE-22 T4): $1 = path_hashes, $2 =
-            // storage, $3 = time, $4 = etag, $5 = size_difference.
-            match &mut tx {
-                DbTxn::Pg(t) => {
-                    let sql = format!(
-                        "UPDATE {prefix}filecache \
-                         SET mtime = CASE WHEN mtime < $3 THEN $3 ELSE mtime END, \
-                             etag = $4, \
-                             size = CASE WHEN size > -1 \
-                                      THEN CASE WHEN size + $5 < -1 THEN -1 \
-                                                ELSE size + $5 END \
-                                      ELSE size \
-                                    END \
-                         WHERE storage = $2 \
-                         AND path_hash = ANY($1::text[])",
-                        prefix = self.prefix,
-                    );
-                    sqlx::query::<Postgres>(&sql)
-                        .bind(parent_hashes)
-                        .bind(self.storage_id)
-                        .bind(time)
-                        .bind(etag)
-                        .bind(size_difference)
-                        .execute(&mut **t)
-                        .await
-                        .map_err(|e| format!("propagate UPDATE with size failed: {e}"))?;
-                }
-                DbTxn::Sqlite(t) => {
-                    let size_diff_idx = parent_hashes.len() + 4;
-                    let sql = format!(
-                        "UPDATE {prefix}filecache \
-                         SET mtime = CASE WHEN mtime < ${time_idx} THEN ${time_idx} ELSE mtime END, \
-                             etag = ${etag_idx}, \
-                             size = CASE WHEN size > -1 \
-                                      THEN CASE WHEN size + ${size_diff_idx} < -1 THEN -1 \
-                                                ELSE size + ${size_diff_idx} END \
-                                      ELSE size \
-                                    END \
-                         WHERE storage = ${storage_idx} \
-                         AND path_hash IN ({in_clause})",
-                        prefix = self.prefix,
-                        time_idx = time_idx,
-                        etag_idx = etag_idx,
-                        size_diff_idx = size_diff_idx,
-                        storage_idx = storage_idx,
-                        in_clause = in_clause,
-                    );
-                    let mut query = sqlx::query(&sql);
-                    for h in parent_hashes {
-                        query = query.bind(h);
-                    }
-                    query = query.bind(self.storage_id);
-                    query = query.bind(time);
-                    query = query.bind(etag);
-                    query = query.bind(size_difference);
-                    query
-                        .execute(&mut **t)
-                        .await
-                        .map_err(|e| format!("propagate UPDATE with size failed: {e}"))?;
-                }
+            let size_diff_idx = parent_hashes.len() + 4;
+            let sql = format!(
+                "UPDATE {prefix}filecache \
+                 SET mtime = CASE WHEN mtime < ${time_idx} THEN ${time_idx} ELSE mtime END, \
+                     etag = ${etag_idx}, \
+                     size = CASE WHEN size > -1 \
+                              THEN CASE WHEN size + ${size_diff_idx} < -1 THEN -1 \
+                                        ELSE size + ${size_diff_idx} END \
+                              ELSE size \
+                            END \
+                 WHERE storage = ${storage_idx} \
+                 AND path_hash IN ({in_clause})",
+                prefix = self.prefix,
+                time_idx = time_idx,
+                etag_idx = etag_idx,
+                size_diff_idx = size_diff_idx,
+                storage_idx = storage_idx,
+                in_clause = in_clause,
+            );
+            let mut query = sqlx::query(&sql);
+            for h in parent_hashes {
+                query = query.bind(h);
             }
+            query = query.bind(self.storage_id);
+            query = query.bind(time);
+            query = query.bind(etag);
+            query = query.bind(size_difference);
+            query
+                .execute(&mut tx)
+                .await
+                .map_err(|e| format!("propagate UPDATE with size failed: {e}"))?;
         } else {
             // No size change — only etag + mtime.
-            match &mut tx {
-                DbTxn::Pg(t) => {
-                    let sql = format!(
-                        "UPDATE {prefix}filecache \
-                         SET mtime = CASE WHEN mtime < $3 THEN $3 ELSE mtime END, \
-                             etag = $4 \
-                         WHERE storage = $2 \
-                         AND path_hash = ANY($1::text[])",
-                        prefix = self.prefix,
-                    );
-                    sqlx::query::<Postgres>(&sql)
-                        .bind(parent_hashes)
-                        .bind(self.storage_id)
-                        .bind(time)
-                        .bind(etag)
-                        .execute(&mut **t)
-                        .await
-                        .map_err(|e| format!("propagate UPDATE failed: {e}"))?;
-                }
-                DbTxn::Sqlite(t) => {
-                    let sql = format!(
-                        "UPDATE {prefix}filecache \
-                         SET mtime = CASE WHEN mtime < ${time_idx} THEN ${time_idx} ELSE mtime END, \
-                             etag = ${etag_idx} \
-                         WHERE storage = ${storage_idx} \
-                         AND path_hash IN ({in_clause})",
-                        prefix = self.prefix,
-                        time_idx = time_idx,
-                        etag_idx = etag_idx,
-                        storage_idx = storage_idx,
-                        in_clause = in_clause,
-                    );
-                    let mut query = sqlx::query(&sql);
-                    for h in parent_hashes {
-                        query = query.bind(h);
-                    }
-                    query = query.bind(self.storage_id);
-                    query = query.bind(time);
-                    query = query.bind(etag);
-                    query
-                        .execute(&mut **t)
-                        .await
-                        .map_err(|e| format!("propagate UPDATE failed: {e}"))?;
-                }
+            let sql = format!(
+                "UPDATE {prefix}filecache \
+                 SET mtime = CASE WHEN mtime < ${time_idx} THEN ${time_idx} ELSE mtime END, \
+                     etag = ${etag_idx} \
+                 WHERE storage = ${storage_idx} \
+                 AND path_hash IN ({in_clause})",
+                prefix = self.prefix,
+                time_idx = time_idx,
+                etag_idx = etag_idx,
+                storage_idx = storage_idx,
+                in_clause = in_clause,
+            );
+            let mut query = sqlx::query(&sql);
+            for h in parent_hashes {
+                query = query.bind(h);
             }
+            query = query.bind(self.storage_id);
+            query = query.bind(time);
+            query = query.bind(etag);
+            query
+                .execute(&mut tx)
+                .await
+                .map_err(|e| format!("propagate UPDATE failed: {e}"))?;
         }
 
         tx.commit()

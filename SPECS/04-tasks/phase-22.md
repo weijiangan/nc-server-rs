@@ -105,8 +105,8 @@ UPDATE {prefix}filecache fc SET … FROM locked l WHERE fc.fileid = l.fileid
 | S0 | T9.1 | Propagation CTE; perf-gate re-measured (`put_new` drops); `make bench-one SC=10_put_get` improves or holds. |
 | S1 | T9.2 | Upsert merge **only after measuring**; milestone suite. |
 
-- [ ] **T9.1** The propagation CTE (pre-lock + the size/etag UPDATE branches) on the `Pg` arm; SQLite unchanged; `try_propagate`'s four round trips become one.
-- [ ] **T9.2** Measure `put_new` statements and PUT latency first; if justified, merge the filecache insert + `filecache_extended` upsert (`filesystem.rs:2289-2292`, `2904-2908`) into one `WITH … RETURNING` statement.
+- [x] **T9.1** The propagation CTE (pre-lock + the size/etag UPDATE branches) on the `Pg` arm; SQLite unchanged; `try_propagate`'s four round trips become one.
+- [x] **T9.2** Measure `put_new` statements and PUT latency first; if justified, merge the filecache insert + `filecache_extended` upsert (`filesystem.rs:2289-2292`, `2904-2908`) into one `WITH … RETURNING` statement.
 
 ---
 
@@ -164,5 +164,6 @@ Goal: verify the index claims against the live DB — verification only. Plan fi
 
 ## Changes
 
+- 2026-08-13: **T9.2 decision (measured, not merged):** `put_new` after T9.1 = 15 statements; the filecache INSERT + extended upsert merge would save 1 (6%) and change the extended-upsert failure from warn-only to fatal (the merged statement fails atomically). PUT is already the fastest-vs-PHP area (SC=10: 46.9 ms p50, 2.16× vs PHP — improved from the 55 ms / 2.3× baseline). Not justified per the task's own condition; the separate upsert stays.
 - 2026-08-13: T6 landed (merges, de-correlation, prop-set plumbing + gating). **Divergence candidate (unchanged, needs an explicit decision):** PHP's `getNumberOfUnreadCommentsForObjects` has no `actor_type`/`actor_id` filter (`Manager.php:673-689`) — a user's own comment newer than the marker counts as unread in PHP; Rust's `get_comments_unread` excludes it since phase 12.6, and no difftest scenario exercises comments, so it was never A/B'd.
 - 2026-08-13: Phase created as the combined doc for the plan's remaining items T6-T10 (the amended execution order after Tier 1; plan section 21). T6 grounding: `PropWriter.requested` already exists (`handle_props.rs:233-236`); harness + perf-gate send allprop, so budgets drop only from the merges (delta 9 → 7, propfind_depth1 20 → 18); the share-pair filters differ and split in Rust; the unread-marker de-correlation is its own task. T3-T10 grounding per plan findings 3-10; T2 is the largest refactor (row-API change) and intentionally last among the structural items.

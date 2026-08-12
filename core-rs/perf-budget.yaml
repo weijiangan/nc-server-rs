@@ -38,6 +38,6 @@ classes:
     method: PUT
     path: /remote.php/webdav/q-budget-<ts>.txt
     unique_path: true
-    budget: 16
+    budget: 15
 
 scaling_delta_budget: 3
