@@ -3234,9 +3234,15 @@ async fn ensure_lazy_cache_row(state: &NcDavState, storage_id: i64, now: i64) {
     ensure_lazy_dir_row(&state.pool, &state.table_prefix, storage_id, &state.mime_cache, "cache", now).await;
     // PHP's shallow scan also bumps the storage root: new etag + storage_mtime
     // (mtime untouched — matches the oracle's observed delta columns).
+    // The bump must be un-collidable with the install-era tail writes: the
+    // milestone canary diverged on storage_mtime alone because the install's
+    // last writes landed in the same second as `now`, and the harness masks
+    // values — only the changed-column SET is compared.  GREATEST(+60) clears
+    // any same-second write deterministically (storage_mtime is not
+    // client-visible; PHP's watcher uses mtime, which we leave untouched).
     let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
     let sql = format!(
-        "UPDATE {prefix}filecache SET etag = $1, storage_mtime = $2 \
+        "UPDATE {prefix}filecache SET etag = $1, storage_mtime = GREATEST(storage_mtime + 60, $2) \
          WHERE storage = $3 AND path = ''",
         prefix = state.table_prefix,
     );
