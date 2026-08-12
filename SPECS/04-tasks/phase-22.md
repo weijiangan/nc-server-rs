@@ -62,8 +62,8 @@ Goal: replace the `string_to_array($1, ',')` interim (21.3) with real `= ANY($1:
 |---|---|---|
 | S0 | T4.1, T4.2 | `cargo test --lib` (SQLite keeps `IN`); perf-gate holds; statement-text stability probe still bounded; milestone suite. |
 
-- [ ] **T4.1** Convert the 21.3 helpers to `Vec<i64>`/`Vec<String>` binds on the `Pg` arm (`count_children_batch`, `share_details_batch` + its users/accounts lists, `share_notes_batch`, `comments_counts_batch`, `comments_unread_batch` (post-merge), `system_tags_batch`, `list_extended_batch`, `lookup_by_ids`, the propagator's pre-lock + UPDATEs) — the dialect branch collapses to the enum variant, the `ids_csv` helper and `string_to_array` die.
-- [ ] **T4.2** `custom_properties_batch` → `propertypath = ANY($1::text[])` on the `Pg` arm; remove the "stays on IN" comment.
+- [x] **T4.1** Convert the 21.3 helpers to `Vec<i64>`/`Vec<String>` binds on the `Pg` arm (`count_children_batch`, `share_details_batch` + its users/accounts lists, `share_notes_batch`, `comments_counts_batch`, `comments_unread_batch` (post-merge), `system_tags_batch`, `list_extended_batch`, `lookup_by_ids`, the propagator's pre-lock + UPDATEs) — the dialect branch collapses to the enum variant, the `ids_csv` helper and `string_to_array` die.
+- [x] **T4.2** `custom_properties_batch` → `propertypath = ANY($1::text[])` on the `Pg` arm; remove the "stays on IN" comment.
 
 ---
 
