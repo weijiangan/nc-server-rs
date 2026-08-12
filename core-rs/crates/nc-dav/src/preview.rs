@@ -276,8 +276,12 @@ impl ProviderRegistry {
 
             // HEIC/HEIF via the imagick HEIC delegate (PHP regex `/image\/(x-)?hei(f|c)/`).
             // Imaginary, when available, also covers these via the early return above.
-            "image/heic" | "image/heif" | "image/x-heic" | "image/x-heif"
-            | "image/heic-sequence" | "image/heif-sequence" => e(P_HEIC) && im("HEIC"),
+            "image/heic"
+            | "image/heif"
+            | "image/x-heic"
+            | "image/x-heif"
+            | "image/heic-sequence"
+            | "image/heif-sequence" => e(P_HEIC) && im("HEIC"),
 
             // Video: Movie provider, gated on the list and the ffmpeg binary.
             _ if mime.starts_with("video/") => e(P_MOVIE) && self.ffmpeg,
@@ -310,9 +314,7 @@ impl ProviderRegistry {
             // is NOT `font/*` (e.g. `font/ttf` has no PHP provider → false).
             "application/font-sfnt" | "application/x-font" => e(P_FONT) && im("TTF"),
             // TGA: `/image\/(x-)?t(ar)?ga/`
-            "image/tga" | "image/x-tga" | "image/targa" | "image/x-targa" => {
-                e(P_TGA) && im("TGA")
-            }
+            "image/tga" | "image/x-tga" | "image/targa" | "image/x-targa" => e(P_TGA) && im("TGA"),
             // SGI: `/image\/(x-)?sgi/`
             "image/sgi" | "image/x-sgi" => e(P_SGI) && im("SGI"),
 
@@ -387,7 +389,11 @@ fn detect_imagick_formats(php: &str) -> Vec<String> {
              if (count($i->queryFormats($f)) === 1) {{ echo $f, ','; }} \
          }}"
     );
-    match std::process::Command::new(php).arg("-r").arg(&script).output() {
+    match std::process::Command::new(php)
+        .arg("-r")
+        .arg(&script)
+        .output()
+    {
         Ok(out) if out.status.success() => {
             parse_imagick_probe(&String::from_utf8_lossy(&out.stdout))
         }
@@ -399,7 +405,9 @@ fn detect_imagick_formats(php: &str) -> Vec<String> {
             Vec::new()
         }
         Err(e) => {
-            tracing::debug!("imagick probe could not run {php} ({e}); imagick treated as unavailable");
+            tracing::debug!(
+                "imagick probe could not run {php} ({e}); imagick treated as unavailable"
+            );
             Vec::new()
         }
     }
@@ -528,15 +536,15 @@ mod tests {
 
         // Not in the default set → unavailable (parity fixes vs the old matrix).
         for m in [
-            "video/mp4",           // Movie not in default list (even with ffmpeg)
-            "application/pdf",     // imagick/ImaginaryPDF — not introspected / out of scope
-            "image/svg+xml",       // imagick-only, no Imaginary here
-            "image/tiff",          // imagick-only
-            "audio/mpeg",          // MP3 not in default list
-            "font/ttf",            // no provider matches font/* (PHP Font is application/font-sfnt|x-font)
+            "video/mp4",             // Movie not in default list (even with ffmpeg)
+            "application/pdf",       // imagick/ImaginaryPDF — not introspected / out of scope
+            "image/svg+xml",         // imagick-only, no Imaginary here
+            "image/tiff",            // imagick-only
+            "audio/mpeg",            // MP3 not in default list
+            "font/ttf", // no provider matches font/* (PHP Font is application/font-sfnt|x-font)
             "application/font-sfnt", // Font provider not in default list
-            "image/heic",          // imagick HEIC delegate, no Imaginary here
-            "application/msword",  // MSOfficeDoc not in default list (even with libreoffice)
+            "image/heic", // imagick HEIC delegate, no Imaginary here
+            "application/msword", // MSOfficeDoc not in default list (even with libreoffice)
             "application/illustrator",
             "application/postscript",
             "application/x-photoshop",
@@ -549,9 +557,15 @@ mod tests {
     fn configured_list_replaces_default() {
         // Setting enabledPreviewProviders REPLACES the default set (PHP getSystemValue).
         let r = reg(Some(&["OC\\Preview\\Movie"]), true, false, false);
-        assert!(av(&r, "video/mp4"), "Movie listed + ffmpeg → video available");
+        assert!(
+            av(&r, "video/mp4"),
+            "Movie listed + ffmpeg → video available"
+        );
         assert!(!av(&r, "image/png"), "default PNG dropped when list is set");
-        assert!(!av(&r, "text/plain"), "default TXT dropped when list is set");
+        assert!(
+            !av(&r, "text/plain"),
+            "default TXT dropped when list is set"
+        );
     }
 
     #[test]
@@ -612,7 +626,13 @@ mod tests {
     fn image_base_class_expansion() {
         // Listing the abstract OC\Preview\Image expands to all GD image providers.
         let r = reg(Some(&["OC\\Preview\\Image"]), false, false, false);
-        for m in ["image/png", "image/jpeg", "image/gif", "image/bmp", "image/webp"] {
+        for m in [
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/bmp",
+            "image/webp",
+        ] {
             assert!(av(&r, m), "Image base class should enable {m}");
         }
         assert!(!av(&r, "text/plain"), "Image expansion must not enable TXT");
@@ -627,7 +647,10 @@ mod tests {
         assert!(av(&reg(Some(&providers), true, false, false), "video/mp4"));
         assert!(av(&reg(Some(&providers), true, false, false), "video/webm"));
         // Movie listed but no ffmpeg → unavailable.
-        assert!(!av(&reg(Some(&providers), false, false, false), "video/mp4"));
+        assert!(!av(
+            &reg(Some(&providers), false, false, false),
+            "video/mp4"
+        ));
         // ffmpeg but Movie not listed → unavailable.
         assert!(!av(&reg(None, true, false, false), "video/mp4"));
     }
@@ -645,7 +668,10 @@ mod tests {
         let mut p2: Vec<&str> = vec!["OC\\Preview\\MSOffice2007", "OC\\Preview\\EMF"];
         p2.push("OC\\Preview\\MSOffice2003");
         let r = reg(Some(&p2), false, true, false);
-        assert!(av(&r, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"));
+        assert!(av(
+            &r,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ));
         assert!(av(&r, "application/vnd.ms-excel"));
         assert!(av(&r, "image/emf"));
         assert!(!av(&r, "application/vnd.sun.xml.writer")); // StarOffice not listed
@@ -665,7 +691,13 @@ mod tests {
     #[test]
     fn disabled_always_false() {
         let r = ProviderRegistry::build(false, None, true, true, true, &["HEIC", "SVG"]);
-        for m in ["image/png", "image/jpeg", "video/mp4", "text/plain", "image/heic"] {
+        for m in [
+            "image/png",
+            "image/jpeg",
+            "video/mp4",
+            "text/plain",
+            "image/heic",
+        ] {
             assert!(!av(&r, m));
         }
         assert!(!r.enable_previews());
@@ -732,7 +764,9 @@ mod tests {
             false,
             false,
             false,
-            &["SVG", "TIFF", "AI", "PSD", "EPS", "PDF", "TTF", "TGA", "SGI"],
+            &[
+                "SVG", "TIFF", "AI", "PSD", "EPS", "PDF", "TTF", "TGA", "SGI",
+            ],
         );
         assert!(av(&r, "image/svg+xml"));
         assert!(av(&r, "image/tiff"));
@@ -766,7 +800,9 @@ mod tests {
             false,
             false,
             false,
-            &["SVG", "TIFF", "HEIC", "AI", "PSD", "EPS", "PDF", "TTF", "TGA", "SGI"],
+            &[
+                "SVG", "TIFF", "HEIC", "AI", "PSD", "EPS", "PDF", "TTF", "TGA", "SGI",
+            ],
         );
         for m in [
             "image/svg+xml",
@@ -809,7 +845,10 @@ mod tests {
         assert!(parse_imagick_probe("").is_empty());
         assert!(parse_imagick_probe(",, ,").is_empty());
         // Lowercase / whitespace tolerated → normalized uppercase.
-        assert_eq!(parse_imagick_probe(" svg , heic "), vec!["SVG".to_string(), "HEIC".to_string()]);
+        assert_eq!(
+            parse_imagick_probe(" svg , heic "),
+            vec!["SVG".to_string(), "HEIC".to_string()]
+        );
     }
 
     // ── rust_generatable is a strict subset of is_available ────────────────

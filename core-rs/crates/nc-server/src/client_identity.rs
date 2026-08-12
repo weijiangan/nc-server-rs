@@ -30,7 +30,12 @@ pub fn resolve(headers: &HeaderMap, peer_addr: IpAddr, cfg: &NcConfig) -> Client
     let https = server_protocol(peer_addr, headers, cfg);
     let host = insecure_server_host(peer_addr, headers, cfg);
     let port = host_port(&host, https);
-    ClientIdentity { ip, https, host, port }
+    ClientIdentity {
+        ip,
+        https,
+        host,
+        port,
+    }
 }
 
 /// Header name PHP reads for forwarded-for entries.  Config values are
@@ -235,7 +240,11 @@ fn host_port(host: &str, https: bool) -> u16 {
             return p;
         }
     }
-    if https { 443 } else { 80 }
+    if https {
+        443
+    } else {
+        80
+    }
 }
 
 /// `TrustedDomainHelper::getDomainWithoutPort`.
@@ -258,7 +267,12 @@ fn is_localhost(domain: &str) -> bool {
 /// against both the domain and the domain-with-port.
 pub fn is_trusted_domain(cfg: &NcConfig, domain_with_port: &str) -> bool {
     // overwritehost is always trusted.
-    if cfg.overwritehost.as_deref().map(|h| !h.is_empty()).unwrap_or(false) {
+    if cfg
+        .overwritehost
+        .as_deref()
+        .map(|h| !h.is_empty())
+        .unwrap_or(false)
+    {
         return true;
     }
     let domain = domain_without_port(domain_with_port);
@@ -383,7 +397,11 @@ mod tests {
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
-            h.insert(k.parse::<axum::http::header::HeaderName>().expect("test header name"), HeaderValue::from_str(v).unwrap());
+            h.insert(
+                k.parse::<axum::http::header::HeaderName>()
+                    .expect("test header name"),
+                HeaderValue::from_str(v).unwrap(),
+            );
         }
         h
     }
@@ -412,14 +430,20 @@ mod tests {
     #[test]
     fn single_proxy_returns_client_ip() {
         let c = cfg(&["10.0.0.1"]);
-        assert_eq!(xff(&[("x-forwarded-for", "203.0.113.9")], &c), "203.0.113.9".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(
+            xff(&[("x-forwarded-for", "203.0.113.9")], &c),
+            "203.0.113.9".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 
     #[test]
     fn chained_proxies_skip_trusted_right_to_left() {
         let c = cfg(&["10.0.0.1", "10.0.0.2"]);
         let h = headers(&[("x-forwarded-for", "203.0.113.9, 10.0.0.2")]);
-        assert_eq!(remote_address(PEER, &h, &c), "203.0.113.9".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(
+            remote_address(PEER, &h, &c),
+            "203.0.113.9".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 
     #[test]
@@ -428,34 +452,49 @@ mod tests {
         // entry wins; entries left of it are never consulted.
         let c = cfg(&["10.0.0.1"]);
         let h = headers(&[("x-forwarded-for", "198.51.100.7, 203.0.113.9")]);
-        assert_eq!(remote_address(PEER, &h, &c), "203.0.113.9".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(
+            remote_address(PEER, &h, &c),
+            "203.0.113.9".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 
     #[test]
     fn ipv4_with_port_stripped() {
         let c = cfg(&["10.0.0.1"]);
-        assert_eq!(xff(&[("x-forwarded-for", "203.0.113.9:443")], &c), "203.0.113.9".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(
+            xff(&[("x-forwarded-for", "203.0.113.9:443")], &c),
+            "203.0.113.9".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 
     #[test]
     fn ipv6_bracketed_with_port_stripped() {
         let c = cfg(&["10.0.0.1"]);
         let h = headers(&[("x-forwarded-for", "[2001:db8::1]:443")]);
-        assert_eq!(remote_address(PEER, &h, &c), "2001:db8::1".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(
+            remote_address(PEER, &h, &c),
+            "2001:db8::1".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 
     #[test]
     fn malformed_entry_skipped() {
         let c = cfg(&["10.0.0.1"]);
         let h = headers(&[("x-forwarded-for", "not-an-ip, 203.0.113.9")]);
-        assert_eq!(remote_address(PEER, &h, &c), "203.0.113.9".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(
+            remote_address(PEER, &h, &c),
+            "203.0.113.9".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 
     #[test]
     fn cidr_range_matches() {
         let c = cfg(&["10.0.0.0/8"]);
         let h = headers(&[("x-forwarded-for", "203.0.113.9")]);
-        assert_eq!(remote_address(PEER, &h, &c), "203.0.113.9".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(
+            remote_address(PEER, &h, &c),
+            "203.0.113.9".parse::<std::net::IpAddr>().unwrap()
+        );
         // peer inside the CIDR is trusted
         assert!(is_trusted_proxy(&c, &PEER));
         let outside: IpAddr = "11.0.0.1".parse::<std::net::IpAddr>().unwrap();

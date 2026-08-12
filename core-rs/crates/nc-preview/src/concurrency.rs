@@ -313,6 +313,10 @@ mod tests {
             h.await.unwrap();
         }
         // Never more than `n` concurrent critical sections.
-        assert!(max_seen.load(SeqCst) <= n, "max_seen={}", max_seen.load(SeqCst));
+        assert!(
+            max_seen.load(SeqCst) <= n,
+            "max_seen={}",
+            max_seen.load(SeqCst)
+        );
     }
 }

@@ -9,14 +9,13 @@ pub mod session;
 pub mod token;
 pub mod twofa;
 
-pub use token::{new_token_cache, SharedTokenCache};
 pub use session::{
-    SessionIdentity, SessionResolveResult, CacheLookup,
-    SessionCache, SharedSessionCache,
-    new_session_cache, make_cache_key, cache_insert, cache_insert_negative,
-    cache_lookup, cache_evict_expired,
-    SESSION_CACHE_TTL, SESSION_NEGATIVE_CACHE_TTL, SESSION_CACHE_EVICT_INTERVAL,
+    cache_evict_expired, cache_insert, cache_insert_negative, cache_lookup, make_cache_key,
+    new_session_cache, CacheLookup, SessionCache, SessionIdentity, SessionResolveResult,
+    SharedSessionCache, SESSION_CACHE_EVICT_INTERVAL, SESSION_CACHE_TTL,
+    SESSION_NEGATIVE_CACHE_TTL,
 };
+pub use token::{new_token_cache, SharedTokenCache};
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -128,7 +127,12 @@ pub async fn cached_user_state(
     let is_admin = is_admin_user(uid, pool, prefix).await;
     let sharing_disabled = sharing_disabled_for_user(pool, prefix, uid).await;
     let display_name = lookup_user_display_name(pool, prefix, uid).await;
-    let state = UserState { is_admin, twofa_enabled, sharing_disabled, display_name };
+    let state = UserState {
+        is_admin,
+        twofa_enabled,
+        sharing_disabled,
+        display_name,
+    };
     cache.insert(uid.to_string(), (state.clone(), Instant::now()));
     Ok(state)
 }
@@ -295,12 +299,13 @@ mod tests {
 
     /// In-memory SQLite with the two tables `cached_user_state` reads.
     async fn fresh_db() -> DbPool {
-        sqlx::any::install_default_drivers();
-        let pool = sqlx::any::AnyPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("in-memory SQLite");
+        let pool = DbPool::Sqlite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("in-memory SQLite"),
+        );
         sqlx::query(
             "CREATE TABLE oc_twofactor_providers (
                 provider_id VARCHAR(255) NOT NULL, uid VARCHAR(64) NOT NULL,
@@ -366,21 +371,34 @@ mod tests {
         .await
         .expect("appconfig");
 
-        let s = cached_user_state("alice", &pool, prefix).await.expect("resolve");
+        let s = cached_user_state("alice", &pool, prefix)
+            .await
+            .expect("resolve");
         assert!(s.is_admin, "admin membership read");
         assert!(s.twofa_enabled, "2FA provider enabled");
-        assert!(s.sharing_disabled, "allow mode, alice not in staff → disabled");
+        assert!(
+            s.sharing_disabled,
+            "allow mode, alice not in staff → disabled"
+        );
         assert_eq!(s.display_name, "Alice Example", "oc_users displayname");
 
         // Cache serves: flip the tables in the DB and the next call must
         // return the cached values (60 s TTL).
-        sqlx::query("DELETE FROM oc_group_user").execute(&pool).await.expect("del");
+        sqlx::query("DELETE FROM oc_group_user")
+            .execute(&pool)
+            .await
+            .expect("del");
         sqlx::query("UPDATE oc_twofactor_providers SET enabled = 0")
             .execute(&pool)
             .await
             .expect("disable");
-        sqlx::query("DELETE FROM oc_users").execute(&pool).await.expect("del users");
-        let s2 = cached_user_state("alice", &pool, prefix).await.expect("cached");
+        sqlx::query("DELETE FROM oc_users")
+            .execute(&pool)
+            .await
+            .expect("del users");
+        let s2 = cached_user_state("alice", &pool, prefix)
+            .await
+            .expect("cached");
         assert!(s2.is_admin, "cached admin state");
         assert!(s2.twofa_enabled, "cached 2FA state");
         assert!(s2.sharing_disabled, "cached sharing state");
@@ -406,7 +424,9 @@ mod tests {
         .execute(&pool)
         .await
         .expect("accounts");
-        let s = cached_user_state("carol", &pool, prefix).await.expect("resolve");
+        let s = cached_user_state("carol", &pool, prefix)
+            .await
+            .expect("resolve");
         assert_eq!(s.display_name, "Carol Chen", "oc_accounts JSON fallback");
         assert!(!s.is_admin);
         assert!(!s.twofa_enabled);

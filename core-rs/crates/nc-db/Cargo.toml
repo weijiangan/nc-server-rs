@@ -12,6 +12,13 @@ sqlite = ["sqlx/sqlite"]
 
 [dependencies]
 sqlx.workspace = true
+# Internal sqlx modules the umbrella crate does not re-export: the native
+# postgres/sqlite argument + row + statement types (for the T3 executor
+# delegation) and AnyColumn/UStr (any side).  Feature unification with
+# `sqlx` provides the any/postgres/sqlite capabilities.
+sqlx-core = { version = "0.8", default-features = false }
+sqlx-postgres = { version = "0.8", default-features = false }
+sqlx-sqlite = { version = "0.8", default-features = false }
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
@@ -20,6 +27,7 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 regex-lite.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

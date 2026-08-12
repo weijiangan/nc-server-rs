@@ -150,9 +150,19 @@ mod tests {
     fn not_modified_on_matching_etag() {
         assert!(is_not_modified(Some("\"abc\""), None, "abc", 1_700_000_000));
         // surrounding whitespace trimmed
-        assert!(is_not_modified(Some("  \"abc\"  "), None, "abc", 1_700_000_000));
+        assert!(is_not_modified(
+            Some("  \"abc\"  "),
+            None,
+            "abc",
+            1_700_000_000
+        ));
         // wrong etag → not 304 on this check
-        assert!(!is_not_modified(Some("\"other\""), None, "abc", 1_700_000_000));
+        assert!(!is_not_modified(
+            Some("\"other\""),
+            None,
+            "abc",
+            1_700_000_000
+        ));
         // unquoted client value does not match the quoted server etag
         assert!(!is_not_modified(Some("abc"), None, "abc", 1_700_000_000));
     }
@@ -161,17 +171,37 @@ mod tests {
     fn not_modified_on_matching_last_modified() {
         let lm = rfc7231(1_700_000_000);
         assert!(is_not_modified(None, Some(&lm), "abc", 1_700_000_000));
-        assert!(is_not_modified(None, Some(&format!("  {lm}  ")), "abc", 1_700_000_000));
-        assert!(!is_not_modified(None, Some("Tue, 14 Nov 2023 00:00:00 GMT"), "abc", 1_700_000_000));
+        assert!(is_not_modified(
+            None,
+            Some(&format!("  {lm}  ")),
+            "abc",
+            1_700_000_000
+        ));
+        assert!(!is_not_modified(
+            None,
+            Some("Tue, 14 Nov 2023 00:00:00 GMT"),
+            "abc",
+            1_700_000_000
+        ));
     }
 
     #[test]
     fn etag_mismatch_falls_through_to_last_modified() {
         // If-None-Match present but wrong → PHP still checks If-Modified-Since.
         let lm = rfc7231(1_700_000_000);
-        assert!(is_not_modified(Some("\"wrong\""), Some(&lm), "abc", 1_700_000_000));
+        assert!(is_not_modified(
+            Some("\"wrong\""),
+            Some(&lm),
+            "abc",
+            1_700_000_000
+        ));
         // both wrong → not modified is false
-        assert!(!is_not_modified(Some("\"wrong\""), Some("nope"), "abc", 1_700_000_000));
+        assert!(!is_not_modified(
+            Some("\"wrong\""),
+            Some("nope"),
+            "abc",
+            1_700_000_000
+        ));
     }
 
     #[test]
@@ -199,10 +229,16 @@ mod tests {
         assert_eq!(r.content_type, "image/jpeg");
         assert_eq!(r.etag, "\"srcetag\"");
         assert_eq!(r.last_modified, "Tue, 14 Nov 2023 22:13:20 GMT");
-        assert_eq!(r.content_disposition, "inline; filename=\"256-256-crop.jpg\"");
+        assert_eq!(
+            r.content_disposition,
+            "inline; filename=\"256-256-crop.jpg\""
+        );
         assert_eq!(r.cache_control, "private, max-age=86400, immutable");
         // Expires = now + 86400
-        assert_eq!(r.expires.as_deref(), Some(rfc7231(1_700_000_000 + 86400)).as_deref());
+        assert_eq!(
+            r.expires.as_deref(),
+            Some(rfc7231(1_700_000_000 + 86400)).as_deref()
+        );
         assert_eq!(r.content_length, 4096);
     }
 

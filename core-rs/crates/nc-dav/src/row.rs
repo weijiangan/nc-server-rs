@@ -4,7 +4,7 @@
 //! All queries are parameterised and use the table prefix from `NcDavState`.
 
 use md5::{Digest, Md5};
-use nc_db::pool::{backend_is_postgres, DbPool};
+use nc_db::pool::DbPool;
 use sqlx::Row;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -99,11 +99,7 @@ pub async fn lookup_storage_id(
     let sql = format!("SELECT numeric_id FROM {prefix}storages WHERE id = $1");
     for key in &candidates {
         let adjusted = adjust_storage_id(key);
-        match sqlx::query(&sql)
-            .bind(&adjusted)
-            .fetch_optional(pool)
-            .await
-        {
+        match sqlx::query(&sql).bind(&adjusted).fetch_optional(pool).await {
             Ok(Some(row)) => return Some(row.get::<i64, _>("numeric_id")),
             Ok(None) => { /* not this key, try next */ }
             Err(e) => {
@@ -196,7 +192,12 @@ pub async fn lookup_by_path_with_ext(
          LEFT JOIN {prefix}filecache_extended fe ON fe.fileid = fc.fileid \
          WHERE fc.storage = $1 AND fc.path_hash = $2"
     );
-    match sqlx::query(&sql).bind(storage).bind(&hash).fetch_optional(pool).await {
+    match sqlx::query(&sql)
+        .bind(storage)
+        .bind(&hash)
+        .fetch_optional(pool)
+        .await
+    {
         Ok(Some(r)) => {
             let row = fc_row_from_any(&r);
             let ext = FileCacheExtRow {
@@ -269,7 +270,10 @@ pub async fn list_children_with_ext(
     prefix: &str,
     parent_id: i64,
     storage: i64,
-) -> (Vec<FileCacheRow>, std::collections::HashMap<i64, FileCacheExtRow>) {
+) -> (
+    Vec<FileCacheRow>,
+    std::collections::HashMap<i64, FileCacheExtRow>,
+) {
     let sql = format!(
         "SELECT fc.fileid, fc.storage, fc.path, fc.path_hash, fc.parent, fc.name, \
          fc.mimetype, fc.mimepart, fc.size, fc.mtime, fc.storage_mtime, fc.etag, \
@@ -281,7 +285,12 @@ pub async fn list_children_with_ext(
     let mut rows_out: Vec<FileCacheRow> = Vec::new();
     let mut ext_map: std::collections::HashMap<i64, FileCacheExtRow> =
         std::collections::HashMap::new();
-    match sqlx::query(&sql).bind(parent_id).bind(storage).fetch_all(pool).await {
+    match sqlx::query(&sql)
+        .bind(parent_id)
+        .bind(storage)
+        .fetch_all(pool)
+        .await
+    {
         Err(e) => {
             tracing::error!(error = %e, parent_id = parent_id, "list_children_with_ext: SQL error");
         }
@@ -309,7 +318,12 @@ pub async fn list_children_with_ext(
 /// `default` → unlimited, a plain number → bytes (human formats such as
 /// "1 GB" are not parsed — the differential scenarios use byte values).  The
 /// used size is the home storage root's cached size (PHP `getSize(sizeRoot)`).
-pub async fn quota_free_space(pool: &DbPool, prefix: &str, uid: &str, storage_id: i64) -> Option<i64> {
+pub async fn quota_free_space(
+    pool: &DbPool,
+    prefix: &str,
+    uid: &str,
+    storage_id: i64,
+) -> Option<i64> {
     let sql = format!(
         "SELECT configvalue FROM {prefix}preferences \
          WHERE userid = $1 AND appid = 'files' AND configkey = 'quota'"
@@ -396,7 +410,7 @@ pub async fn list_extended_batch(
 
     // Stable statement text per dialect (phase-21 S2): one text bind expanded
     // server-side on Postgres, one bind per id on SQLite.
-    let pg = backend_is_postgres();
+    let pg = pool.is_postgres();
     let sql = if pg {
         format!(
             "SELECT fileid, metadata_etag, creation_time, upload_time \
@@ -501,7 +515,7 @@ pub async fn count_children_batch(
     // expanded server-side via string_to_array (stable statement text — no
     // distinct prepared statement per child count); SQLite keeps one bind
     // per id via `IN`.  Same statements, same results on both backends.
-    let pg = backend_is_postgres();
+    let pg = pool.is_postgres();
     let sql = if pg {
         format!(
             "SELECT parent, \
@@ -679,9 +693,12 @@ pub async fn share_details_and_notes_batch(
     std::collections::HashMap<i64, String>,
 ) {
     if fileids.is_empty() {
-        return (std::collections::HashMap::new(), std::collections::HashMap::new());
+        return (
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        );
     }
-    let pg = backend_is_postgres();
+    let pg = pool.is_postgres();
     let sql = if pg {
         format!(
             "SELECT file_source, share_type, share_with, uid_owner, uid_initiator, note, stime \
@@ -713,7 +730,10 @@ pub async fn share_details_and_notes_batch(
         Ok(r) => r,
         Err(e) => {
             tracing::error!(uid, error = %e, "share_details_and_notes_batch: SQL error");
-            return (std::collections::HashMap::new(), std::collections::HashMap::new());
+            return (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            );
         }
     };
 
@@ -821,7 +841,6 @@ pub async fn list_changed_since(
         Ok(rows) => rows.iter().map(fc_row_from_any).collect(),
     }
 }
-
 
 // ─── oc_properties helpers (task §10.11) ─────────────────────────────────────
 
@@ -1005,9 +1024,7 @@ pub async fn delete_custom_properties_for_path(
     path: &str,
 ) -> anyhow::Result<()> {
     let prop_path = format_property_path(path);
-    let sql = format!(
-        "DELETE FROM {prefix}properties WHERE userid=$1 AND propertypath=$2"
-    );
+    let sql = format!("DELETE FROM {prefix}properties WHERE userid=$1 AND propertypath=$2");
     sqlx::query(&sql)
         .bind(userid)
         .bind(&prop_path)
@@ -1262,7 +1279,7 @@ async fn batch_lookup_display_names(
     //    (User::getDisplayName → backend); see lookup_user_display_name for
     //    why oc_accounts is only a (potentially stale) fallback.
     //    Uids are comma-safe (Nextcloud usernames: letters/digits/`_.@-'`).
-    let pg = backend_is_postgres();
+    let pg = pool.is_postgres();
     let users_sql = if pg {
         format!(
             "SELECT uid, displayname FROM {prefix}users \
@@ -1357,13 +1374,17 @@ async fn batch_lookup_display_names(
         }
         // 3. For any UIDs still unresolved, fall back to the UID itself.
         for uid in &unresolved {
-            display_names.entry((*uid).clone()).or_insert_with(|| (*uid).clone());
+            display_names
+                .entry((*uid).clone())
+                .or_insert_with(|| (*uid).clone());
         }
     }
 
     // 4. For UIDs that had no oc_users row and no oc_accounts row, fall back to UID.
     for uid in uids {
-        display_names.entry(uid.clone()).or_insert_with(|| uid.clone());
+        display_names
+            .entry(uid.clone())
+            .or_insert_with(|| uid.clone());
     }
 
     display_names
@@ -1446,12 +1467,7 @@ pub async fn get_comments_count(pool: &DbPool, prefix: &str, fileid: i64) -> i64
 ///
 /// The read marker is a de-correlated `LEFT JOIN` (T6.4), same shape as the
 /// batch query and PHP's own `Manager.php:678-688`.
-pub async fn get_comments_unread(
-    pool: &DbPool,
-    prefix: &str,
-    fileid: i64,
-    uid: &str,
-) -> i64 {
+pub async fn get_comments_unread(pool: &DbPool, prefix: &str, fileid: i64, uid: &str) -> i64 {
     let sql = format!(
         "SELECT COUNT(*) FROM {prefix}comments c \
          LEFT JOIN {prefix}comments_read_markers m \
@@ -1495,7 +1511,7 @@ pub async fn comments_counts_batch(
         return std::collections::HashMap::new();
     }
     let n = fileids.len();
-    let pg = backend_is_postgres();
+    let pg = pool.is_postgres();
     let sql = if pg {
         format!(
             "SELECT c.object_id, COUNT(*) AS n, \
@@ -1709,7 +1725,7 @@ pub async fn system_tags_batch(
     if fileids.is_empty() {
         return std::collections::HashMap::new();
     }
-    let pg = backend_is_postgres();
+    let pg = pool.is_postgres();
     let sql = if pg {
         format!(
             "SELECT m.objectid, t.id, t.name, t.visibility, t.editable, t.color \
@@ -1838,7 +1854,7 @@ pub async fn lookup_by_ids(
     if fileids.is_empty() {
         return std::collections::HashMap::new();
     }
-    let pg = backend_is_postgres();
+    let pg = pool.is_postgres();
     let sql = if pg {
         format!(
             "SELECT fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
@@ -2009,12 +2025,13 @@ mod tests {
 
     /// In-memory SQLite with the tables the batch PROPFIND queries read.
     async fn fresh_batch_db() -> DbPool {
-        sqlx::any::install_default_drivers();
-        let pool = sqlx::any::AnyPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("in-memory SQLite");
+        let pool = DbPool::Sqlite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("in-memory SQLite"),
+        );
         sqlx::query(
             "CREATE TABLE oc_filecache (
                 fileid BIGINT NOT NULL PRIMARY KEY, storage BIGINT NOT NULL,
@@ -2115,11 +2132,8 @@ mod tests {
         let pool = fresh_batch_db().await;
         let prefix = "oc_";
         // dir (1) with two children: a.txt (has an extended row), b.txt (none).
-        for (id, parent, name, mime) in [
-            (1, 0, "files", 2),
-            (2, 1, "a.txt", 1),
-            (3, 1, "b.txt", 1),
-        ] {
+        for (id, parent, name, mime) in [(1, 0, "files", 2), (2, 1, "a.txt", 1), (3, 1, "b.txt", 1)]
+        {
             let path = format!("files/{name}");
             sqlx::query(
                 "INSERT INTO oc_filecache (fileid, storage, path, path_hash, parent, name, mimetype) \
@@ -2163,9 +2177,11 @@ mod tests {
         assert_eq!(ext.creation_time, 0, "absent extended row → zero times");
         assert_eq!(ext.upload_time, 0);
         assert_eq!(ext.metadata_etag, None);
-        assert!(lookup_by_path_with_ext(&pool, prefix, 1, "files/missing.txt")
-            .await
-            .is_none());
+        assert!(
+            lookup_by_path_with_ext(&pool, prefix, 1, "files/missing.txt")
+                .await
+                .is_none()
+        );
 
         // list variant: same values through the fileid-keyed map, consistent
         // with the single-query pair for every child.
@@ -2179,7 +2195,11 @@ mod tests {
                 .expect("single row");
             let single_ext = get_extended(&pool, prefix, r.fileid).await;
             let joined_ext = map.get(&r.fileid).expect("joined ext");
-            assert_eq!(joined_ext.creation_time, single_ext.creation_time, "fileid {}", r.fileid);
+            assert_eq!(
+                joined_ext.creation_time, single_ext.creation_time,
+                "fileid {}",
+                r.fileid
+            );
             assert_eq!(joined_ext.upload_time, single_ext.upload_time);
             assert_eq!(joined_ext.metadata_etag, single_ext.metadata_etag);
             assert_eq!(single_row.fileid, r.fileid);
@@ -2234,16 +2254,16 @@ mod tests {
         // alice owns files 10/11/12; bob shares his file 11 WITH alice.
         // (id, share_type, share_with, uid_owner, uid_initiator, file_source, stime, note)
         for (id, stype, swith, owner, init, fs, stime, note) in [
-            (1, 0, "bob", "alice", "alice", 10, 100, ""),          // detail, no note
+            (1, 0, "bob", "alice", "alice", 10, 100, ""), // detail, no note
             (2, 1, "staff", "alice", "alice", 10, 200, "staff-note"), // detail + note
             (3, 0, "erin", "alice", "alice", 10, 300, "erin-note"), // detail + most-recent note
-            (4, 0, "alice", "bob", "bob", 11, 100, "bob-note"),    // detail + note
-            (5, 5, "x", "carol", "carol", 11, 500, "carol-note"),  // outside details filter,
+            (4, 0, "alice", "bob", "bob", 11, 100, "bob-note"), // detail + note
+            (5, 5, "x", "carol", "carol", 11, 500, "carol-note"), // outside details filter,
             // but the most-recent note on file 11 — notes must still see it
-            (6, 0, "dave", "alice", "alice", 12, 500, ""),         // detail, empty note at
+            (6, 0, "dave", "alice", "alice", 12, 500, ""), // detail, empty note at
             // the highest stime — must not hide the older note below
             (7, 0, "frank", "alice", "alice", 12, 400, "frank-note"), // detail + note
-            (8, 1, "staff", "alice", "alice", 12, 300, ""),        // detail, no note
+            (8, 1, "staff", "alice", "alice", 12, 300, ""),           // detail, no note
         ] {
             sqlx::query(
                 "INSERT INTO oc_share (id, share_type, share_with, uid_owner, uid_initiator, file_source, stime, note) \
@@ -2267,7 +2287,8 @@ mod tests {
             .execute(&pool)
             .await
             .expect("user");
-        let (details, notes) = share_details_and_notes_batch(&pool, prefix, "alice", &[10, 11, 12]).await;
+        let (details, notes) =
+            share_details_and_notes_batch(&pool, prefix, "alice", &[10, 11, 12]).await;
 
         // Notes: max-stime non-empty note per file, filter-free (carol-note
         // lives on a share_type-5 row alice is not a party to).
@@ -2287,7 +2308,13 @@ mod tests {
         for id in [10, 11, 12] {
             let mut single = get_share_details(&pool, prefix, "alice", id).await;
             let mut batched = details.get(&id).cloned().unwrap_or_default();
-            let key = |d: &ShareDetail| (d.share_type, d.share_with.clone(), d.share_with_displayname.clone());
+            let key = |d: &ShareDetail| {
+                (
+                    d.share_type,
+                    d.share_with.clone(),
+                    d.share_with_displayname.clone(),
+                )
+            };
             single.sort_by_key(key);
             batched.sort_by_key(key);
             assert_eq!(batched.len(), single.len(), "fileid {id} len");
@@ -2306,7 +2333,11 @@ mod tests {
         // falls back to the uid.
         let t10 = details.get(&10).unwrap();
         assert!(t10.iter().any(|d| d.share_with_displayname == "Robert"));
-        assert!(details.get(&12).unwrap().iter().any(|d| d.share_with_displayname == "dave"));
+        assert!(details
+            .get(&12)
+            .unwrap()
+            .iter()
+            .any(|d| d.share_with_displayname == "dave"));
     }
 
     #[tokio::test]
@@ -2354,9 +2385,21 @@ mod tests {
                 "unread {id}"
             );
         }
-        assert_eq!(merged.get(&10), Some(&(3, 1)), "file 10: 3 comments, bob@day03 unread");
-        assert_eq!(merged.get(&11), Some(&(1, 0)), "file 11: alice's own comment, nothing unread");
-        assert_eq!(merged.get(&12), Some(&(1, 1)), "file 12: bob's comment, no marker");
+        assert_eq!(
+            merged.get(&10),
+            Some(&(3, 1)),
+            "file 10: 3 comments, bob@day03 unread"
+        );
+        assert_eq!(
+            merged.get(&11),
+            Some(&(1, 0)),
+            "file 11: alice's own comment, nothing unread"
+        );
+        assert_eq!(
+            merged.get(&12),
+            Some(&(1, 1)),
+            "file 12: bob's comment, no marker"
+        );
     }
 
     #[tokio::test]
@@ -2364,13 +2407,15 @@ mod tests {
         let pool = fresh_batch_db().await;
         let prefix = "oc_";
         for (id, name, vis) in [(1, "Beta", 1), (2, "alpha", 1), (3, "hidden", 0)] {
-            sqlx::query("INSERT INTO oc_systemtag (id, name, visibility, editable) VALUES (?, ?, ?, 1)")
-                .bind(id)
-                .bind(name)
-                .bind(vis)
-                .execute(&pool)
-                .await
-                .expect("tag");
+            sqlx::query(
+                "INSERT INTO oc_systemtag (id, name, visibility, editable) VALUES (?, ?, ?, 1)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(vis)
+            .execute(&pool)
+            .await
+            .expect("tag");
         }
         for (obj, tag) in [("10", 1), ("10", 2), ("11", 3)] {
             sqlx::query(
@@ -2434,12 +2479,13 @@ mod tests {
     // ── oc_properties CRUD smoke test (SQLite in-memory) ─────────────────
 
     async fn fresh_props_db() -> DbPool {
-        sqlx::any::install_default_drivers();
-        let pool = sqlx::any::AnyPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("in-memory SQLite");
+        let pool = DbPool::Sqlite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("in-memory SQLite"),
+        );
         // Create the table matching 0013_properties.sql
         sqlx::query(
             "CREATE TABLE oc_properties (
@@ -2468,9 +2514,17 @@ mod tests {
         let xml = b"<ok xmlns=\"urn:example\">hello</ok>";
 
         // Insert
-        upsert_custom_property(&pool, prefix, "alice", "files/notes.txt", "{urn:example}state", xml, 2)
-            .await
-            .expect("upsert");
+        upsert_custom_property(
+            &pool,
+            prefix,
+            "alice",
+            "files/notes.txt",
+            "{urn:example}state",
+            xml,
+            2,
+        )
+        .await
+        .expect("upsert");
 
         // Read back
         let props = list_custom_properties(&pool, prefix, "alice", "files/notes.txt").await;
@@ -2486,14 +2540,30 @@ mod tests {
         let prefix = "oc_";
 
         // First write
-        upsert_custom_property(&pool, prefix, "alice", "files/x.txt", "{urn:a}v", b"<a/>", 2)
-            .await
-            .expect("upsert 1");
+        upsert_custom_property(
+            &pool,
+            prefix,
+            "alice",
+            "files/x.txt",
+            "{urn:a}v",
+            b"<a/>",
+            2,
+        )
+        .await
+        .expect("upsert 1");
 
         // Second write with different value
-        upsert_custom_property(&pool, prefix, "alice", "files/x.txt", "{urn:a}v", b"<b/>", 2)
-            .await
-            .expect("upsert 2");
+        upsert_custom_property(
+            &pool,
+            prefix,
+            "alice",
+            "files/x.txt",
+            "{urn:a}v",
+            b"<b/>",
+            2,
+        )
+        .await
+        .expect("upsert 2");
 
         // Should have exactly one row with the latest value
         let props = list_custom_properties(&pool, prefix, "alice", "files/x.txt").await;
@@ -2506,9 +2576,17 @@ mod tests {
         let pool = fresh_props_db().await;
         let prefix = "oc_";
 
-        upsert_custom_property(&pool, prefix, "alice", "files/a.txt", "{urn:x}p", b"<p/>", 2)
-            .await
-            .expect("upsert");
+        upsert_custom_property(
+            &pool,
+            prefix,
+            "alice",
+            "files/a.txt",
+            "{urn:x}p",
+            b"<p/>",
+            2,
+        )
+        .await
+        .expect("upsert");
 
         // Delete it
         delete_custom_property(&pool, prefix, "alice", "files/a.txt", "{urn:x}p")
@@ -2524,12 +2602,28 @@ mod tests {
         let pool = fresh_props_db().await;
         let prefix = "oc_";
 
-        upsert_custom_property(&pool, prefix, "alice", "files/b.txt", "{urn:a}p1", b"<p1/>", 2)
-            .await
-            .expect("upsert p1");
-        upsert_custom_property(&pool, prefix, "alice", "files/b.txt", "{urn:a}p2", b"<p2/>", 2)
-            .await
-            .expect("upsert p2");
+        upsert_custom_property(
+            &pool,
+            prefix,
+            "alice",
+            "files/b.txt",
+            "{urn:a}p1",
+            b"<p1/>",
+            2,
+        )
+        .await
+        .expect("upsert p1");
+        upsert_custom_property(
+            &pool,
+            prefix,
+            "alice",
+            "files/b.txt",
+            "{urn:a}p2",
+            b"<p2/>",
+            2,
+        )
+        .await
+        .expect("upsert p2");
 
         // Delete all for this path
         delete_custom_properties_for_path(&pool, prefix, "alice", "files/b.txt")
@@ -2545,12 +2639,28 @@ mod tests {
         let pool = fresh_props_db().await;
         let prefix = "oc_";
 
-        upsert_custom_property(&pool, prefix, "alice", "files/shared.txt", "{urn:x}p", b"<alice/>", 2)
-            .await
-            .expect("upsert alice");
-        upsert_custom_property(&pool, prefix, "bob", "files/shared.txt", "{urn:x}p", b"<bob/>", 2)
-            .await
-            .expect("upsert bob");
+        upsert_custom_property(
+            &pool,
+            prefix,
+            "alice",
+            "files/shared.txt",
+            "{urn:x}p",
+            b"<alice/>",
+            2,
+        )
+        .await
+        .expect("upsert alice");
+        upsert_custom_property(
+            &pool,
+            prefix,
+            "bob",
+            "files/shared.txt",
+            "{urn:x}p",
+            b"<bob/>",
+            2,
+        )
+        .await
+        .expect("upsert bob");
 
         let alice_props = list_custom_properties(&pool, prefix, "alice", "files/shared.txt").await;
         assert_eq!(alice_props.len(), 1);
@@ -2641,7 +2751,10 @@ mod tests {
     #[test]
     fn compute_share_permissions_file_strips_create_delete() {
         // Files can never carry CREATE or DELETE (PHP lines 280-282).
-        assert_eq!(compute_share_permissions(P_ALL, false, false), P_ALL & !(P_CREATE | P_DELETE));
+        assert_eq!(
+            compute_share_permissions(P_ALL, false, false),
+            P_ALL & !(P_CREATE | P_DELETE)
+        );
         assert_eq!(compute_share_permissions(P_ALL, false, false), 19);
     }
 
@@ -2654,7 +2767,10 @@ mod tests {
 
     #[test]
     fn permissions_to_ocm_json_with_share() {
-        assert_eq!(permissions_to_ocm_json(P_ALL), r#"["share","read","write"]"#);
+        assert_eq!(
+            permissions_to_ocm_json(P_ALL),
+            r#"["share","read","write"]"#
+        );
     }
 
     #[test]
@@ -2670,8 +2786,14 @@ mod tests {
         let effective = apply_sharing_mask(db_permissions, sharing_disabled);
 
         assert_eq!(effective, P_ALL, "home root keeps SHARE (→ RGDNVCK)");
-        assert_eq!(compute_share_permissions(effective, true, is_mount_root), P_ALL);
-        assert_eq!(permissions_to_ocm_json(effective), r#"["share","read","write"]"#);
+        assert_eq!(
+            compute_share_permissions(effective, true, is_mount_root),
+            P_ALL
+        );
+        assert_eq!(
+            permissions_to_ocm_json(effective),
+            r#"["share","read","write"]"#
+        );
     }
 
     #[test]
@@ -2694,7 +2816,13 @@ mod tests {
         let effective = apply_sharing_mask(db_permissions, sharing_disabled);
 
         assert_eq!(effective, P_ALL, "non-root keeps SHARE (→ RGDNVCK)");
-        assert_eq!(compute_share_permissions(effective, true, is_mount_root), P_ALL);
-        assert_eq!(permissions_to_ocm_json(effective), r#"["share","read","write"]"#);
+        assert_eq!(
+            compute_share_permissions(effective, true, is_mount_root),
+            P_ALL
+        );
+        assert_eq!(
+            permissions_to_ocm_json(effective),
+            r#"["share","read","write"]"#
+        );
     }
 }

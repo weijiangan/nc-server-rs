@@ -67,7 +67,10 @@ impl Inventory {
         &self,
         scenario: &str,
         divs: &'a [Divergence],
-    ) -> (Vec<(&'a Divergence, &DivergenceRecord)>, Vec<&'a Divergence>) {
+    ) -> (
+        Vec<(&'a Divergence, &DivergenceRecord)>,
+        Vec<&'a Divergence>,
+    ) {
         let mut known = Vec::new();
         let mut unlisted = Vec::new();
         for d in divs {

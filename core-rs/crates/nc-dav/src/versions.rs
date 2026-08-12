@@ -44,11 +44,7 @@ pub async fn store_version(
 ) {
     debug!(
         fc_path,
-        old_size,
-        old_mtime,
-        old_mimetype,
-        source_fileid,
-        "store_version called"
+        old_size, old_mtime, old_mimetype, source_fileid, "store_version called"
     );
 
     // Guard: skip .part files, empty files, directories (PHP Storage::store:160-205).
@@ -181,8 +177,10 @@ pub async fn rename_versions(
         None => return,
     };
 
-    let old_versions_dir = crate::row::disk_path(data_dir, uid, &format!("files_versions/{old_rel}"));
-    let new_versions_dir = crate::row::disk_path(data_dir, uid, &format!("files_versions/{new_rel}"));
+    let old_versions_dir =
+        crate::row::disk_path(data_dir, uid, &format!("files_versions/{old_rel}"));
+    let new_versions_dir =
+        crate::row::disk_path(data_dir, uid, &format!("files_versions/{new_rel}"));
 
     // Check if the old path is a directory or a file (by checking disk).
     if old_versions_dir.is_dir() {
@@ -210,10 +208,12 @@ pub async fn rename_versions(
                     if name_str.starts_with(&prefix_pattern)
                         && name_str[prefix_pattern.len()..].starts_with(".v")
                     {
-                        let new_name =
-                            format!("{}{}", new_rel, &name_str[prefix_pattern.len()..]);
-                        let new_disk =
-                            crate::row::disk_path(data_dir, uid, &format!("files_versions/{new_name}"));
+                        let new_name = format!("{}{}", new_rel, &name_str[prefix_pattern.len()..]);
+                        let new_disk = crate::row::disk_path(
+                            data_dir,
+                            uid,
+                            &format!("files_versions/{new_name}"),
+                        );
                         if let Some(np) = new_disk.parent() {
                             let _ = tokio::fs::create_dir_all(np).await;
                         }
@@ -247,7 +247,8 @@ pub async fn copy_versions(
         None => return,
     };
 
-    let old_versions_dir = crate::row::disk_path(data_dir, uid, &format!("files_versions/{old_rel}"));
+    let old_versions_dir =
+        crate::row::disk_path(data_dir, uid, &format!("files_versions/{old_rel}"));
     let parent_of_versions = old_versions_dir.parent();
     let base_name = old_versions_dir
         .file_name()
@@ -259,8 +260,7 @@ pub async fn copy_versions(
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if name_str.starts_with(&base_name)
-                    && name_str[base_name.len()..].starts_with(".v")
+                if name_str.starts_with(&base_name) && name_str[base_name.len()..].starts_with(".v")
                 {
                     let new_name = format!("{}{}", new_rel, &name_str[base_name.len()..]);
                     let new_disk =
@@ -352,20 +352,11 @@ async fn ensure_version_parents(
         let name = seg.to_string();
         let now = current_timestamp();
 
-        let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
-            pool,
-            prefix,
-            mime_cache,
-            "httpd/unix-directory",
-        )
-        .await;
-        let dir_mimepart_id = nc_db::mime::get_or_insert_mime_id(
-            pool,
-            prefix,
-            mime_cache,
-            "httpd",
-        )
-        .await;
+        let dir_mime_id =
+            nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, "httpd/unix-directory")
+                .await;
+        let dir_mimepart_id =
+            nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, "httpd").await;
         let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
 
         let sql = format!(
@@ -474,7 +465,11 @@ async fn insert_version_row(
             let mime_str = cache
                 .get_name(mimetype)
                 .unwrap_or("application/octet-stream");
-            mime_str.split('/').next().unwrap_or("application").to_string()
+            mime_str
+                .split('/')
+                .next()
+                .unwrap_or("application")
+                .to_string()
         };
         // Drop the RwLockReadGuard before the await below.
         nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, &part_str).await
@@ -586,7 +581,9 @@ pub(crate) async fn insert_version_entity(
                     warn!(source_fileid, timestamp, error = %e, "Failed to insert oc_files_versions row");
                     return;
                 }
-                if msg.contains("UNIQUE") || msg.contains("unique") || msg.contains("constraint")
+                if msg.contains("UNIQUE")
+                    || msg.contains("unique")
+                    || msg.contains("constraint")
                     || msg.contains("duplicate")
                 {
                     ts += 1;
@@ -647,12 +644,13 @@ mod tests {
     /// 1  "" (root)  2  "files"  4  "files/hello.txt" (26, etag "old-etag", mtime 100)
     /// ```
     async fn fresh_db() -> (DbPool, String, i64) {
-        sqlx::any::install_default_drivers();
-        let pool = sqlx::any::AnyPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("in-memory SQLite");
+        let pool = DbPool::Sqlite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("in-memory SQLite"),
+        );
 
         sqlx::query(
             "CREATE TABLE oc_filecache (
@@ -750,10 +748,7 @@ mod tests {
     #[test]
     fn version_metadata_json_escapes_special_chars() {
         // json_encode escapes quotes/backslashes/control chars; serde_json matches.
-        assert_eq!(
-            version_metadata_json(r#"a"b"#),
-            r#"{"author":"a\"b"}"#
-        );
+        assert_eq!(version_metadata_json(r#"a"b"#), r#"{"author":"a\"b"}"#);
     }
 
     /// The version row is a clone of the overwritten file (PHP `View::copy` →
@@ -794,7 +789,11 @@ mod tests {
         let v = row::lookup_by_path(&pool, &prefix, storage_id, "files_versions/hello.txt.v100")
             .await
             .expect("version row");
-        assert_eq!(v.etag.as_deref(), Some("old-etag"), "version row must inherit the source etag");
+        assert_eq!(
+            v.etag.as_deref(),
+            Some("old-etag"),
+            "version row must inherit the source etag"
+        );
         assert_eq!(v.mtime, 100, "version row must keep the source mtime");
         assert_eq!(v.size, 26);
         assert!(
@@ -802,12 +801,13 @@ mod tests {
             "storage_mtime {} should be the copy time (now), not the old mtime",
             v.storage_mtime
         );
-        let checksum: Option<String> =
-            sqlx::query_scalar(&format!("SELECT checksum FROM {prefix}filecache WHERE fileid = $1"))
-                .bind(v.fileid)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let checksum: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT checksum FROM {prefix}filecache WHERE fileid = $1"
+        ))
+        .bind(v.fileid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(checksum, None, "version row checksum must be NULL");
 
         // The parent dir: size recomputed from children, mtime/etag propagated,
@@ -815,19 +815,21 @@ mod tests {
         let dir = row::lookup_by_path(&pool, &prefix, storage_id, "files_versions")
             .await
             .expect("files_versions dir");
-        assert_eq!(dir.size, 26, "files_versions dir must gain the version file's size");
+        assert_eq!(
+            dir.size, 26,
+            "files_versions dir must gain the version file's size"
+        );
         assert!(
             dir.mtime >= 100,
             "files_versions dir mtime {} should be bumped by the propagation",
             dir.mtime
         );
-        let dir_ext: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM oc_filecache_extended WHERE fileid = $1",
-        )
-        .bind(dir.fileid)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let dir_ext: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oc_filecache_extended WHERE fileid = $1")
+                .bind(dir.fileid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(dir_ext, 0, "version dirs must have no extended rows");
     }
 
@@ -856,6 +858,9 @@ mod tests {
         assert_eq!(rows.len(), 2, "the retried insert must land a second row");
         let (ts, size) = rows.iter().max().copied().unwrap();
         assert!(ts > 100, "the new entity must carry a bumped timestamp");
-        assert_eq!(size, 31, "the new entity must reflect the post-write file size");
+        assert_eq!(
+            size, 31,
+            "the new entity must reflect the post-write file size"
+        );
     }
 }

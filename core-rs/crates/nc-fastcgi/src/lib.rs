@@ -116,7 +116,8 @@ impl FastCgiState {
             );
         }
 
-        let session_resolve_permits = config.session_resolve_concurrency.unwrap_or(8).max(1) as usize;
+        let session_resolve_permits =
+            config.session_resolve_concurrency.unwrap_or(8).max(1) as usize;
 
         Some(Self {
             socket_path,
@@ -281,21 +282,19 @@ pub async fn proxy_handler(fpm: &FastCgiState, req: axum::extract::Request) -> R
     // middleware (trusted-proxy XFF walk, gated X-Forwarded-Proto/Host) —
     // REMOTE_ADDR / SERVER_NAME / SERVER_PORT / HTTPS all come from it, so
     // client-supplied forwarding headers cannot spoof any of them.
-    let identity = parts
-        .extensions
-        .get::<nc_auth::ClientIdentity>();
+    let identity = parts.extensions.get::<nc_auth::ClientIdentity>();
     let (remote_addr, server_name, server_port, is_https) = match identity {
-        Some(id) => (
-            id.ip.to_string(),
-            id.host.clone(),
-            id.port,
-            id.https,
-        ),
+        Some(id) => (id.ip.to_string(), id.host.clone(), id.port, id.https),
         None => {
             // No resolved identity (requests bypassing the composite, e.g.
             // tests): fall back to the peer-less defaults.  In production the
             // composite always resolves first.
-            ("127.0.0.1".to_string(), "localhost".to_string(), 80u16, false)
+            (
+                "127.0.0.1".to_string(),
+                "localhost".to_string(),
+                80u16,
+                false,
+            )
         }
     };
 
@@ -580,10 +579,7 @@ where
                         accum_len = header_accum.len(),
                         "fastcgi: CGI header block exceeds 64 KiB cap — aborting (misbehaving app)"
                     );
-                    return Err(error_response(
-                        502,
-                        "FastCGI header block too large\n",
-                    ));
+                    return Err(error_response(502, "FastCGI header block too large\n"));
                 }
 
                 if let Some(sep_pos) = header_accum.windows(SEP.len()).position(|w| w == SEP) {
@@ -1053,10 +1049,7 @@ pub async fn fetch_php_capabilities(
             .and_then(|c| c.as_object())
             .map(|o| o.keys().map(|k| k.as_str()).collect())
             .unwrap_or_default();
-        tracing::debug!(
-            ?keys,
-            "capabilities-fetch: received PHP-app capabilities"
-        );
+        tracing::debug!(?keys, "capabilities-fetch: received PHP-app capabilities");
     }
 
     caps
@@ -1513,7 +1506,10 @@ mod tests {
     fn registry_scans_real_apps_dir() {
         // Navigate from core-rs/crates/nc-fastcgi/ → workspace/server
         let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let nc_root = crate_dir.join("../../../workspace/server").canonicalize().unwrap();
+        let nc_root = crate_dir
+            .join("../../../workspace/server")
+            .canonicalize()
+            .unwrap();
 
         let entries = build_route_registry(&nc_root);
 
@@ -1740,11 +1736,8 @@ mod tests {
     /// Scratch directory unique per test — parallel-safe without a tempfile
     /// crate: `{tmp}/nc-fastcgi-shim-{pid}-{name}`.
     fn shim_test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "nc-fastcgi-shim-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nc-fastcgi-shim-{}-{}", std::process::id(), name));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1820,7 +1813,10 @@ mod tests {
     fn header_map(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
         let mut m = axum::http::HeaderMap::new();
         for (k, v) in pairs {
-            m.insert(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+            m.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
         }
         m
     }

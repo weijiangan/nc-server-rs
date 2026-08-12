@@ -103,7 +103,11 @@ pub(crate) async fn create_token(inst: &Instance, admin_user: &str) -> Result<St
     let secret = read_secret(inst)?;
 
     // Raw token: 256 bits of randomness (two v4 UUIDs).
-    let raw = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    let raw = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
 
     // Stored value: hex(sha512(raw + secret)) — PHP `hashToken` / Rust `concat_hash`.
     let mut h = Sha512::new();

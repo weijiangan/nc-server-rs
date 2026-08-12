@@ -86,7 +86,10 @@ pub async fn try_serve_archive(
     //    If filter has invalid values (PHP behaviour) we bail entirely.
     let (filter, has_invalid) = parse_files_filter(uri_query, &x_nc_files);
     if has_invalid {
-        tracing::debug!(?uri_query, "§5.10 invalid files filter, falling through to default");
+        tracing::debug!(
+            ?uri_query,
+            "§5.10 invalid files filter, falling through to default"
+        );
         return None;
     }
     let filtered = !filter.is_empty();
@@ -97,22 +100,31 @@ pub async fn try_serve_archive(
     let archive_name = if fc_path == "files" {
         "download".to_string()
     } else {
-        fc_path
-            .rsplit('/')
-            .next()
-            .unwrap_or("download")
-            .to_string()
+        fc_path.rsplit('/').next().unwrap_or("download").to_string()
     };
 
     // 5. Collect entries.
     let children = if filtered {
         collect_filtered_children(
-            pool, prefix, storage_id, &filter, fc_path, data_dir, uid, dir_mimetype_id,
+            pool,
+            prefix,
+            storage_id,
+            &filter,
+            fc_path,
+            data_dir,
+            uid,
+            dir_mimetype_id,
         )
         .await
     } else {
         collect_all_children(
-            pool, prefix, storage_id, fc_path, data_dir, uid, dir_mimetype_id,
+            pool,
+            prefix,
+            storage_id,
+            fc_path,
+            data_dir,
+            uid,
+            dir_mimetype_id,
         )
         .await
     };
@@ -128,9 +140,8 @@ pub async fn try_serve_archive(
     };
     let full_name = format!("{archive_name}.{ext}");
     let encoded = percent_encode_filename(&full_name);
-    let content_disposition = format!(
-        "attachment; filename*=UTF-8''{encoded}; filename=\"{encoded}\""
-    );
+    let content_disposition =
+        format!("attachment; filename*=UTF-8''{encoded}; filename=\"{encoded}\"");
     let content_type = match format {
         ArchiveFormat::Zip => "application/zip",
         ArchiveFormat::Tar => "application/x-tar",
@@ -161,10 +172,7 @@ pub async fn try_serve_archive(
                 http::header::CONTENT_TYPE,
                 HeaderValue::from_static(content_type),
             )
-            .header(
-                H_X_ACCEL_BUFFERING.clone(),
-                HeaderValue::from_static("no"),
-            )
+            .header(H_X_ACCEL_BUFFERING.clone(), HeaderValue::from_static("no"))
             .header(
                 http::header::CONTENT_DISPOSITION,
                 HeaderValue::from_str(&content_disposition).unwrap(),
@@ -191,10 +199,7 @@ pub async fn try_serve_archive(
                 http::header::CONTENT_TYPE,
                 HeaderValue::from_static(content_type),
             )
-            .header(
-                H_X_ACCEL_BUFFERING.clone(),
-                HeaderValue::from_static("no"),
-            )
+            .header(H_X_ACCEL_BUFFERING.clone(), HeaderValue::from_static("no"))
             .header(
                 http::header::CONTENT_DISPOSITION,
                 HeaderValue::from_str(&content_disposition).unwrap(),
@@ -212,10 +217,8 @@ pub async fn try_serve_archive(
             .insert(HeaderName::from_static("x-request-id"), v);
     }
     if let Ok(v) = HeaderValue::from_str(uid) {
-        resp.headers_mut().insert(
-            HeaderName::from_static("x-user-id"),
-            v,
-        );
+        resp.headers_mut()
+            .insert(HeaderName::from_static("x-user-id"), v);
     }
 
     Some(resp)
@@ -364,7 +367,14 @@ async fn collect_all_children(
     };
 
     collect_node(
-        pool, prefix, storage_id, &dir_row, &root_path, data_dir, uid, dir_mimetype_id,
+        pool,
+        prefix,
+        storage_id,
+        &dir_row,
+        &root_path,
+        data_dir,
+        uid,
+        dir_mimetype_id,
     )
     .await
 }
@@ -390,11 +400,16 @@ async fn collect_filtered_children(
     let mut entries = Vec::new();
     for name in child_names {
         let child_fc = format!("{fc_path}/{name}");
-        if let Some(child_row) =
-            row::lookup_by_path(pool, prefix, storage_id, &child_fc).await
-        {
+        if let Some(child_row) = row::lookup_by_path(pool, prefix, storage_id, &child_fc).await {
             let sub = collect_node(
-                pool, prefix, storage_id, &child_row, &root_path, data_dir, uid, dir_mimetype_id,
+                pool,
+                prefix,
+                storage_id,
+                &child_row,
+                &root_path,
+                data_dir,
+                uid,
+                dir_mimetype_id,
             )
             .await;
             entries.extend(sub);
@@ -435,7 +450,14 @@ async fn collect_node(
         for child in &children {
             all.extend(
                 Box::pin(collect_node(
-                    pool, prefix, storage_id, child, root_path, data_dir, uid, dir_mimetype_id,
+                    pool,
+                    prefix,
+                    storage_id,
+                    child,
+                    root_path,
+                    data_dir,
+                    uid,
+                    dir_mimetype_id,
                 ))
                 .await,
             );
@@ -468,7 +490,14 @@ async fn collect_node(
     for child in &children {
         result.extend(
             Box::pin(collect_node(
-                pool, prefix, storage_id, child, root_path, data_dir, uid, dir_mimetype_id,
+                pool,
+                prefix,
+                storage_id,
+                child,
+                root_path,
+                data_dir,
+                uid,
+                dir_mimetype_id,
             ))
             .await,
         );
@@ -503,8 +532,7 @@ fn build_archive_buffered(
             let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
 
             if include_top_dir {
-                let mtime =
-                    unix_to_zip_datetime(entries.first().map(|e| e.mtime).unwrap_or(0));
+                let mtime = unix_to_zip_datetime(entries.first().map(|e| e.mtime).unwrap_or(0));
                 let opts = ZipFileOptions::<()>::default().last_modified_time(mtime);
                 let _ = zip.add_directory(archive_name, opts);
             }
@@ -515,13 +543,11 @@ fn build_archive_buffered(
                 }
                 if entry.is_dir {
                     let mtime = unix_to_zip_datetime(entry.mtime);
-                    let opts =
-                        ZipFileOptions::<()>::default().last_modified_time(mtime);
+                    let opts = ZipFileOptions::<()>::default().last_modified_time(mtime);
                     let _ = zip.add_directory(&entry.archive_path, opts);
                 } else {
                     let mtime = unix_to_zip_datetime(entry.mtime);
-                    let opts =
-                        ZipFileOptions::<()>::default().last_modified_time(mtime);
+                    let opts = ZipFileOptions::<()>::default().last_modified_time(mtime);
                     if zip.start_file(&entry.archive_path, opts).is_err() {
                         tracing::error!(path = %entry.archive_path, "zip start_file failed");
                         continue;
@@ -562,8 +588,7 @@ fn build_archive_buffered(
                     header.set_mode(0o644);
                     header.set_entry_type(tar::EntryType::Regular);
                     header.set_cksum();
-                    let _ =
-                        tar.append_data(&mut header, &entry.archive_path, file);
+                    let _ = tar.append_data(&mut header, &entry.archive_path, file);
                 } else {
                     tracing::warn!(
                         path = %entry.disk_path.display(),

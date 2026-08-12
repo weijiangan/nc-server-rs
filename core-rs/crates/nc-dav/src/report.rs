@@ -44,11 +44,7 @@ pub async fn handle_report(
 
     // Only handle {oc:}filter-files.
     if root.name != "filter-files"
-        || root
-            .namespace
-            .as_deref()
-            .unwrap_or("")
-            != "http://owncloud.org/ns"
+        || root.namespace.as_deref().unwrap_or("") != "http://owncloud.org/ns"
     {
         return None; // Not a filter-files REPORT.
     }
@@ -170,7 +166,11 @@ pub async fn handle_report(
 
         let mut meta = NcMetaData::from_row(fc_row, mime_type, None);
         if let Some(ext) = extended_map.get(&fid) {
-            meta.apply_extended(ext.creation_time, ext.upload_time, ext.metadata_etag.clone());
+            meta.apply_extended(
+                ext.creation_time,
+                ext.upload_time,
+                ext.metadata_etag.clone(),
+            );
         }
 
         // Build the DAV href.
@@ -190,19 +190,19 @@ pub async fn handle_report(
             &meta,
             instance_id,
             uid,
-            uid,                  // owner_display_name — will be resolved per-file
-            true,                 // do_content
-            "",                   // data_fingerprint
-            0,                    // child_dir_count
-            0,                    // child_file_count
-            false,                // is_mounted
-            false,                // is_shared
-            fc_row.permissions,   // share_permissions (use raw — sharing mask not applied for now)
-            "",                   // download_url
-            "",                   // note
-            false,                // has_preview
-            &[],                  // tags
-            true,                 // favorite
+            uid,                // owner_display_name — will be resolved per-file
+            true,               // do_content
+            "",                 // data_fingerprint
+            0,                  // child_dir_count
+            0,                  // child_file_count
+            false,              // is_mounted
+            false,              // is_shared
+            fc_row.permissions, // share_permissions (use raw — sharing mask not applied for now)
+            "",                 // download_url
+            "",                 // note
+            false,              // has_preview
+            &[],                // tags
+            true,               // favorite
         );
 
         // Group props: Some(xml) → 200, None(xml) → 404.
@@ -231,8 +231,7 @@ pub async fn handle_report(
             for (ns, name) in &requested_props {
                 // Check if already covered by a 200 or 404 prop.
                 let covered = props.iter().any(|p| {
-                    p.namespace.as_deref().unwrap_or("") == ns.as_str()
-                        && p.name == *name
+                    p.namespace.as_deref().unwrap_or("") == ns.as_str() && p.name == *name
                 });
                 if !covered {
                     let tag = make_empty_tag(ns, name);
@@ -264,9 +263,8 @@ pub async fn handle_report(
             for tag in &props_404_names {
                 responses_xml.push_str(tag);
             }
-            responses_xml.push_str(
-                "</d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>",
-            );
+            responses_xml
+                .push_str("</d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>");
         }
 
         responses_xml.push_str("</d:response>");
@@ -308,9 +306,7 @@ fn build_xml_error(status: u16, exception: &str, message: &str) -> http::Respons
          </d:error>\n"
     );
     http::Response::builder()
-        .status(
-            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
-        )
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST))
         .header(
             http::header::CONTENT_TYPE,
             http::HeaderValue::from_static("application/xml; charset=utf-8"),

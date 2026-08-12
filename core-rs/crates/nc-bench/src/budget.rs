@@ -197,13 +197,20 @@ async fn probe(
     if let Some(d) = depth {
         h.insert("Depth", reqwest::header::HeaderValue::from(d));
     }
-    let resp = client.request(m, path, h, None).await.context("probe request")?;
+    let resp = client
+        .request(m, path, h, None)
+        .await
+        .context("probe request")?;
     let status = resp.status();
     // Consume the response body: dav-server-rs streams PROPFIND responses —
     // read_dir and the per-child batch queries run inside the stream, which
     // only executes while the body is being read.  Dropping the response
     // without reading it would skip the very work being measured.
-    let body_len = resp.text().await.context("reading probe response body")?.len();
+    let body_len = resp
+        .text()
+        .await
+        .context("reading probe response body")?
+        .len();
     eprintln!("    [{} {} -> {} ({body_len} B)]", status, method, path);
     Ok(())
 }

@@ -36,8 +36,14 @@ pub fn render(d: &Delta) -> String {
                     }
                     cols.sort();
                     for c in cols {
-                        let b = before.get(c).map(|s| sanitize(s)).unwrap_or_else(|| "∅".into());
-                        let a = after.get(c).map(|s| sanitize(s)).unwrap_or_else(|| "∅".into());
+                        let b = before
+                            .get(c)
+                            .map(|s| sanitize(s))
+                            .unwrap_or_else(|| "∅".into());
+                        let a = after
+                            .get(c)
+                            .map(|s| sanitize(s))
+                            .unwrap_or_else(|| "∅".into());
                         if b != a {
                             diffs.push(format!("{c}: {b} -> {a}"));
                         }

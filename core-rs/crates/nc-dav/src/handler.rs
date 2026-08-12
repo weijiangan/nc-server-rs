@@ -61,7 +61,10 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
             );
             return http::Response::builder()
                 .status(StatusCode::BAD_REQUEST)
-                .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+                .header(
+                    H_CSP.clone(),
+                    HeaderValue::from_static("default-src 'none';"),
+                )
                 .body(Body::from(msg.clone()))
                 .unwrap();
         }
@@ -82,7 +85,10 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
             );
             return http::Response::builder()
                 .status(StatusCode::BAD_REQUEST)
-                .header(H_CSP.clone(), HeaderValue::from_static("default-src 'none';"))
+                .header(
+                    H_CSP.clone(),
+                    HeaderValue::from_static("default-src 'none';"),
+                )
                 .body(Body::from(msg.clone()))
                 .unwrap();
         }
@@ -726,10 +732,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         if let Some(ref token) = download_start_token {
             if let Some(cookie_val) = build_download_started_cookie(token) {
                 if let Ok(v) = http::HeaderValue::from_str(&cookie_val) {
-                    parts.headers.insert(
-                        http::header::SET_COOKIE,
-                        v,
-                    );
+                    parts.headers.insert(http::header::SET_COOKIE, v);
                 }
             }
         }
@@ -958,10 +961,7 @@ fn build_download_started_cookie(token: &str) -> Option<String> {
     }
     // PHP: setcookie('ocDownloadStarted', $token, time() + 20, '/')
     // Max-Age=20, Path=/
-    Some(format!(
-        "ocDownloadStarted={}; Max-Age=20; Path=/",
-        token
-    ))
+    Some(format!("ocDownloadStarted={}; Max-Age=20; Path=/", token))
 }
 
 /// Extract the path component from a `Destination` header value.

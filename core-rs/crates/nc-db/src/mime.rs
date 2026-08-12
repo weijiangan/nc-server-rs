@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use sqlx::AnyPool;
+use crate::pool::DbPool;
 
 /// Process-lifetime cache of `oc_mimetypes`.
 ///
@@ -48,7 +48,7 @@ impl MimeCache {
 /// Returns the mimetype ID, or `1` (`application/octet-stream`) as a last‑resort
 /// fallback when the DB is unreachable.
 pub async fn get_or_insert_mime_id(
-    pool: &AnyPool,
+    pool: &DbPool,
     table_prefix: &str,
     cache: &SharedMimeCache,
     mime: &str,
@@ -73,15 +73,13 @@ pub async fn get_or_insert_mime_id(
         .await;
 
     // Read back the ID (ours or the concurrent winner's).
-    let id: i64 = sqlx::query_scalar(&format!(
-        "SELECT id FROM {table} WHERE mimetype = $1"
-    ))
-    .bind(mime)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(1_i64);
+    let id: i64 = sqlx::query_scalar(&format!("SELECT id FROM {table} WHERE mimetype = $1"))
+        .bind(mime)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(1_i64);
 
     // Update the in‑memory cache so future readers don't repeat the DB trip.
     {
@@ -95,15 +93,11 @@ pub async fn get_or_insert_mime_id(
 }
 
 /// Load `oc_mimetypes` from the DB and return a shared, writable cache.
-pub async fn load_mime_cache(
-    pool: &AnyPool,
-    table_prefix: &str,
-) -> anyhow::Result<SharedMimeCache> {
+pub async fn load_mime_cache(pool: &DbPool, table_prefix: &str) -> anyhow::Result<SharedMimeCache> {
     let table = format!("{table_prefix}mimetypes");
-    let rows: Vec<(i64, String)> =
-        sqlx::query_as(&format!("SELECT id, mimetype FROM {table}"))
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(i64, String)> = sqlx::query_as(&format!("SELECT id, mimetype FROM {table}"))
+        .fetch_all(pool)
+        .await?;
 
     let mut cache = MimeCache::default();
     for (id, mime) in rows {
@@ -119,7 +113,7 @@ pub async fn load_mime_cache(
 ///
 /// Called after any insert into `oc_mimetypes`.
 pub async fn refresh_mime_cache(
-    pool: &AnyPool,
+    pool: &DbPool,
     table_prefix: &str,
     cache: &SharedMimeCache,
 ) -> anyhow::Result<()> {

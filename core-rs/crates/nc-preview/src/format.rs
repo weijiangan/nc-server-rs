@@ -78,7 +78,10 @@ impl OutputFormat {
 /// the mapping untouched).
 pub fn output_format(source_mime: &str, preview_format: Option<&str>) -> OutputFormat {
     let base = match source_mime {
-        "image/gif" | "image/png" | "image/svg+xml" | "application/pdf"
+        "image/gif"
+        | "image/png"
+        | "image/svg+xml"
+        | "application/pdf"
         | "application/illustrator" => OutputFormat::Png,
         _ => OutputFormat::Jpeg,
     };
@@ -213,7 +216,10 @@ mod tests {
         assert_eq!(output_format("image/gif", None), OutputFormat::Png);
         assert_eq!(output_format("image/svg+xml", None), OutputFormat::Png);
         assert_eq!(output_format("application/pdf", None), OutputFormat::Png);
-        assert_eq!(output_format("application/illustrator", None), OutputFormat::Png);
+        assert_eq!(
+            output_format("application/illustrator", None),
+            OutputFormat::Png
+        );
         for m in [
             "image/jpeg",
             "image/bmp",
@@ -232,9 +238,15 @@ mod tests {
     fn output_format_webp_override_is_one_way() {
         // Only "webp" overrides; any other value (incl. the default "jpeg") is a no-op.
         assert_eq!(output_format("image/png", Some("webp")), OutputFormat::Webp);
-        assert_eq!(output_format("image/heic", Some("webp")), OutputFormat::Webp);
+        assert_eq!(
+            output_format("image/heic", Some("webp")),
+            OutputFormat::Webp
+        );
         assert_eq!(output_format("image/png", Some("jpeg")), OutputFormat::Png);
-        assert_eq!(output_format("image/jpeg", Some("jpeg")), OutputFormat::Jpeg);
+        assert_eq!(
+            output_format("image/jpeg", Some("jpeg")),
+            OutputFormat::Jpeg
+        );
         assert_eq!(output_format("image/png", Some("gif")), OutputFormat::Png); // not webp → no-op
         assert_eq!(output_format("image/png", None), OutputFormat::Png);
     }
@@ -263,20 +275,56 @@ mod tests {
     /// `(source_mime, expected)` for a max-preview generation at 4096×4096,
     /// default `preview_format`, quality 80/80.
     const MAX_GOLDEN: &[(&str, &str)] = &[
-        ("image/bmp", r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#),
-        ("image/x-bitmap", r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#),
-        ("image/png", r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"png","norotation":"true","quality":"80"}}]"#),
-        ("image/jpeg", r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#),
-        ("image/gif", r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"png","norotation":"true","quality":"80"}}]"#),
+        (
+            "image/bmp",
+            r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#,
+        ),
+        (
+            "image/x-bitmap",
+            r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#,
+        ),
+        (
+            "image/png",
+            r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"png","norotation":"true","quality":"80"}}]"#,
+        ),
+        (
+            "image/jpeg",
+            r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#,
+        ),
+        (
+            "image/gif",
+            r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"png","norotation":"true","quality":"80"}}]"#,
+        ),
         // heic: NEITHER autorotate nor convert.
-        ("image/heic", r#"[{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#),
-        ("image/heif", r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#),
+        (
+            "image/heic",
+            r#"[{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#,
+        ),
+        (
+            "image/heif",
+            r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#,
+        ),
         // svg+xml / illustrator / pdf: convert{type:png} (no autorotate).
-        ("image/svg+xml", r#"[{"operation":"convert","params":{"type":"png"}},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"png","norotation":"true","quality":"80"}}]"#),
-        ("image/tiff", r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#),
-        ("image/webp", r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#),
-        ("application/illustrator", r#"[{"operation":"convert","params":{"type":"png"}},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"png","norotation":"true","quality":"80"}}]"#),
-        ("application/pdf", r#"[{"operation":"convert","params":{"type":"png"}},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"png","norotation":"true","quality":"80"}}]"#),
+        (
+            "image/svg+xml",
+            r#"[{"operation":"convert","params":{"type":"png"}},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"png","norotation":"true","quality":"80"}}]"#,
+        ),
+        (
+            "image/tiff",
+            r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#,
+        ),
+        (
+            "image/webp",
+            r#"[{"operation":"autorotate"},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"jpeg","norotation":"true","quality":"80"}}]"#,
+        ),
+        (
+            "application/illustrator",
+            r#"[{"operation":"convert","params":{"type":"png"}},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"png","norotation":"true","quality":"80"}}]"#,
+        ),
+        (
+            "application/pdf",
+            r#"[{"operation":"convert","params":{"type":"png"}},{"operation":"fit","params":{"width":4096,"height":4096,"stripmeta":"true","type":"png","norotation":"true","quality":"80"}}]"#,
+        ),
     ];
 
     #[test]

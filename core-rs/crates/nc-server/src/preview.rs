@@ -72,7 +72,20 @@ pub async fn preview_by_file_id(
         // (share mounts) and returns the correct 404/403.
         return proxy(&state, req).await;
     };
-    serve_preview(&state, RouteKind::Core, row, &uid, x, y, !a, mode, inm, ims, req).await
+    serve_preview(
+        &state,
+        RouteKind::Core,
+        row,
+        &uid,
+        x,
+        y,
+        !a,
+        mode,
+        inm,
+        ims,
+        req,
+    )
+    .await
 }
 
 /// `GET /core/preview.png?file=…` — preview by path (`PreviewController::getPreview`).
@@ -103,7 +116,20 @@ pub async fn preview_by_path(
     let Some(row) = resolve_by_path(&state, &uid, &file).await else {
         return proxy(&state, req).await;
     };
-    serve_preview(&state, RouteKind::Core, row, &uid, x, y, !a, mode, inm, ims, req).await
+    serve_preview(
+        &state,
+        RouteKind::Core,
+        row,
+        &uid,
+        x,
+        y,
+        !a,
+        mode,
+        inm,
+        ims,
+        req,
+    )
+    .await
 }
 
 /// `GET /apps/files/api/v1/thumbnail/{x}/{y}/{file}` — deprecated files thumbnail
@@ -131,8 +157,20 @@ pub async fn files_thumbnail(
         return proxy(&state, req).await;
     };
     // crop=true always; mode defaults to fill (PHP passes no mode here).
-    serve_preview(&state, RouteKind::FilesThumbnail, row, &uid, x, y, true, Mode::Fill, inm, ims, req)
-        .await
+    serve_preview(
+        &state,
+        RouteKind::FilesThumbnail,
+        row,
+        &uid,
+        x,
+        y,
+        true,
+        Mode::Fill,
+        inm,
+        ims,
+        req,
+    )
+    .await
 }
 
 // ─── Shared serve path ────────────────────────────────────────────────────────
@@ -299,7 +337,10 @@ async fn stream_200(pr: response::PreviewResponse, file: tokio::fs::File) -> Res
         .header(header::ETAG, header_val(&pr.etag))
         .header(header::LAST_MODIFIED, header_val(&pr.last_modified))
         .header(header::CACHE_CONTROL, header_val(&pr.cache_control))
-        .header(header::CONTENT_DISPOSITION, header_val(&pr.content_disposition))
+        .header(
+            header::CONTENT_DISPOSITION,
+            header_val(&pr.content_disposition),
+        )
         .header("X-Robots-Tag", response::X_ROBOTS_TAG);
     if let Some(ref exp) = pr.expires {
         b = b.header(header::EXPIRES, header_val(exp));
@@ -428,7 +469,9 @@ mod tests {
 
     #[test]
     fn query_map_decodes_and_defaults() {
-        let q = query_map(&uri("/core/preview?fileId=42&x=100&y=200&a=true&mode=cover"));
+        let q = query_map(&uri(
+            "/core/preview?fileId=42&x=100&y=200&a=true&mode=cover",
+        ));
         assert_eq!(q_i64(&q, "fileId", -1), 42);
         assert_eq!(q_i64(&q, "x", 32), 100);
         assert_eq!(q_i64(&q, "y", 32), 200);

@@ -259,9 +259,16 @@ pub async fn invalidate_previews(
                     }
                 };
                 let name = store::preview_name(
-                    row.version_id, row.width, row.height, row.cropped, row.max, out_mime,
+                    row.version_id,
+                    row.width,
+                    row.height,
+                    row.cropped,
+                    row.max,
+                    out_mime,
                 );
-                Some(store::preview_byte_path(datadir, instanceid, file_id, &name))
+                Some(store::preview_byte_path(
+                    datadir, instanceid, file_id, &name,
+                ))
             })
             .collect()
     };
@@ -294,13 +301,14 @@ mod tests {
     use crate::store::find_max;
 
     async fn sqlite_pool() -> DbPool {
-        sqlx::any::install_default_drivers();
         // Single connection: an in-memory SQLite DB is per-connection.
-        let pool = sqlx::any::AnyPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
+        let pool = DbPool::Sqlite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
         // oc_previews per REQ §9.10 (boolean columns as INTEGER for SQLite's Any driver).
         sqlx::query(
             "CREATE TABLE oc_previews (
@@ -333,10 +341,12 @@ mod tests {
         .await
         .unwrap();
         // oc_mimetypes so invalidation can resolve output-mime ids → names.
-        sqlx::query("CREATE TABLE oc_mimetypes (id INTEGER PRIMARY KEY, mimetype VARCHAR(255) NOT NULL)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "CREATE TABLE oc_mimetypes (id INTEGER PRIMARY KEY, mimetype VARCHAR(255) NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         for (id, mime) in [
             (5i64, "image/jpeg"),
             (6i64, "image/png"),
@@ -417,10 +427,16 @@ mod tests {
     #[tokio::test]
     async fn distinct_keys_insert_independently() {
         let pool = sqlite_pool().await;
-        insert_preview(&pool, "oc_", &newp(256, 256, false, true, 5), 1).await.unwrap();
-        insert_preview(&pool, "oc_", &newp(512, 512, false, false, 5), 2).await.unwrap();
+        insert_preview(&pool, "oc_", &newp(256, 256, false, true, 5), 1)
+            .await
+            .unwrap();
+        insert_preview(&pool, "oc_", &newp(512, 512, false, false, 5), 2)
+            .await
+            .unwrap();
         // Same dims but different output mime → distinct key.
-        insert_preview(&pool, "oc_", &newp(256, 256, false, true, 7), 3).await.unwrap();
+        insert_preview(&pool, "oc_", &newp(256, 256, false, true, 7), 3)
+            .await
+            .unwrap();
         assert_eq!(store::load_preview_rows(&pool, "oc_", 123).await.len(), 3);
     }
 
@@ -429,7 +445,9 @@ mod tests {
     #[tokio::test]
     async fn write_bytes_creates_sharded_path_no_temp_left() {
         let dir = tempdir();
-        let n = write_preview_bytes(&dir, "oc1", 123, "256-256-crop.png", b"PNGDATA", 42).await.unwrap();
+        let n = write_preview_bytes(&dir, "oc1", 123, "256-256-crop.png", b"PNGDATA", 42)
+            .await
+            .unwrap();
         assert_eq!(n, 7);
         let path = store::preview_byte_path(&dir, "oc1", 123, "256-256-crop.png");
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"PNGDATA");
@@ -439,7 +457,11 @@ mod tests {
         while let Some(e) = entries.next_entry().await.unwrap() {
             names.push(e.file_name().to_string_lossy().into_owned());
         }
-        assert_eq!(names, vec!["256-256-crop.png".to_string()], "temp file must be renamed away");
+        assert_eq!(
+            names,
+            vec!["256-256-crop.png".to_string()],
+            "temp file must be renamed away"
+        );
     }
 
     // ── invalidation (Watcher parity) ──────────────────────────────────────
@@ -456,8 +478,12 @@ mod tests {
         // Write both byte files.
         let max_name = store::preview_name(-1, 1351, 901, false, true, "image/jpeg");
         let der_name = store::preview_name(-1, 256, 256, true, false, "image/jpeg");
-        write_preview_bytes(&dir, "oc1", 123, &max_name, b"MAX", 1).await.unwrap();
-        write_preview_bytes(&dir, "oc1", 123, &der_name, b"DER", 2).await.unwrap();
+        write_preview_bytes(&dir, "oc1", 123, &max_name, b"MAX", 1)
+            .await
+            .unwrap();
+        write_preview_bytes(&dir, "oc1", 123, &der_name, b"DER", 2)
+            .await
+            .unwrap();
 
         let cache = mime_cache(&pool).await;
         let deleted = invalidate_previews(&pool, "oc_", &dir, "oc1", 123, &cache).await;
@@ -466,8 +492,16 @@ mod tests {
         // Rows gone.
         assert!(store::load_preview_rows(&pool, "oc_", 123).await.is_empty());
         // Bytes gone.
-        assert!(tokio::fs::read(store::preview_byte_path(&dir, "oc1", 123, &max_name)).await.is_err());
-        assert!(tokio::fs::read(store::preview_byte_path(&dir, "oc1", 123, &der_name)).await.is_err());
+        assert!(
+            tokio::fs::read(store::preview_byte_path(&dir, "oc1", 123, &max_name))
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::fs::read(store::preview_byte_path(&dir, "oc1", 123, &der_name))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -475,19 +509,22 @@ mod tests {
         let pool = sqlite_pool().await;
         let dir = tempdir();
         let cache = mime_cache(&pool).await;
-        assert_eq!(invalidate_previews(&pool, "oc_", &dir, "oc1", 999, &cache).await, 0);
+        assert_eq!(
+            invalidate_previews(&pool, "oc_", &dir, "oc1", 999, &cache).await,
+            0
+        );
         // A non-positive file id is never touched.
-        assert_eq!(invalidate_previews(&pool, "oc_", &dir, "oc1", 0, &cache).await, 0);
+        assert_eq!(
+            invalidate_previews(&pool, "oc_", &dir, "oc1", 0, &cache).await,
+            0
+        );
     }
 
     /// A unique temp directory under the system temp root.
     fn tempdir() -> std::path::PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let d = std::env::temp_dir().join(format!(
-            "nc_preview_test_{}_{n}",
-            std::process::id()
-        ));
+        let d = std::env::temp_dir().join(format!("nc_preview_test_{}_{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }

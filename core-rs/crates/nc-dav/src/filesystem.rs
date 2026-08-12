@@ -152,11 +152,8 @@ impl NcFileSystem {
         put_error: crate::SharedPutError,
         skip_trashbin: bool,
     ) -> Self {
-        let propagator = Propagator::new(
-            state.pool.clone(),
-            state.table_prefix.clone(),
-            storage_id,
-        );
+        let propagator =
+            Propagator::new(state.pool.clone(), state.table_prefix.clone(), storage_id);
         let tag_cache = crate::tags::new_tag_cache();
         NcFileSystem {
             state,
@@ -591,11 +588,7 @@ impl NcFileSystem {
                 tracing::warn!(path = %fc_path, error = %e, "delete_dir: propagation failed (size>0)");
             }
         } else {
-            if let Err(e) = self
-                .propagator
-                .propagate_change(fc_path, now, 0)
-                .await
-            {
+            if let Err(e) = self.propagator.propagate_change(fc_path, now, 0).await {
                 tracing::warn!(path = %fc_path, error = %e, "delete_dir: propagation failed (size=0)");
             }
         }
@@ -712,11 +705,7 @@ impl NcFileSystem {
                 tracing::warn!(path = %fc_path, error = %e, "delete_file: propagation failed (size>0)");
             }
         } else {
-            if let Err(e) = self
-                .propagator
-                .propagate_change(fc_path, now, 0)
-                .await
-            {
+            if let Err(e) = self.propagator.propagate_change(fc_path, now, 0).await {
                 tracing::warn!(path = %fc_path, error = %e, "delete_file: propagation failed (size=0)");
             }
         }
@@ -1039,11 +1028,7 @@ impl NcFileSystem {
             }
         }
         // propagateChange(target, time, 0) — etag/mtime only, size already recomputed.
-        if let Err(e) = self
-            .propagator
-            .propagate_change(trash_fc, now, 0)
-            .await
-        {
+        if let Err(e) = self.propagator.propagate_change(trash_fc, now, 0).await {
             tracing::warn!(path = %trash_fc, error = %e, "trash: trash-chain etag/mtime propagation failed");
         }
     }
@@ -1117,20 +1102,16 @@ impl NcFileSystem {
             return;
         }
 
-        let trash_versions_parent = match row::lookup_by_path(
-            pool,
-            prefix,
-            self.storage_id,
-            "files_trashbin/versions",
-        )
-        .await
-        {
-            Some(r) => r,
-            None => {
-                warn!("trash_versions: files_trashbin/versions missing from filecache");
-                return;
-            }
-        };
+        let trash_versions_parent =
+            match row::lookup_by_path(pool, prefix, self.storage_id, "files_trashbin/versions")
+                .await
+            {
+                Some(r) => r,
+                None => {
+                    warn!("trash_versions: files_trashbin/versions missing from filecache");
+                    return;
+                }
+            };
 
         let versions_len = versions_base.len();
         let mut first_target: Option<String> = None;
@@ -1802,18 +1783,14 @@ impl DavFileSystem for NcFileSystem {
                 // §9.4: inherit permissions + extended times from the source file
                 // so that the version row carries correct metadata for PHP-FPM.
                 let old_permissions = existing.as_ref().map(|r| r.permissions).unwrap_or(27);
-                let (old_creation_time, old_upload_time) =
-                    if let Some(ref ex) = existing {
-                        let ext = row::get_extended(
-                            &self.state.pool,
-                            &self.state.table_prefix,
-                            ex.fileid,
-                        )
-                        .await;
-                        (ext.creation_time, ext.upload_time)
-                    } else {
-                        (0, 0)
-                    };
+                let (old_creation_time, old_upload_time) = if let Some(ref ex) = existing {
+                    let ext =
+                        row::get_extended(&self.state.pool, &self.state.table_prefix, ex.fileid)
+                            .await;
+                    (ext.creation_time, ext.upload_time)
+                } else {
+                    (0, 0)
+                };
                 let write_ctx = WriteCtx {
                     temp_path,
                     final_path: disk,
@@ -1951,11 +1928,7 @@ impl DavFileSystem for NcFileSystem {
 
             // §9.2: MKCOL propagates etag/mtime to the parent chain.
             // New directories have size 0, so sizeDifference=0.
-            if let Err(e) = self
-                .propagator
-                .propagate_change(&fc_path, now, 0)
-                .await
-            {
+            if let Err(e) = self.propagator.propagate_change(&fc_path, now, 0).await {
                 tracing::warn!(path = %fc_path, error = %e, "mkcol: propagation failed");
             }
 
@@ -2598,25 +2571,22 @@ impl DavFileSystem for NcFileSystem {
             // per-uid user-state cache (round-4 Task 12): the auth middleware
             // resolved the entry earlier in the request, so this is a cache
             // hit; on failure default to uid / sharing-enabled with a warning.
-            let user_state = nc_auth::cached_user_state(
-                &self.uid,
-                &self.state.pool,
-                &self.state.table_prefix,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    uid = %self.uid,
-                    error = %e,
-                    "user-state resolution failed — defaulting"
-                );
-                nc_auth::UserState {
-                    is_admin: false,
-                    twofa_enabled: false,
-                    sharing_disabled: false,
-                    display_name: self.uid.clone(),
-                }
-            });
+            let user_state =
+                nc_auth::cached_user_state(&self.uid, &self.state.pool, &self.state.table_prefix)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            uid = %self.uid,
+                            error = %e,
+                            "user-state resolution failed — defaulting"
+                        );
+                        nc_auth::UserState {
+                            is_admin: false,
+                            twofa_enabled: false,
+                            sharing_disabled: false,
+                            display_name: self.uid.clone(),
+                        }
+                    });
             let owner_display_name = user_state.display_name.clone();
 
             // ── Phase 7.6: is_mounted, share_permissions, download_url, note ──
@@ -2704,12 +2674,15 @@ impl DavFileSystem for NcFileSystem {
                 .await
             } else {
                 // Own file: derive from the node's (masked) permissions.
-                row::compute_share_permissions(effective_permissions, meta.is_dir_flag, is_mount_root)
+                row::compute_share_permissions(
+                    effective_permissions,
+                    meta.is_dir_flag,
+                    is_mount_root,
+                )
             };
 
             // ── Phase 12.4: OCM share-permissions JSON ─────────────────────
-            let ocm_share_permissions =
-                row::permissions_to_ocm_json(share_permissions);
+            let ocm_share_permissions = row::permissions_to_ocm_json(share_permissions);
 
             // `note`: most-recent non-empty share note for this file.
             // Phase 18.1: batched by read_dir; an in-batch miss means no
@@ -2888,18 +2861,19 @@ impl DavFileSystem for NcFileSystem {
             // miss means no properties, and only nodes outside the batch run
             // the single query.
             if do_content {
-                let custom_props = if batch_contains(&self.propfind_batch.child_paths, fc_path.as_str())
-                {
-                    batch_get(&self.propfind_batch.custom_props, fc_path.as_str()).unwrap_or_default()
-                } else {
-                    crate::row::list_custom_properties(
-                        &self.state.pool,
-                        &self.state.table_prefix,
-                        &self.uid,
-                        &fc_path,
-                    )
-                    .await
-                };
+                let custom_props =
+                    if batch_contains(&self.propfind_batch.child_paths, fc_path.as_str()) {
+                        batch_get(&self.propfind_batch.custom_props, fc_path.as_str())
+                            .unwrap_or_default()
+                    } else {
+                        crate::row::list_custom_properties(
+                            &self.state.pool,
+                            &self.state.table_prefix,
+                            &self.uid,
+                            &fc_path,
+                        )
+                        .await
+                    };
                 for (propname, propvalue, _valuetype) in custom_props {
                     if let Some((ns, name)) = crate::row::parse_clark_notation(&propname) {
                         // Skip known-namespace props — they are handled above or
@@ -3355,7 +3329,15 @@ async fn ensure_lazy_cache_row(state: &NcDavState, storage_id: i64, now: i64) {
         return;
     }
     tracing::debug!(storage_id, "lazy-cache: materializing row");
-    ensure_lazy_dir_row(&state.pool, &state.table_prefix, storage_id, &state.mime_cache, "cache", now).await;
+    ensure_lazy_dir_row(
+        &state.pool,
+        &state.table_prefix,
+        storage_id,
+        &state.mime_cache,
+        "cache",
+        now,
+    )
+    .await;
     // PHP's shallow scan also bumps the storage root: new etag + storage_mtime
     // (mtime untouched — matches the oracle's observed delta columns).
     // The bump must be un-collidable with the install-era tail writes: the
@@ -3402,7 +3384,8 @@ pub(crate) async fn ensure_lazy_dir_row(
     }
     let dir_mime_id =
         nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, "httpd/unix-directory").await;
-    let dir_mimepart_id = nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, "httpd").await;
+    let dir_mimepart_id =
+        nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, "httpd").await;
     let parent_id = row::lookup_by_path(pool, prefix, storage_id, "")
         .await
         .map(|r| r.fileid)
@@ -4007,9 +3990,9 @@ mod tests {
     #[test]
     fn is_trash_extension_invalid() {
         assert!(!is_trash_extension("txt"));
-        assert!(!is_trash_extension("d"));     // too short
-        assert!(!is_trash_extension("dx123"));  // has non-digit
-        assert!(!is_trash_extension(""));       // empty
+        assert!(!is_trash_extension("d")); // too short
+        assert!(!is_trash_extension("dx123")); // has non-digit
+        assert!(!is_trash_extension("")); // empty
     }
 
     // ── Delete-to-trash parity (phase-16 findings #6–#12) ────────────────
@@ -4070,12 +4053,13 @@ mod tests {
     /// 6  "files_versions" (0)      4  "files/hello.txt" (26)
     /// ```
     async fn fresh_delete_db() -> (DbPool, String, i64) {
-        sqlx::any::install_default_drivers();
-        let pool = sqlx::any::AnyPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("in-memory SQLite");
+        let pool = DbPool::Sqlite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("in-memory SQLite"),
+        );
 
         sqlx::query(
             "CREATE TABLE oc_filecache (
@@ -4205,12 +4189,7 @@ mod tests {
         (pool, prefix, storage_id)
     }
 
-    fn test_fs(
-        pool: DbPool,
-        prefix: String,
-        storage_id: i64,
-        data_dir: PathBuf,
-    ) -> NcFileSystem {
+    fn test_fs(pool: DbPool, prefix: String, storage_id: i64, data_dir: PathBuf) -> NcFileSystem {
         let cfg = NcConfig::from_php_config("<?php\n$CONFIG = ['dbtype' => 'sqlite3'];").unwrap();
         let state = crate::NcDavState {
             pool,
@@ -4222,7 +4201,14 @@ mod tests {
             filename_validator: Arc::new(FilenameValidator::from_config(&cfg)),
             base_url: Arc::new(String::new()),
             upload_state_store: Arc::new(UploadStateStore::new()),
-            preview_registry: Arc::new(ProviderRegistry::build(false, None, false, false, false, &[])),
+            preview_registry: Arc::new(ProviderRegistry::build(
+                false,
+                None,
+                false,
+                false,
+                false,
+                &[],
+            )),
             dir_mime_id: 1,
             dir_mimepart_id: 1,
             storage_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -4274,7 +4260,10 @@ mod tests {
 
     async fn extended_count(pool: &DbPool) -> i64 {
         let sql = "SELECT COUNT(*) FROM oc_filecache_extended";
-        sqlx::query_scalar::<_, i64>(sql).fetch_one(pool).await.unwrap()
+        sqlx::query_scalar::<_, i64>(sql)
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     /// The trashed file keeps its original mtime and gets `storage_mtime` from
@@ -4320,7 +4309,9 @@ mod tests {
             "files_trashbin/keys",
         ] {
             assert!(
-                row::lookup_by_path(&pool, &prefix, storage_id, p).await.is_some(),
+                row::lookup_by_path(&pool, &prefix, storage_id, p)
+                    .await
+                    .is_some(),
                 "missing skeleton dir {p}"
             );
         }
@@ -4360,8 +4351,13 @@ mod tests {
         );
 
         // Target chain: trash ancestors gain the 26 bytes.
-        let (_, size, _, _, _, _) = fc_row(&pool, &prefix, "files_trashbin/files").await.unwrap();
-        assert_eq!(size, 26, "files_trashbin/files must gain the trashed file's size");
+        let (_, size, _, _, _, _) = fc_row(&pool, &prefix, "files_trashbin/files")
+            .await
+            .unwrap();
+        assert_eq!(
+            size, 26,
+            "files_trashbin/files must gain the trashed file's size"
+        );
         let (_, size, _, _, _, _) = fc_row(&pool, &prefix, "files_trashbin").await.unwrap();
         assert_eq!(size, 26, "files_trashbin must gain the trashed file's size");
 
@@ -4379,14 +4375,26 @@ mod tests {
         let data_dir = fresh_data_dir();
         let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir);
 
-        fs.ensure_parent_dir("files_trashbin/files/x").await.unwrap();
-        for p in ["files_trashbin", "files_trashbin/files", "files_trashbin/files/x"] {
+        fs.ensure_parent_dir("files_trashbin/files/x")
+            .await
+            .unwrap();
+        for p in [
+            "files_trashbin",
+            "files_trashbin/files",
+            "files_trashbin/files/x",
+        ] {
             assert!(
-                row::lookup_by_path(&pool, &prefix, storage_id, p).await.is_some(),
+                row::lookup_by_path(&pool, &prefix, storage_id, p)
+                    .await
+                    .is_some(),
                 "missing dir {p}"
             );
         }
-        assert_eq!(extended_count(&pool).await, 0, "no extended rows for mkdir'd dirs");
+        assert_eq!(
+            extended_count(&pool).await,
+            0,
+            "no extended rows for mkdir'd dirs"
+        );
     }
 
     /// Finding #10: versions move to `files_trashbin/versions/` and the
@@ -4436,7 +4444,9 @@ mod tests {
             "version file must exist at {trash_vpath}"
         );
         assert!(
-            !data_dir.join("admin/files_versions/hello.txt.v100").exists(),
+            !data_dir
+                .join("admin/files_versions/hello.txt.v100")
+                .exists(),
             "version file must leave files_versions/"
         );
 
@@ -4521,7 +4531,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(vcount, 1, "dir trash must not delete inner files' version rows");
+        assert_eq!(
+            vcount, 1,
+            "dir trash must not delete inner files' version rows"
+        );
 
         // The main file moved too (id 9 under files_trashbin/files/dir.d{ts}).
         assert!(fc_row(&pool, &prefix, "files/dir/a.txt").await.is_none());
@@ -4592,7 +4605,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(vcount, 0, "version rows must be deleted even without version files");
+        assert_eq!(
+            vcount, 0,
+            "version rows must be deleted even without version files"
+        );
     }
 
     /// Finding #12 (etag pattern): after a delete-to-trash the storage root
@@ -4612,10 +4628,19 @@ mod tests {
         let root = etag_of(&pool, &prefix, "").await.unwrap();
         let files = etag_of(&pool, &prefix, "files").await.unwrap();
         let trash = etag_of(&pool, &prefix, "files_trashbin").await.unwrap();
-        let trash_files = etag_of(&pool, &prefix, "files_trashbin/files").await.unwrap();
-        let keys = etag_of(&pool, &prefix, "files_trashbin/keys").await.unwrap();
-        let versions = etag_of(&pool, &prefix, "files_trashbin/versions").await.unwrap();
-        assert_eq!(root, files, "root and files/ must share the source-chain etag");
+        let trash_files = etag_of(&pool, &prefix, "files_trashbin/files")
+            .await
+            .unwrap();
+        let keys = etag_of(&pool, &prefix, "files_trashbin/keys")
+            .await
+            .unwrap();
+        let versions = etag_of(&pool, &prefix, "files_trashbin/versions")
+            .await
+            .unwrap();
+        assert_eq!(
+            root, files,
+            "root and files/ must share the source-chain etag"
+        );
         assert_eq!(
             trash, trash_files,
             "files_trashbin and files_trashbin/files must share the trash-chain etag"
@@ -4669,6 +4694,10 @@ mod tests {
         assert_eq!(size, 0);
         assert_eq!(parent, 1, "cache must hang off the storage root");
         assert!(mtime > 0 && sm > 0);
-        assert_eq!(extended_count(&pool).await, 0, "cache row must have no extended row");
+        assert_eq!(
+            extended_count(&pool).await,
+            0,
+            "cache row must have no extended row"
+        );
     }
 }

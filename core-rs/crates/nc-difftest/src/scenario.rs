@@ -235,12 +235,21 @@ fn describe(op: &Op) -> String {
         Op::Copy { from, to } => format!("COPY {from} -> {to}"),
         Op::Propfind { path, depth } => format!("PROPFIND {path} (depth {})", depth.unwrap_or(0)),
         Op::Proppatch { path, .. } => format!("PROPPATCH {path}"),
-        Op::ShareCreate { path, share_type, .. } => {
+        Op::ShareCreate {
+            path, share_type, ..
+        } => {
             format!("SHARE_CREATE {path} (type {share_type})")
         }
         Op::ShareDelete { id } => format!("SHARE_DELETE {id}"),
-        Op::ChunkedUploadV2 { upload_dir, destination, chunks } => {
-            format!("CHUNKED_V2 {upload_dir} -> {destination} ({} chunks)", chunks.len())
+        Op::ChunkedUploadV2 {
+            upload_dir,
+            destination,
+            chunks,
+        } => {
+            format!(
+                "CHUNKED_V2 {upload_dir} -> {destination} ({} chunks)",
+                chunks.len()
+            )
         }
         Op::Bulk { files } => {
             format!("BULK ({} files)", files.len())
@@ -297,7 +306,9 @@ pub async fn run_ops(
                 capture_headers,
             } => {
                 let bytes = body_bytes(body_file, body)?;
-                let resp = client.put(&interpolate(path, vars), bytes, put_headers(headers)?).await?;
+                let resp = client
+                    .put(&interpolate(path, vars), bytes, put_headers(headers)?)
+                    .await?;
                 let status = resp.status();
                 for (var, header) in capture_headers {
                     let val = resp
@@ -309,7 +320,11 @@ pub async fn run_ops(
                     vars.insert(var.clone(), val);
                 }
                 let body_text = if *compare_body {
-                    Some(resp.text().await.with_context(|| "reading body for compare_body")?)
+                    Some(
+                        resp.text()
+                            .await
+                            .with_context(|| "reading body for compare_body")?,
+                    )
                 } else {
                     None
                 };
@@ -339,7 +354,11 @@ pub async fn run_ops(
                     (None, Some(bytes.to_vec()))
                 } else if *compare_body {
                     (
-                        Some(resp.text().await.with_context(|| "reading body for compare_body")?),
+                        Some(
+                            resp.text()
+                                .await
+                                .with_context(|| "reading body for compare_body")?,
+                        ),
                         None,
                     )
                 } else {
@@ -355,14 +374,20 @@ pub async fn run_ops(
                 continue;
             }
             Op::Delete { path, headers } => {
-                client.delete(&interpolate(path, vars), put_headers(headers)?).await?
+                client
+                    .delete(&interpolate(path, vars), put_headers(headers)?)
+                    .await?
             }
             Op::Mkcol { path } => client.mkcol(path).await?,
             Op::Move { from, to } => {
-                client.move_(&interpolate(from, vars), &interpolate(to, vars)).await?
+                client
+                    .move_(&interpolate(from, vars), &interpolate(to, vars))
+                    .await?
             }
             Op::Copy { from, to } => {
-                client.copy(&interpolate(from, vars), &interpolate(to, vars)).await?
+                client
+                    .copy(&interpolate(from, vars), &interpolate(to, vars))
+                    .await?
             }
             Op::Propfind { path, depth } => {
                 let resp = client
@@ -389,7 +414,9 @@ pub async fn run_ops(
                 });
                 continue;
             }
-            Op::Proppatch { path, body } => client.proppatch(&interpolate(path, vars), body).await?,
+            Op::Proppatch { path, body } => {
+                client.proppatch(&interpolate(path, vars), body).await?
+            }
             Op::ShareCreate {
                 path,
                 share_type,
@@ -410,7 +437,10 @@ pub async fn run_ops(
                 let resp = client.share_create(&params).await?;
                 if !capture.is_empty() {
                     let status = resp.status();
-                    let body = resp.text().await.with_context(|| "reading share_create body")?;
+                    let body = resp
+                        .text()
+                        .await
+                        .with_context(|| "reading share_create body")?;
                     anyhow::ensure!(
                         status.is_success(),
                         "share_create failed ({status}): {body:.300}"
@@ -465,7 +495,9 @@ pub async fn run_ops(
                     });
                 }
                 // Assemble: MOVE {dir}/.file -> destination.
-                client.move_(&format!("{dir}/.file"), &interpolate(destination, vars)).await?
+                client
+                    .move_(&format!("{dir}/.file"), &interpolate(destination, vars))
+                    .await?
             }
             Op::Bulk { files } => {
                 let boundary = "difftest-bulk-boundary";
@@ -479,7 +511,9 @@ pub async fn run_ops(
                     if let Some(m) = f.mtime {
                         body.extend_from_slice(format!("X-File-Mtime: {m}\r\n").as_bytes());
                     }
-                    body.extend_from_slice(format!("Content-Length: {}\r\n", bytes.len()).as_bytes());
+                    body.extend_from_slice(
+                        format!("Content-Length: {}\r\n", bytes.len()).as_bytes(),
+                    );
                     body.extend_from_slice(b"\r\n");
                     body.extend_from_slice(&bytes);
                     body.extend_from_slice(b"\r\n");
@@ -490,10 +524,14 @@ pub async fn run_ops(
                     reqwest::header::CONTENT_TYPE,
                     HeaderValue::from_str(&format!("multipart/related; boundary={boundary}"))?,
                 );
-                client.request(Method::POST, "/remote.php/dav/bulk", h, Some(body)).await?
+                client
+                    .request(Method::POST, "/remote.php/dav/bulk", h, Some(body))
+                    .await?
             }
             Op::OcsUserQuota { user, quota } => {
-                client.ocs_user_update(&interpolate(user, vars), "quota", &interpolate(quota, vars)).await?
+                client
+                    .ocs_user_update(&interpolate(user, vars), "quota", &interpolate(quota, vars))
+                    .await?
             }
         };
         results.push(OpResult {

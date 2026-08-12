@@ -1,4 +1,4 @@
-use sqlx::AnyPool;
+use crate::pool::DbPool;
 
 /// Schema migration entry point.
 ///
@@ -17,7 +17,7 @@ use sqlx::AnyPool;
 /// TO RE-ENABLE: uncomment the `sqlx::migrate!()` block below and delete this
 /// comment. Only appropriate for a future "Rust-only install" path where PHP
 /// is never involved in schema management.
-pub async fn run(pool: &AnyPool) -> anyhow::Result<()> {
+pub async fn run(pool: &DbPool) -> anyhow::Result<()> {
     // ── DISABLED: see doc comment above ──────────────────────────────────────
     // sqlx::migrate!("../../migrations")
     //     .run(pool)

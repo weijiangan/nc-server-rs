@@ -85,12 +85,18 @@ mod tests {
 
     #[test]
     fn valid_timestamp() {
-        assert_eq!(sanitize_mtime(Some("1234567890")).unwrap(), Some(1234567890));
+        assert_eq!(
+            sanitize_mtime(Some("1234567890")).unwrap(),
+            Some(1234567890)
+        );
     }
 
     #[test]
     fn trimmed_timestamp() {
-        assert_eq!(sanitize_mtime(Some("  1234567890  ")).unwrap(), Some(1234567890));
+        assert_eq!(
+            sanitize_mtime(Some("  1234567890  ")).unwrap(),
+            Some(1234567890)
+        );
     }
 
     // ── Hexadecimal rejection ────────────────────────────────────────────
@@ -125,7 +131,10 @@ mod tests {
     fn decimal_accepted_truncated() {
         // PHP's is_numeric() accepts floats; (int) cast truncates.
         // "123.45" → truncates to 123 (rejected by bounds anyway, but parse succeeds)
-        assert_eq!(sanitize_mtime(Some("1234567890.8558369")).unwrap(), Some(1234567890));
+        assert_eq!(
+            sanitize_mtime(Some("1234567890.8558369")).unwrap(),
+            Some(1234567890)
+        );
     }
 
     // ── Bounds rejection ─────────────────────────────────────────────────

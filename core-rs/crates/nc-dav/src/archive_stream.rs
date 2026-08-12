@@ -62,9 +62,8 @@ impl ArchiveStream {
         // s-zip's `StreamingZipWriter` is a sync API — run in `spawn_blocking`
         // to avoid blocking the Tokio async runtime.
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = build_archive_stream(
-                format, archive_name, entries, include_top_dir, tx,
-            ) {
+            if let Err(e) = build_archive_stream(format, archive_name, entries, include_top_dir, tx)
+            {
                 tracing::error!(error = %e, "§5.10 streaming archive build failed");
             }
         });
@@ -357,8 +356,7 @@ mod tests {
             make_file_entry(&tmp, "data.bin", b"\x00\x01\x02\x03"),
         ];
 
-        let (tx, mut rx) =
-            mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_CHANNEL_CAP);
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_CHANNEL_CAP);
         build_archive_stream(
             ArchiveFormat::Zip,
             "test_root".to_string(),
@@ -400,8 +398,7 @@ mod tests {
 
         let entries = vec![make_file_entry(&tmp, "my_file.txt", b"tar content")];
 
-        let (tx, mut rx) =
-            mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_CHANNEL_CAP);
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_CHANNEL_CAP);
         build_archive_stream(
             ArchiveFormat::Tar,
             "test_tar".to_string(),
@@ -422,13 +419,7 @@ mod tests {
         let ents: Vec<_> = ar.entries().unwrap().collect();
         assert!(!ents.is_empty());
         assert_eq!(
-            ents[0]
-                .as_ref()
-                .unwrap()
-                .path()
-                .unwrap()
-                .to_str()
-                .unwrap(),
+            ents[0].as_ref().unwrap().path().unwrap().to_str().unwrap(),
             "my_file.txt"
         );
 

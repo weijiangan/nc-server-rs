@@ -185,7 +185,11 @@ mod tests {
             (123_456, 500, 42, 0, 2048),
         ] {
             let id = encode(s, ms, srv, cli, seq);
-            assert_eq!(decode(id), (s, ms, srv, cli, seq), "({s},{ms},{srv},{cli},{seq})");
+            assert_eq!(
+                decode(id),
+                (s, ms, srv, cli, seq),
+                "({s},{ms},{srv},{cli},{seq})"
+            );
         }
     }
 
@@ -212,7 +216,7 @@ mod tests {
         assert_eq!(resolve_server_id(Some(5), b"host"), 5);
         assert_eq!(resolve_server_id(Some(300), b"host"), 300);
         assert_eq!(resolve_server_id(Some(600), b"host"), 600 & 0x1FF); // 88
-        // Unset / non-positive → crc32(hostname) & 0x1FF.
+                                                                        // Unset / non-positive → crc32(hostname) & 0x1FF.
         assert_eq!(resolve_server_id(None, b"bea97354b6fc"), 223);
         assert_eq!(resolve_server_id(Some(-1), b"bea97354b6fc"), 223);
         assert_eq!(resolve_server_id(Some(0), b"bea97354b6fc"), 223);

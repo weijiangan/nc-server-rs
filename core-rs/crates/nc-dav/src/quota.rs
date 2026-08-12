@@ -69,7 +69,9 @@ pub async fn check_quota(
 
     if upload_bytes > free {
         tracing::debug!(
-            uid, upload_bytes, free,
+            uid,
+            upload_bytes,
+            free,
             "§5.2 quota check: upload exceeds available space"
         );
         Err(())
@@ -125,13 +127,11 @@ async fn resolve_effective_quota(
         Some(v) if !v.is_empty() && !v.eq_ignore_ascii_case("default") => v.to_string(),
 
         // Absent or "default" → read the server-wide default.
-        _ => {
-            appconfig_cache
-                .read()
-                .ok()
-                .and_then(|g| g.get_string("files", "default_quota"))
-                .unwrap_or_else(|| "none".to_string())
-        }
+        _ => appconfig_cache
+            .read()
+            .ok()
+            .and_then(|g| g.get_string("files", "default_quota"))
+            .unwrap_or_else(|| "none".to_string()),
     }
 }
 
@@ -158,9 +158,7 @@ async fn lookup_quota_preference(pool: &DbPool, prefix: &str, uid: &str) -> Opti
 /// running recursive total — no subtree scan needed.
 async fn lookup_used_bytes(pool: &DbPool, prefix: &str, storage_id: i64) -> i64 {
     let path_hash = crate::row::path_hash("files");
-    let sql = format!(
-        "SELECT size FROM {prefix}filecache WHERE storage = $1 AND path_hash = $2"
-    );
+    let sql = format!("SELECT size FROM {prefix}filecache WHERE storage = $1 AND path_hash = $2");
     sqlx::query_scalar::<_, Option<i64>>(&sql)
         .bind(storage_id)
         .bind(&path_hash)
@@ -212,7 +210,11 @@ pub fn parse_quota_string(s: &str) -> Option<i64> {
     };
 
     let bytes = (num * multiplier as f64) as i64;
-    if bytes >= 0 { Some(bytes) } else { None }
+    if bytes >= 0 {
+        Some(bytes)
+    } else {
+        None
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

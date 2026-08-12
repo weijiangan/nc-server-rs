@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use bytes::{Buf, Bytes};
 use dav_server::fs::{DavFile, DavMetaData, FsError, FsFuture};
-use futures::{FutureExt, future};
+use futures::{future, FutureExt};
 use tokio::task;
 
 use crate::metadata::NcMetaData;
@@ -36,7 +36,11 @@ use nc_db::pool::DbPool;
 /// hex digits of `md5(fileid)`, followed by the fileid itself.
 ///
 /// Path: `{datadir}/appdata_{instanceid}/preview/{c0}/{c1}/.../{c6}/{fileid}/`
-pub(crate) fn preview_cache_dir(data_dir: &std::path::Path, instance_id: &str, fileid: i64) -> std::path::PathBuf {
+pub(crate) fn preview_cache_dir(
+    data_dir: &std::path::Path,
+    instance_id: &str,
+    fileid: i64,
+) -> std::path::PathBuf {
     use md5::Digest;
     let digest = md5::Md5::digest(fileid.to_string().as_bytes());
     let hash = format!("{:x}", digest);
@@ -79,7 +83,7 @@ impl RunningHash {
             .map(str::to_uppercase)
             .as_deref()
         {
-            Some("MD5")                  => RunningHash::Md5(md5::Md5::new()),
+            Some("MD5") => RunningHash::Md5(md5::Md5::new()),
             Some("SHA1") | Some("SHA-1") => RunningHash::Sha1(sha1::Sha1::new()),
             Some("SHA256") | Some("SHA-256") => RunningHash::Sha256(sha2::Sha256::new()),
             Some("ADLER32") | Some("ADLER-32") => RunningHash::Adler32(adler::Adler32::new()),
@@ -90,24 +94,24 @@ impl RunningHash {
     pub fn update(&mut self, data: &[u8]) {
         use md5::Digest; // same trait for all three via digest re-export
         match self {
-            RunningHash::Md5(h)     => h.update(data),
-            RunningHash::Sha1(h)    => h.update(data),
-            RunningHash::Sha256(h)  => h.update(data),
+            RunningHash::Md5(h) => h.update(data),
+            RunningHash::Sha1(h) => h.update(data),
+            RunningHash::Sha256(h) => h.update(data),
             RunningHash::Adler32(h) => h.write_slice(data),
-            RunningHash::None       => {}
+            RunningHash::None => {}
         }
     }
 
     pub fn finalize_hex(self) -> Option<String> {
         use md5::Digest;
         match self {
-            RunningHash::Md5(h)     => Some(format!("{:x}", h.finalize())),
-            RunningHash::Sha1(h)    => Some(format!("{:x}", h.finalize())),
-            RunningHash::Sha256(h)  => Some(format!("{:x}", h.finalize())),
+            RunningHash::Md5(h) => Some(format!("{:x}", h.finalize())),
+            RunningHash::Sha1(h) => Some(format!("{:x}", h.finalize())),
+            RunningHash::Sha256(h) => Some(format!("{:x}", h.finalize())),
             // Adler-32 output is a u32 formatted as 8 lowercase hex digits;
             // matches PHP hash('adler32', ...) output.
             RunningHash::Adler32(h) => Some(format!("{:08x}", h.checksum())),
-            RunningHash::None       => None,
+            RunningHash::None => None,
         }
     }
 }
@@ -117,17 +121,17 @@ impl RunningHash {
 /// Everything needed to commit a PUT to the database after the file has been
 /// written to disk.
 pub struct WriteCtx {
-    pub temp_path:      PathBuf,
-    pub final_path:     PathBuf,
-    pub pool:           DbPool,
-    pub prefix:         String,
-    pub storage_id:     i64,
+    pub temp_path: PathBuf,
+    pub final_path: PathBuf,
+    pub pool: DbPool,
+    pub prefix: String,
+    pub storage_id: i64,
     /// Path within the storage — e.g. `files/Photos/img.jpg`.
-    pub fc_path:        String,
-    pub parent_id:      i64,
-    pub uid:            String,
-    pub mime_type_id:   i64,
-    pub mimepart_id:    i64,
+    pub fc_path: String,
+    pub parent_id: i64,
+    pub uid: String,
+    pub mime_type_id: i64,
+    pub mimepart_id: i64,
     /// `Some(fid)` when overwriting an existing entry; `None` for new files.
     pub initial_fileid: Option<i64>,
     /// Size of the existing file before overwrite (0 for new files).
@@ -158,30 +162,30 @@ pub struct WriteCtx {
     /// its version share the etag on same-second overwrites.
     pub old_storage_mtime: i64,
     /// Expected file size from `OpenOptions.size` (for validation).
-    pub expected_size:  Option<u64>,
+    pub expected_size: Option<u64>,
     /// Checksum from `OC-Checksum` header (e.g. `"SHA1:abc…"`).
-    pub oc_checksum:    Option<String>,
+    pub oc_checksum: Option<String>,
     /// Running hash accumulating all written bytes for checksum validation.
-    pub running_hash:   RunningHash,
+    pub running_hash: RunningHash,
     /// Client-supplied `X-OC-MTime` value (Unix seconds); `None` if absent.
-    pub x_oc_mtime:     Option<i64>,
+    pub x_oc_mtime: Option<i64>,
     /// Client-supplied `X-OC-CTime` value (Unix seconds); `None` if absent.
-    pub x_oc_ctime:     Option<i64>,
+    pub x_oc_ctime: Option<i64>,
     /// Written by `flush()` so `dav_handler` can inject response headers.
-    pub write_result:   crate::SharedWriteResult,
+    pub write_result: crate::SharedWriteResult,
     /// Set to `Some(PutErrorKind::…)` by `flush()` when it terminates early due
     /// to a known client error.  `dav_handler` reads this to rewrite the HTTP
     /// status (e.g. `GeneralFailure` 500 → `BadRequest` 400 for checksum mismatch).
-    pub put_error:      crate::SharedPutError,
+    pub put_error: crate::SharedPutError,
     /// Cache propagator — used in `flush()` to update parent ETag/mtime/size
     /// after the file is committed (§9.2).
-    pub propagator:     Propagator,
+    pub propagator: Propagator,
     /// Data directory root — needed for version disk copy (§9.4).
-    pub data_dir:       std::path::PathBuf,
+    pub data_dir: std::path::PathBuf,
     /// MIME cache — needed for version filecache row (§9.4).
-    pub mime_cache:     SharedMimeCache,
+    pub mime_cache: SharedMimeCache,
     /// Nextcloud instance ID — needed to purge stale PHP preview caches.
-    pub instance_id:    std::sync::Arc<String>,
+    pub instance_id: std::sync::Arc<String>,
 }
 
 impl std::fmt::Debug for WriteCtx {
@@ -197,9 +201,9 @@ impl std::fmt::Debug for WriteCtx {
 pub struct NcDavFile {
     /// The OS-level file handle.  Stored as `Option` so it can be temporarily
     /// *taken out* into a blocking closure without lifetime issues.
-    pub file:  Option<std::fs::File>,
+    pub file: Option<std::fs::File>,
     /// Metadata as seen at the time the file was opened.
-    pub meta:  NcMetaData,
+    pub meta: NcMetaData,
     /// Non-`None` only while in write mode.
     pub write: Option<WriteCtx>,
 }
@@ -219,11 +223,11 @@ where
 
 fn io_to_fs(e: io::Error) -> FsError {
     match e.kind() {
-        io::ErrorKind::NotFound         => FsError::NotFound,
+        io::ErrorKind::NotFound => FsError::NotFound,
         io::ErrorKind::PermissionDenied => FsError::Forbidden,
-        io::ErrorKind::AlreadyExists    => FsError::Exists,
-        io::ErrorKind::OutOfMemory      => FsError::InsufficientStorage,
-        _                               => FsError::GeneralFailure,
+        io::ErrorKind::AlreadyExists => FsError::Exists,
+        io::ErrorKind::OutOfMemory => FsError::InsufficientStorage,
+        _ => FsError::GeneralFailure,
     }
 }
 

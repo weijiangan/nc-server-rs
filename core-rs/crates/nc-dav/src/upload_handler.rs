@@ -510,10 +510,20 @@ async fn handle_move(
     // §10.8: get-or-insert mimetype IDs; mimepart is the part BEFORE
     // the '/' (e.g. "image"), NOT "image/" — matching PHP's
     // getId(substr($mimetype, 0, strpos($mimetype, '/')))
-    let mime_type_id =
-        nc_db::mime::get_or_insert_mime_id(&state.pool, &state.table_prefix, &state.mime_cache, &mime_str).await;
-    let mimepart_id =
-        nc_db::mime::get_or_insert_mime_id(&state.pool, &state.table_prefix, &state.mime_cache, &part_str).await;
+    let mime_type_id = nc_db::mime::get_or_insert_mime_id(
+        &state.pool,
+        &state.table_prefix,
+        &state.mime_cache,
+        &mime_str,
+    )
+    .await;
+    let mimepart_id = nc_db::mime::get_or_insert_mime_id(
+        &state.pool,
+        &state.table_prefix,
+        &state.mime_cache,
+        &part_str,
+    )
+    .await;
 
     // Resolve parent directory
     let parent_path = {
@@ -566,7 +576,9 @@ async fn handle_move(
 
     // Handle X-OC-MTime header (§10.5: validate with PHP MtimeSanitizer)
     let mtime = match crate::mtime::sanitize_mtime(
-        req.headers().get("x-oc-mtime").and_then(|v| v.to_str().ok()),
+        req.headers()
+            .get("x-oc-mtime")
+            .and_then(|v| v.to_str().ok()),
     ) {
         Ok(Some(t)) => t,
         Ok(None) => now,
@@ -575,7 +587,9 @@ async fn handle_move(
 
     // Handle X-OC-CTime header (§10.5: validate with PHP MtimeSanitizer)
     let ctime = match crate::mtime::sanitize_mtime(
-        req.headers().get("x-oc-ctime").and_then(|v| v.to_str().ok()),
+        req.headers()
+            .get("x-oc-ctime")
+            .and_then(|v| v.to_str().ok()),
     ) {
         Ok(v) => v,
         Err(msg) => return bad_request_response(&msg),
@@ -685,11 +699,8 @@ async fn handle_move(
     {
         let old_size = existing_row.as_ref().map(|r| r.size).unwrap_or(0);
         let size_diff = (total_size as i64) - old_size;
-        let propagator = Propagator::new(
-            state.pool.clone(),
-            state.table_prefix.clone(),
-            storage_id,
-        );
+        let propagator =
+            Propagator::new(state.pool.clone(), state.table_prefix.clone(), storage_id);
         // PHP lazily materializes the `uploads/` row on the first upload
         // (finding #24) — the source chain needs it.
         let now_s = std::time::SystemTime::now()
@@ -753,11 +764,8 @@ async fn handle_move(
         }
 
         // Layer 2: Legacy preview files on disk.
-        let preview_dir = crate::davfile::preview_cache_dir(
-            &state.data_directory,
-            &state.instance_id,
-            fid,
-        );
+        let preview_dir =
+            crate::davfile::preview_cache_dir(&state.data_directory, &state.instance_id, fid);
         if let Err(e) = fs::remove_dir_all(&preview_dir).await {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(

@@ -172,12 +172,7 @@ pub fn build_props(
         // Tags are serialized as <oc:tags><oc:tag>...</oc:tag>...</oc:tags>.
         // Favorite is "1" or "0".
         make_prop("tags", "oc", OC_NS, &tags::format_tags_xml(tags)),
-        make_prop(
-            "favorite",
-            "oc",
-            OC_NS,
-            if favorite { "1" } else { "0" },
-        ),
+        make_prop("favorite", "oc", OC_NS, if favorite { "1" } else { "0" }),
         // {ocs:}share-permissions — per-share MAX permissions from oc_share;
         // defaults to 31 (all permissions) for the owner's own unshared file
         // (REQ §6.5 / §4.8, PHASE-7.6).
@@ -355,21 +350,11 @@ pub fn add_phase12_props(props: &mut Vec<DavProp>, ctx: &Phase12PropCtx<'_>) {
 
     // {oc:}comments-href — only when non-empty (PHASE-12.6).
     if !ctx.comments_href.is_empty() {
-        props.push(make_prop(
-            "comments-href",
-            "oc",
-            OC_NS,
-            ctx.comments_href,
-        ));
+        props.push(make_prop("comments-href", "oc", OC_NS, ctx.comments_href));
     }
 
     // {nc:}system-tags — always 200, self-closing when empty (PHASE-12.7).
-    props.push(make_prop(
-        "system-tags",
-        "nc",
-        NC_NS,
-        ctx.system_tags_xml,
-    ));
+    props.push(make_prop("system-tags", "nc", NC_NS, ctx.system_tags_xml));
 }
 
 // ─── Permission encoding ──────────────────────────────────────────────────────
@@ -745,7 +730,8 @@ mod tests {
             false,
             31,
             "",
-            "",            false,
+            "",
+            false,
             &[],
             false,
         );
@@ -788,7 +774,8 @@ mod tests {
             false,
             31,
             url,
-            "",            false,
+            "",
+            false,
             &[],
             false,
         );
@@ -821,7 +808,8 @@ mod tests {
             false,
             1,
             "",
-            "",            false,
+            "",
+            false,
             &[],
             false,
         );
@@ -864,7 +852,8 @@ mod tests {
             false,
             31,
             "",
-            "hello share note",            false,
+            "hello share note",
+            false,
             &[],
             false,
         );
@@ -920,7 +909,8 @@ mod tests {
             false,
             31,
             "",
-            "",            false,
+            "",
+            false,
             &[],
             false,
         );
@@ -945,7 +935,8 @@ mod tests {
             false,
             31,
             "",
-            "",            false,
+            "",
+            false,
             &[],
             false,
         );
@@ -974,7 +965,8 @@ mod tests {
             false,
             31,
             "",
-            "",            false,
+            "",
+            false,
             &[],
             false,
         );
@@ -1016,7 +1008,20 @@ mod tests {
     fn is_mount_root_true_for_files_path() {
         let meta = test_meta_with_path(Some("files"));
         let props = build_props(
-            &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",            false,
+            &meta,
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            false,
+            false,
+            31,
+            "",
+            "",
+            false,
             &[],
             false,
         );
@@ -1032,7 +1037,20 @@ mod tests {
     fn is_mount_root_true_for_empty_path() {
         let meta = test_meta_with_path(Some(""));
         let props = build_props(
-            &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",            false,
+            &meta,
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            false,
+            false,
+            31,
+            "",
+            "",
+            false,
             &[],
             false,
         );
@@ -1048,7 +1066,20 @@ mod tests {
     fn is_mount_root_false_for_subdir() {
         let meta = test_meta_with_path(Some("files/Photos"));
         let props = build_props(
-            &meta, "inst", "u", "U", true, "", 0, 0, false, false, 31, "", "",            false,
+            &meta,
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            false,
+            false,
+            31,
+            "",
+            "",
+            false,
             &[],
             false,
         );
@@ -1079,7 +1110,20 @@ mod tests {
     fn hide_download_present_on_shared_nodes() {
         let meta = test_meta(None);
         let props = build_props(
-            &meta, "inst", "u", "U", true, "", 0, 0, false, true, 31, "", "",            false,
+            &meta,
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            false,
+            true,
+            31,
+            "",
+            "",
+            false,
             &[],
             false,
         );
@@ -1098,7 +1142,20 @@ mod tests {
     fn hide_download_in_prop_names() {
         let meta = test_meta(None);
         let names = build_props(
-            &meta, "inst", "u", "U", false, "", 0, 0, false, false, 31, "", "",            false,
+            &meta,
+            "inst",
+            "u",
+            "U",
+            false,
+            "",
+            0,
+            0,
+            false,
+            false,
+            31,
+            "",
+            "",
+            false,
             &[],
             false,
         );
@@ -1126,7 +1183,8 @@ mod tests {
             false,
             31,
             "",
-            "",            false,
+            "",
+            false,
             &[],
             false,
         );
@@ -1153,15 +1211,15 @@ mod tests {
             false,
             31,
             "",
-            "",            false,
+            "",
+            false,
             &[],
             false,
         );
         let p = home.iter().find(|p| p.name == "mount-type").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
         assert_eq!(
-            xml,
-            "<nc:mount-type xmlns:nc=\"http://nextcloud.org/ns\"></nc:mount-type>",
+            xml, "<nc:mount-type xmlns:nc=\"http://nextcloud.org/ns\"></nc:mount-type>",
             "home mount must emit empty mount-type, got {xml}"
         );
 
@@ -1178,7 +1236,8 @@ mod tests {
             true,
             31,
             "",
-            "",            false,
+            "",
+            false,
             &[],
             false,
         );
@@ -1211,8 +1270,7 @@ mod tests {
         let p = props.iter().find(|p| p.name == "displayname").unwrap();
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
         assert_eq!(
-            xml,
-            "<d:displayname xmlns:d=\"DAV:\">alice</d:displayname>",
+            xml, "<d:displayname xmlns:d=\"DAV:\">alice</d:displayname>",
             "mount root must emit the UID, got {xml}"
         );
     }
@@ -1232,7 +1290,8 @@ mod tests {
             false,
             31,
             "",
-            "",            false,
+            "",
+            false,
             &[],
             false,
         );
@@ -1270,7 +1329,8 @@ mod tests {
             false,
             31,
             "",
-            "",            false,
+            "",
+            false,
             &[],
             false,
         );
@@ -1301,7 +1361,8 @@ mod tests {
             false,
             31,
             "",
-            "",            false,
+            "",
+            false,
             &[],
             false,
         );

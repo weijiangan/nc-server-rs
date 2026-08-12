@@ -20,7 +20,6 @@
 /// on `SHA-256(php_session_cookie_value)`.  It is held in `AppState` and
 /// checked before calling `resolve_session()` on every PHP-session-only
 /// browser request.
-
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -114,7 +113,11 @@ pub enum CacheLookup {
 /// `session_cache_ttl` config value, default [`SESSION_CACHE_TTL`]) — the
 /// revocation knob.  Negative entries always use
 /// [`SESSION_NEGATIVE_CACHE_TTL`].
-pub fn cache_lookup(cache: &SessionCache, key: &SessionCacheKey, positive_ttl: Duration) -> CacheLookup {
+pub fn cache_lookup(
+    cache: &SessionCache,
+    key: &SessionCacheKey,
+    positive_ttl: Duration,
+) -> CacheLookup {
     let Some(entry) = cache.get(key) else {
         return CacheLookup::Miss;
     };
@@ -146,9 +149,7 @@ pub fn cache_lookup(cache: &SessionCache, key: &SessionCacheKey, positive_ttl: D
 /// with the default TTL still bounds the map.
 pub fn cache_evict_expired(cache: &SessionCache) {
     cache.retain(|_, entry| match entry {
-        SessionCacheEntry::Positive(_, inserted_at) => {
-            inserted_at.elapsed() < SESSION_CACHE_TTL
-        }
+        SessionCacheEntry::Positive(_, inserted_at) => inserted_at.elapsed() < SESSION_CACHE_TTL,
         SessionCacheEntry::Negative(inserted_at) => {
             inserted_at.elapsed() < SESSION_NEGATIVE_CACHE_TTL
         }
@@ -407,7 +408,10 @@ mod tests {
         let k3 = make_cache_key("sidXXX");
 
         assert_eq!(k1, k2, "same cookie value must produce the same key");
-        assert_ne!(k1, k3, "different cookie values must produce different keys");
+        assert_ne!(
+            k1, k3,
+            "different cookie values must produce different keys"
+        );
 
         // Verify it is actually SHA-256: PHP session IDs are opaque strings;
         // we just check the length (32 bytes = 256 bits).
@@ -440,7 +444,10 @@ mod tests {
     fn session_cache_miss_for_unknown_key() {
         let cache = SessionCache::new();
         let key = make_cache_key("nonexistent");
-        assert_eq!(cache_lookup(&cache, &key, SESSION_CACHE_TTL), CacheLookup::Miss);
+        assert_eq!(
+            cache_lookup(&cache, &key, SESSION_CACHE_TTL),
+            CacheLookup::Miss
+        );
     }
 
     /// An entry inserted with a deliberately aged timestamp is treated as
@@ -457,10 +464,16 @@ mod tests {
         let old_time = Instant::now()
             .checked_sub(SESSION_CACHE_TTL + Duration::from_secs(1))
             .expect("instant subtraction should not underflow on test systems");
-        cache.insert(key, SessionCacheEntry::Positive(sample_identity(), old_time));
+        cache.insert(
+            key,
+            SessionCacheEntry::Positive(sample_identity(), old_time),
+        );
 
         // Should be considered expired → Miss.
-        assert_eq!(cache_lookup(&cache, &key, SESSION_CACHE_TTL), CacheLookup::Miss);
+        assert_eq!(
+            cache_lookup(&cache, &key, SESSION_CACHE_TTL),
+            CacheLookup::Miss
+        );
     }
 
     /// The `session_cache_ttl` revocation knob: a positive entry that the
@@ -472,7 +485,10 @@ mod tests {
         let old_time = Instant::now()
             .checked_sub(Duration::from_secs(30))
             .expect("instant subtraction should not underflow on test systems");
-        cache.insert(key, SessionCacheEntry::Positive(sample_identity(), old_time));
+        cache.insert(
+            key,
+            SessionCacheEntry::Positive(sample_identity(), old_time),
+        );
 
         assert_eq!(
             cache_lookup(&cache, &key, Duration::from_secs(60)),
@@ -501,14 +517,20 @@ mod tests {
         let old_time = Instant::now()
             .checked_sub(SESSION_CACHE_TTL + Duration::from_secs(1))
             .expect("instant subtraction should not underflow on test systems");
-        cache.insert(stale_key, SessionCacheEntry::Positive(sample_identity(), old_time));
+        cache.insert(
+            stale_key,
+            SessionCacheEntry::Positive(sample_identity(), old_time),
+        );
 
         assert_eq!(cache.len(), 2);
 
         cache_evict_expired(&cache);
 
         assert_eq!(cache.len(), 1, "stale entry should have been evicted");
-        assert!(cache.get(&fresh_key).is_some(), "fresh entry must be retained");
+        assert!(
+            cache.get(&fresh_key).is_some(),
+            "fresh entry must be retained"
+        );
         assert!(cache.get(&stale_key).is_none(), "stale entry must be gone");
     }
 
@@ -565,7 +587,11 @@ mod tests {
 
         assert_eq!(cache.len(), 3);
         cache_evict_expired(&cache);
-        assert_eq!(cache.len(), 2, "stale negative evicted, fresh of both kinds kept");
+        assert_eq!(
+            cache.len(),
+            2,
+            "stale negative evicted, fresh of both kinds kept"
+        );
         assert!(cache.get(&fresh_pos).is_some());
         assert!(cache.get(&fresh_neg).is_some());
         assert!(cache.get(&stale_neg).is_none());

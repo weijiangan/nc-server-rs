@@ -40,10 +40,7 @@ impl Probe {
             .next()
             .context("probe must start with the HTTP method")?
             .to_string();
-        let path = it
-            .next()
-            .context("probe must include a path")?
-            .to_string();
+        let path = it.next().context("probe must include a path")?.to_string();
         let mut depth = None;
         for kv in it {
             let (k, v) = kv
@@ -54,7 +51,11 @@ impl Probe {
                 other => anyhow::bail!("unknown probe flag {other:?}"),
             }
         }
-        Ok(Probe { method, path, depth })
+        Ok(Probe {
+            method,
+            path,
+            depth,
+        })
     }
 
     fn headers(&self) -> HeaderMap {
@@ -101,9 +102,9 @@ pub async fn bench(
     duration_secs: u64,
     warmup_secs: u64,
 ) -> Result<LoadReport> {
-    nc_difftest::preconditions::check(cfg)
-        .await
-        .context("preconditions failed — is the stack up (`make diff-up`) and the sides identical?")?;
+    nc_difftest::preconditions::check(cfg).await.context(
+        "preconditions failed — is the stack up (`make diff-up`) and the sides identical?",
+    )?;
 
     let mut probes = default_probes();
     for s in extra {
@@ -120,7 +121,11 @@ pub async fn bench(
         auth::instance_creds(&cfg.oracle, &cfg.admin_user, &cfg.admin_pass).await?;
 
     let sut = Arc::new(NextcloudClient::new(&cfg.sut, &sut_user, &sut_pass)?);
-    let oracle = Arc::new(NextcloudClient::new(&cfg.oracle, &oracle_user, &oracle_pass)?);
+    let oracle = Arc::new(NextcloudClient::new(
+        &cfg.oracle,
+        &oracle_user,
+        &oracle_pass,
+    )?);
 
     let mut out = Vec::new();
     for probe in &probes {
@@ -128,12 +133,24 @@ pub async fn bench(
 
         // Warm both sides so caches/opcache are hot before measuring.
         hammer(&sut, probe, Duration::from_secs(warmup_secs), concurrency).await?;
-        hammer(&oracle, probe, Duration::from_secs(warmup_secs), concurrency).await?;
+        hammer(
+            &oracle,
+            probe,
+            Duration::from_secs(warmup_secs),
+            concurrency,
+        )
+        .await?;
 
         let rust = hammer(&sut, probe, Duration::from_secs(duration_secs), concurrency).await?;
         // Cooldown so the two measured runs don't bleed into each other.
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let php = hammer(&oracle, probe, Duration::from_secs(duration_secs), concurrency).await?;
+        let php = hammer(
+            &oracle,
+            probe,
+            Duration::from_secs(duration_secs),
+            concurrency,
+        )
+        .await?;
 
         // Same semantics as scenario mode: >1 means Rust is faster
         // (rust req/s over php req/s).

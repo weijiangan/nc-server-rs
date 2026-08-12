@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use sqlx::AnyPool;
+use crate::pool::DbPool;
 
 /// Typed config value as stored in `oc_appconfig`.
 #[derive(Debug, Clone)]
@@ -59,7 +59,8 @@ impl AppConfigCache {
 
     /// Insert or update a single entry (called by write path to keep cache hot).
     pub fn set_raw(&mut self, app: &str, key: &str, value: String) {
-        self.values.insert((app.to_string(), key.to_string()), value);
+        self.values
+            .insert((app.to_string(), key.to_string()), value);
     }
 
     /// Remove an entry (called when a key is deleted from `oc_appconfig`).
@@ -83,7 +84,7 @@ impl AppConfigCache {
 
 /// Load non-lazy `oc_appconfig` rows into a shared cache.
 pub async fn load_appconfig_cache(
-    pool: &AnyPool,
+    pool: &DbPool,
     table_prefix: &str,
 ) -> anyhow::Result<SharedAppConfigCache> {
     let table = format!("{table_prefix}appconfig");
@@ -113,7 +114,7 @@ pub async fn load_appconfig_cache(
 /// replaced — only the inner `AppConfigCache` value is swapped, so all holders
 /// of the shared reference see the fresh data immediately on their next read.
 pub async fn reload_appconfig_cache(
-    pool: &AnyPool,
+    pool: &DbPool,
     table_prefix: &str,
     cache: &SharedAppConfigCache,
 ) -> anyhow::Result<()> {
@@ -208,8 +209,8 @@ mod tests {
         let cache = make_cache(&[
             ("bruteForce", "whitelist_0", "10.0.0.0/24"),
             ("bruteForce", "whitelist_5", "192.168.0.0/24"), // non-contiguous key
-            ("bruteForce", "other_key",  "ignored"),
-            ("core",       "whitelist_0", "also_ignored"),   // wrong app
+            ("bruteForce", "other_key", "ignored"),
+            ("core", "whitelist_0", "also_ignored"), // wrong app
         ]);
         let guard = cache.read().unwrap();
         let mut entries = guard.values_with_prefix("bruteForce", "whitelist_");
@@ -221,6 +222,8 @@ mod tests {
     fn values_with_prefix_empty_when_no_match() {
         let cache = make_cache(&[("core", "version", "30.0.2.1")]);
         let guard = cache.read().unwrap();
-        assert!(guard.values_with_prefix("bruteForce", "whitelist_").is_empty());
+        assert!(guard
+            .values_with_prefix("bruteForce", "whitelist_")
+            .is_empty());
     }
 }

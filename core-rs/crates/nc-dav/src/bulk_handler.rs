@@ -83,9 +83,7 @@ pub async fn bulk_handler(
     let data_dir_str = state.data_directory.to_str().unwrap_or("").to_string();
 
     let storage_id =
-        match row::lookup_storage_id(&state.pool, &state.table_prefix, &uid, &data_dir_str)
-            .await
-        {
+        match row::lookup_storage_id(&state.pool, &state.table_prefix, &uid, &data_dir_str).await {
             Some(id) => id,
             None => {
                 return http::Response::builder()
@@ -196,7 +194,13 @@ pub async fn bulk_handler(
         }
 
         match write_file(
-            &state, &uid, &instance_id, storage_id, &file_path, &part.data, mtime,
+            &state,
+            &uid,
+            &instance_id,
+            storage_id,
+            &file_path,
+            &part.data,
+            mtime,
         )
         .await
         {
@@ -305,10 +309,20 @@ async fn write_file(
     // §10.8: get-or-insert mimetype IDs; mimepart is the part BEFORE
     // the '/' (e.g. "image"), NOT "image/" — matching PHP's
     // getId(substr($mimetype, 0, strpos($mimetype, '/')))
-    let mime_type_id =
-        nc_db::mime::get_or_insert_mime_id(&state.pool, &state.table_prefix, &state.mime_cache, &mime_str).await;
-    let mimepart_id =
-        nc_db::mime::get_or_insert_mime_id(&state.pool, &state.table_prefix, &state.mime_cache, &part_str).await;
+    let mime_type_id = nc_db::mime::get_or_insert_mime_id(
+        &state.pool,
+        &state.table_prefix,
+        &state.mime_cache,
+        &mime_str,
+    )
+    .await;
+    let mimepart_id = nc_db::mime::get_or_insert_mime_id(
+        &state.pool,
+        &state.table_prefix,
+        &state.mime_cache,
+        &part_str,
+    )
+    .await;
 
     let parent_path = {
         let mut parts: Vec<&str> = fc_path.split('/').collect();
@@ -321,9 +335,10 @@ async fn write_file(
         }
     };
 
-    let parent_row = row::lookup_by_path(&state.pool, &state.table_prefix, storage_id, &parent_path)
-        .await
-        .ok_or_else(|| "Parent directory not found".to_string())?;
+    let parent_row =
+        row::lookup_by_path(&state.pool, &state.table_prefix, storage_id, &parent_path)
+            .await
+            .ok_or_else(|| "Parent directory not found".to_string())?;
 
     let existing =
         row::lookup_by_path(&state.pool, &state.table_prefix, storage_id, &fc_path).await;
@@ -458,11 +473,8 @@ async fn write_file(
     {
         let old_size = existing.as_ref().map(|r| r.size).unwrap_or(0);
         let size_diff = (data.len() as i64) - old_size;
-        let propagator = Propagator::new(
-            state.pool.clone(),
-            state.table_prefix.clone(),
-            storage_id,
-        );
+        let propagator =
+            Propagator::new(state.pool.clone(), state.table_prefix.clone(), storage_id);
         let _ = propagator
             .propagate_change(&fc_path, file_mtime, size_diff)
             .await;
@@ -752,8 +764,7 @@ mod tests {
 
     #[test]
     fn test_multipart_parser_single_part() {
-        let body =
-            b"--boundary\r\nX-File-Path: /test.txt\r\n\r\nhello world\r\n--boundary--";
+        let body = b"--boundary\r\nX-File-Path: /test.txt\r\n\r\nhello world\r\n--boundary--";
         let parser = MultipartParser::new(body, "boundary");
         let parts: Vec<_> = parser.collect();
         assert_eq!(parts.len(), 1);
@@ -769,12 +780,22 @@ mod tests {
         let parts: Vec<_> = parser.collect();
         assert_eq!(parts.len(), 2);
         assert_eq!(
-            parts[0].as_ref().unwrap().headers.get("x-file-path").unwrap(),
+            parts[0]
+                .as_ref()
+                .unwrap()
+                .headers
+                .get("x-file-path")
+                .unwrap(),
             "/a.txt"
         );
         assert_eq!(parts[0].as_ref().unwrap().data, b"content A");
         assert_eq!(
-            parts[1].as_ref().unwrap().headers.get("x-file-path").unwrap(),
+            parts[1]
+                .as_ref()
+                .unwrap()
+                .headers
+                .get("x-file-path")
+                .unwrap(),
             "/b.txt"
         );
         assert_eq!(parts[1].as_ref().unwrap().data, b"content B");
@@ -886,8 +907,7 @@ mod tests {
         // already prefixed with "files/".
         let with_files_prefix = bulk_fc_path("files/test.txt");
         assert_eq!(
-            with_files_prefix,
-            "files/files/test.txt",
+            with_files_prefix, "files/files/test.txt",
             "callers must strip 'files/' prefix before passing to bulk_fc_path"
         );
         // Correct: strip the DAV prefix first.

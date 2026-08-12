@@ -87,7 +87,13 @@ fn parse_snapshot(stdout: &str) -> Result<FileTree> {
             let size = sizes
                 .remove(&p)
                 .with_context(|| format!("hash without size entry for {p:?}"))?;
-            tree.insert(p, FileEntry { size, sha256: hash.to_string() });
+            tree.insert(
+                p,
+                FileEntry {
+                    size,
+                    sha256: hash.to_string(),
+                },
+            );
         }
     }
     if !sizes.is_empty() {
@@ -150,10 +156,16 @@ pub fn render(d: &FileDelta) -> String {
     for (path, change) in d {
         match change {
             FileChange::Added(e) => {
-                out.push_str(&format!("  + {path} ({} bytes, sha256:{})\n", e.size, e.sha256));
+                out.push_str(&format!(
+                    "  + {path} ({} bytes, sha256:{})\n",
+                    e.size, e.sha256
+                ));
             }
             FileChange::Removed(e) => {
-                out.push_str(&format!("  - {path} ({} bytes, sha256:{})\n", e.size, e.sha256));
+                out.push_str(&format!(
+                    "  - {path} ({} bytes, sha256:{})\n",
+                    e.size, e.sha256
+                ));
             }
             FileChange::Changed { before, after } => {
                 out.push_str(&format!(
@@ -213,17 +225,32 @@ mod tests {
 
     #[test]
     fn delta_added_removed_changed() {
-        let e1 = FileEntry { size: 1, sha256: "a".repeat(64) };
-        let e2 = FileEntry { size: 2, sha256: "b".repeat(64) };
-        let e3 = FileEntry { size: 1, sha256: "c".repeat(64) };
-        let before: FileTree =
-            [("gone".into(), e1.clone()), ("same".into(), e2.clone()), ("mut".into(), e1.clone())]
-                .into_iter()
-                .collect();
-        let after: FileTree =
-            [("new".into(), e3.clone()), ("same".into(), e2.clone()), ("mut".into(), e3.clone())]
-                .into_iter()
-                .collect();
+        let e1 = FileEntry {
+            size: 1,
+            sha256: "a".repeat(64),
+        };
+        let e2 = FileEntry {
+            size: 2,
+            sha256: "b".repeat(64),
+        };
+        let e3 = FileEntry {
+            size: 1,
+            sha256: "c".repeat(64),
+        };
+        let before: FileTree = [
+            ("gone".into(), e1.clone()),
+            ("same".into(), e2.clone()),
+            ("mut".into(), e1.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let after: FileTree = [
+            ("new".into(), e3.clone()),
+            ("same".into(), e2.clone()),
+            ("mut".into(), e3.clone()),
+        ]
+        .into_iter()
+        .collect();
         let d = delta(&before, &after);
         assert_eq!(d.len(), 3);
         assert!(matches!(d["new"], FileChange::Added(_)));
@@ -234,7 +261,10 @@ mod tests {
 
     #[test]
     fn identical_deltas_diff_empty() {
-        let e = FileEntry { size: 26, sha256: "x".repeat(64) };
+        let e = FileEntry {
+            size: 26,
+            sha256: "x".repeat(64),
+        };
         let mut d = FileDelta::new();
         d.insert("hello.txt".into(), FileChange::Added(e.clone()));
         let (identical, text) = diff(&d, &d);
@@ -244,7 +274,10 @@ mod tests {
         let mut d2 = FileDelta::new();
         d2.insert(
             "hello.txt".into(),
-            FileChange::Added(FileEntry { size: 27, sha256: "y".repeat(64) }),
+            FileChange::Added(FileEntry {
+                size: 27,
+                sha256: "y".repeat(64),
+            }),
         );
         let (identical2, text2) = diff(&d, &d2);
         assert!(!identical2);

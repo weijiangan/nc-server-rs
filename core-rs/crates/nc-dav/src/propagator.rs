@@ -145,9 +145,8 @@ impl Propagator {
         size_difference: i64,
         etag: &str,
     ) -> Result<(), String> {
-        let placeholders: Vec<String> = (1..=parent_hashes.len())
-            .map(|i| format!("${i}"))
-            .collect();
+        let placeholders: Vec<String> =
+            (1..=parent_hashes.len()).map(|i| format!("${i}")).collect();
         let in_clause = placeholders.join(", ");
 
         // Parameter indices:
@@ -164,7 +163,7 @@ impl Propagator {
             .begin()
             .await
             .map_err(|e| format!("propagate BEGIN failed: {e}"))?;
-        let pg = tx.backend_name() == "PostgreSQL";
+        let pg = tx.is_postgres();
 
         // Pre-lock the parent rows in a deterministic order (see the doc
         // comment above).  Postgres-only: SQLite has whole-file locking (no
@@ -181,7 +180,7 @@ impl Propagator {
             sqlx::query(&lock_sql)
                 .bind(parent_hashes.join(","))
                 .bind(self.storage_id)
-                .execute(&mut *tx)
+                .execute(&mut tx)
                 .await
                 .map_err(|e| format!("propagate pre-lock failed: {e}"))?;
         }
@@ -242,7 +241,7 @@ impl Propagator {
             query = query.bind(size_difference);
 
             query
-                .execute(&mut *tx)
+                .execute(&mut tx)
                 .await
                 .map_err(|e| format!("propagate UPDATE with size failed: {e}"))?;
         } else {
@@ -284,7 +283,7 @@ impl Propagator {
             query = query.bind(etag);
 
             query
-                .execute(&mut *tx)
+                .execute(&mut tx)
                 .await
                 .map_err(|e| format!("propagate UPDATE failed: {e}"))?;
         }
@@ -349,8 +348,7 @@ impl Propagator {
         // Propagate the size delta up to ancestors.
         let size_delta = new_size - old_size;
         if size_delta != 0 {
-            self.propagate_change(fc_path, new_size, size_delta)
-                .await?;
+            self.propagate_change(fc_path, new_size, size_delta).await?;
         }
 
         Ok(())
@@ -376,9 +374,7 @@ impl Propagator {
     ) -> Result<(), String> {
         // Parent directory's on-disk mtime, truncated to whole seconds (PHP
         // `filemtime` returns int seconds).
-        let disk_mtime = match std::fs::metadata(parent_disk_path)
-            .and_then(|m| m.modified())
-        {
+        let disk_mtime = match std::fs::metadata(parent_disk_path).and_then(|m| m.modified()) {
             Ok(t) => t
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -438,12 +434,12 @@ impl Propagator {
     /// `calculateFolderSizeInner`). No-op when the folder row is absent or its size
     /// is already correct.
     async fn recompute_folder_size(&self, folder_path: &str) -> Result<(), String> {
-        let folder = match row::lookup_by_path(&self.pool, &self.prefix, self.storage_id, folder_path)
-            .await
-        {
-            Some(f) => f,
-            None => return Ok(()),
-        };
+        let folder =
+            match row::lookup_by_path(&self.pool, &self.prefix, self.storage_id, folder_path).await
+            {
+                Some(f) => f,
+                None => return Ok(()),
+            };
 
         // Single round-trip: SUM of child sizes and MIN to detect an unscanned child.
         // PostgreSQL SUM(bigint) returns NUMERIC; CAST to BIGINT keeps it as i64 for
@@ -592,12 +588,13 @@ mod tests {
     }
 
     async fn fresh_db() -> (DbPool, String, i64) {
-        sqlx::any::install_default_drivers();
-        let pool = sqlx::any::AnyPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("in-memory SQLite");
+        let pool = DbPool::Sqlite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("in-memory SQLite"),
+        );
 
         // Create the filecache table matching 0003_filecache.sql.
         sqlx::query(
@@ -630,7 +627,12 @@ mod tests {
     }
 
     /// Read back a filecache row by path.
-    async fn get_row(pool: &DbPool, prefix: &str, storage_id: i64, path: &str) -> (i64, String, i64, i64) {
+    async fn get_row(
+        pool: &DbPool,
+        prefix: &str,
+        storage_id: i64,
+        path: &str,
+    ) -> (i64, String, i64, i64) {
         let hash = row::path_hash(path);
         let sql = format!(
             "SELECT size, etag, mtime, storage_mtime FROM {prefix}filecache \
@@ -665,7 +667,10 @@ mod tests {
         // Ancestor "files/A": size 50 → 80, mtime updated, etag changed.
         let (size, etag, mtime, _) = get_row(&pool, &prefix, storage_id, "files/A").await;
         assert_eq!(size, 80, "files/A size should be 50+30=80");
-        assert!(mtime >= 20, "files/A mtime should be >= 20 (GREATEST of 10 and 20)");
+        assert!(
+            mtime >= 20,
+            "files/A mtime should be >= 20 (GREATEST of 10 and 20)"
+        );
         assert_ne!(etag, "a_old", "files/A etag should have changed");
 
         // Ancestor "files": size 100 → 130, mtime updated,  etag same as A.
@@ -853,7 +858,10 @@ mod tests {
         let (size_files, _, _, _) = get_row(&pool, &prefix, storage_id, "files").await;
         // files was 100, size delta = 40, so now 140. But only if propagation
         // from correct_folder_size worked.
-        assert_eq!(size_files, 140, "files should reflect the corrected delta (100→140)");
+        assert_eq!(
+            size_files, 140,
+            "files should reflect the corrected delta (100→140)"
+        );
     }
 
     #[tokio::test]
@@ -910,7 +918,10 @@ mod tests {
             .expect("correct_parent_storage_mtime");
 
         let (_, _, mtime, storage_mtime) = get_row(&pool, &prefix, storage_id, "files/A").await;
-        assert_eq!(storage_mtime, 1_700_000_123, "parent storage_mtime = dir disk mtime");
+        assert_eq!(
+            storage_mtime, 1_700_000_123,
+            "parent storage_mtime = dir disk mtime"
+        );
         assert_eq!(mtime, 1_700_000_123, "mtime copied from storage_mtime");
 
         let _ = std::fs::remove_dir_all(&dir);

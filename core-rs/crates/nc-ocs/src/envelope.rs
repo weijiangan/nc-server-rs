@@ -29,10 +29,7 @@ pub enum OcsFormat {
 /// 1. `?format=json` or `?format=xml` query parameter
 /// 2. `Accept: application/json` header
 /// 3. Default: XML
-pub fn negotiate_format(
-    query: Option<&str>,
-    accept: Option<&str>,
-) -> OcsFormat {
+pub fn negotiate_format(query: Option<&str>, accept: Option<&str>) -> OcsFormat {
     // 1. Query parameter takes precedence.
     if let Some(q) = query {
         for part in q.split('&') {
@@ -89,12 +86,7 @@ pub fn v2_http_status(statuscode: u16) -> u16 {
 ///
 /// * v1: includes `<totalitems></totalitems>` and `<itemsperpage></itemsperpage>`.
 /// * v2: omits those elements.
-pub fn build_xml(
-    version: OcsVersion,
-    statuscode: u16,
-    message: &str,
-    data_xml: &str,
-) -> String {
+pub fn build_xml(version: OcsVersion, statuscode: u16, message: &str, data_xml: &str) -> String {
     let status = status_label(statuscode);
     let msg_escaped = xml_escape(message);
     let meta_extra = match version {
@@ -215,10 +207,7 @@ fn json_value_to_xml(value: &serde_json::Value, _parent_key: &str) -> String {
                         }
                     }
                     serde_json::Value::Object(_) => {
-                        out.push_str(&format!(
-                            "<{elem}>{}</{elem}>",
-                            json_value_to_xml(v, k)
-                        ));
+                        out.push_str(&format!("<{elem}>{}</{elem}>", json_value_to_xml(v, k)));
                     }
                     serde_json::Value::Null => {
                         out.push_str(&format!("<{elem}/>"));
@@ -228,10 +217,7 @@ fn json_value_to_xml(value: &serde_json::Value, _parent_key: &str) -> String {
                         out.push_str(&format!("<{elem}>{s}</{elem}>"));
                     }
                     _ => {
-                        out.push_str(&format!(
-                            "<{elem}>{}</{elem}>",
-                            xml_escape(&scalar_str(v))
-                        ));
+                        out.push_str(&format!("<{elem}>{}</{elem}>", xml_escape(&scalar_str(v))));
                     }
                 }
             }
@@ -281,8 +267,14 @@ mod tests {
     #[test]
     fn v1_xml_has_totalitems_and_itemsperpage() {
         let xml = build_xml(OcsVersion::V1, 100, "OK", "<foo/>");
-        assert!(xml.contains("<totalitems></totalitems>"), "v1 must have totalitems");
-        assert!(xml.contains("<itemsperpage></itemsperpage>"), "v1 must have itemsperpage");
+        assert!(
+            xml.contains("<totalitems></totalitems>"),
+            "v1 must have totalitems"
+        );
+        assert!(
+            xml.contains("<itemsperpage></itemsperpage>"),
+            "v1 must have itemsperpage"
+        );
         assert!(xml.contains("<statuscode>100</statuscode>"));
         assert!(xml.contains("<status>ok</status>"));
     }
@@ -291,7 +283,10 @@ mod tests {
     fn v2_xml_omits_pagination_fields() {
         let xml = build_xml(OcsVersion::V2, 100, "OK", "<foo/>");
         assert!(!xml.contains("totalitems"), "v2 must NOT have totalitems");
-        assert!(!xml.contains("itemsperpage"), "v2 must NOT have itemsperpage");
+        assert!(
+            !xml.contains("itemsperpage"),
+            "v2 must NOT have itemsperpage"
+        );
     }
 
     #[test]
@@ -329,6 +324,9 @@ mod tests {
     #[test]
     fn version_detected_from_path() {
         assert_eq!(OcsVersion::from_path("/ocs/v1.php/config"), OcsVersion::V1);
-        assert_eq!(OcsVersion::from_path("/ocs/v2.php/cloud/capabilities"), OcsVersion::V2);
+        assert_eq!(
+            OcsVersion::from_path("/ocs/v2.php/cloud/capabilities"),
+            OcsVersion::V2
+        );
     }
 }

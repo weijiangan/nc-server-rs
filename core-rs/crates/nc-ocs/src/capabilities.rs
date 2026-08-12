@@ -360,12 +360,18 @@ mod tests {
         cache.apply_php_capabilities(auth_only_caps);
         cache.apply_php_public_capabilities(pub_caps);
 
-        assert!(cache.auth_json.contains("admin_only_feature"),
-            "auth_* must include all authenticated PHP caps");
-        assert!(!cache.public_json.contains("admin_only_feature"),
-            "public_* must NOT include ICapability-only caps");
-        assert!(cache.public_json.contains("files_sharing"),
-            "public_* must include IPublicCapability caps");
+        assert!(
+            cache.auth_json.contains("admin_only_feature"),
+            "auth_* must include all authenticated PHP caps"
+        );
+        assert!(
+            !cache.public_json.contains("admin_only_feature"),
+            "public_* must NOT include ICapability-only caps"
+        );
+        assert!(
+            cache.public_json.contains("files_sharing"),
+            "public_* must include IPublicCapability caps"
+        );
     }
 
     #[test]

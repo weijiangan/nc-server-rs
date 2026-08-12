@@ -17,7 +17,10 @@ use crate::{
 #[tracing::instrument(skip_all, level = "debug", fields(method = %request.method(), path = %request.uri().path()))]
 pub async fn ocs_config(State(state): State<OcsState>, request: Request) -> Response {
     let version = OcsVersion::from_path(request.uri().path());
-    let format = negotiate_format(request.uri().query(), header_str(request.headers(), "accept"));
+    let format = negotiate_format(
+        request.uri().query(),
+        header_str(request.headers(), "accept"),
+    );
 
     let host = request
         .headers()
@@ -57,12 +60,12 @@ pub async fn ocs_config(State(state): State<OcsState>, request: Request) -> Resp
 /// ETag = `md5(json_encode($result))`.
 /// Unauthenticated → public-only subset; authenticated → full set.
 #[tracing::instrument(skip_all, level = "debug", fields(method = %request.method(), path = %request.uri().path()))]
-pub async fn ocs_capabilities(
-    State(state): State<OcsState>,
-    request: Request,
-) -> Response {
+pub async fn ocs_capabilities(State(state): State<OcsState>, request: Request) -> Response {
     let version = OcsVersion::from_path(request.uri().path());
-    let format = negotiate_format(request.uri().query(), header_str(request.headers(), "accept"));
+    let format = negotiate_format(
+        request.uri().query(),
+        header_str(request.headers(), "accept"),
+    );
 
     let cache = state
         .capability_cache
@@ -155,8 +158,7 @@ pub async fn rebuild_capability_cache(
 
     let new_cache = {
         let ac = appconfig_cache.read().expect("appconfig lock");
-        let mut cache =
-            crate::capabilities::build_capability_cache(&ac, Some(&existing_version));
+        let mut cache = crate::capabilities::build_capability_cache(&ac, Some(&existing_version));
         // Re-merge both PHP capability sources into the freshly built native cache.
         if !existing_php_caps.is_null() {
             cache.apply_php_capabilities(existing_php_caps);
@@ -167,7 +169,9 @@ pub async fn rebuild_capability_cache(
         cache
     };
 
-    let mut cap = capability_cache.write().expect("capability cache write lock");
+    let mut cap = capability_cache
+        .write()
+        .expect("capability cache write lock");
     *cap = new_cache;
     tracing::debug!("Capability cache rebuilt (PHP-app capabilities preserved)");
 }

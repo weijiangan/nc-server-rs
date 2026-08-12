@@ -602,7 +602,10 @@ $CONFIG = [
 
         // REQ §17: the sensitive URL must never appear in Debug output.
         let debug = format!("{cfg:?}");
-        assert!(!debug.contains("localhost:9090"), "URL leaked into Debug: {debug}");
+        assert!(
+            !debug.contains("localhost:9090"),
+            "URL leaked into Debug: {debug}"
+        );
         assert!(debug.contains("Sensitive(<redacted>)"));
     }
 

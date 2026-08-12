@@ -55,12 +55,13 @@ mod tests {
     /// In-memory SQLite with the `oc_preview_generation` shape the app migrations
     /// produce (`id` PK autoincrement, `uid`, `file_id`, `queued_at`).
     async fn fresh_db() -> DbPool {
-        sqlx::any::install_default_drivers();
-        let pool = sqlx::any::AnyPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("in-memory SQLite");
+        let pool = DbPool::Sqlite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("in-memory SQLite"),
+        );
         sqlx::query(
             "CREATE TABLE oc_preview_generation (
                 id        INTEGER NOT NULL PRIMARY KEY,

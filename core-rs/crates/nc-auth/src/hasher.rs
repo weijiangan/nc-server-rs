@@ -194,8 +194,8 @@ mod tests {
         // Generate a real argon2id PHC string via the same crate path PHP's
         // output parses through.  Fixed 16-byte salt keeps the test free of an
         // RNG dependency.
-        use argon2::PasswordHasher;
         use argon2::password_hash::SaltString;
+        use argon2::PasswordHasher;
         let salt = SaltString::encode_b64(b"0123456789abcdef").unwrap();
         let phc = Argon2::default()
             .hash_password(b"s3cret", &salt)

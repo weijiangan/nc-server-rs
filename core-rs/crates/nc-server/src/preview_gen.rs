@@ -25,8 +25,10 @@
 use crate::state::AppState;
 use bytes::Bytes;
 use nc_dav::row::FileCacheRow;
-use nc_preview::backend::{BackendError, DEFAULT_MAX_FILESIZE_MIB, ImaginaryClient, PreviewBackend};
-use nc_preview::concurrency::{Coalescer, CoalesceKey, generation_semaphore};
+use nc_preview::backend::{
+    BackendError, ImaginaryClient, PreviewBackend, DEFAULT_MAX_FILESIZE_MIB,
+};
+use nc_preview::concurrency::{generation_semaphore, CoalesceKey, Coalescer};
 use nc_preview::persist::{self, NewPreview};
 use nc_preview::snowflake::SnowflakeGenerator;
 use nc_preview::store::{self, PreviewRow};
@@ -76,8 +78,10 @@ impl PreviewGen {
             let (jpeg_q, webp_q) = {
                 let ac = appconfig.read().expect("appconfig cache lock");
                 (
-                    ac.get_string("preview", "jpeg_quality").unwrap_or_else(|| "80".to_string()),
-                    ac.get_string("preview", "webp_quality").unwrap_or_else(|| "80".to_string()),
+                    ac.get_string("preview", "jpeg_quality")
+                        .unwrap_or_else(|| "80".to_string()),
+                    ac.get_string("preview", "webp_quality")
+                        .unwrap_or_else(|| "80".to_string()),
                 )
             };
             cfg.preview_imaginary_url
@@ -86,11 +90,15 @@ impl PreviewGen {
                 .and_then(|url| {
                     ImaginaryClient::new(
                         &url,
-                        cfg.preview_imaginary_key.as_ref().map(|s| s.expose()).unwrap_or(""),
+                        cfg.preview_imaginary_key
+                            .as_ref()
+                            .map(|s| s.expose())
+                            .unwrap_or(""),
                         cfg.preview_format.clone(),
                         jpeg_q,
                         webp_q,
-                        cfg.preview_max_filesize_image.unwrap_or(DEFAULT_MAX_FILESIZE_MIB),
+                        cfg.preview_max_filesize_image
+                            .unwrap_or(DEFAULT_MAX_FILESIZE_MIB),
                     )
                 })
                 .map(Arc::new)
@@ -146,18 +154,31 @@ impl PreviewGen {
             .run(key, move || async move {
                 let _permit = semaphore.acquire().await.map_err(|_| GenError::Semaphore)?;
                 let datadir = data_dir(&st);
-                let fc_path = fc_row.path.clone().ok_or_else(|| GenError::Io("no filecache path".into()))?;
+                let fc_path = fc_row
+                    .path
+                    .clone()
+                    .ok_or_else(|| GenError::Io("no filecache path".into()))?;
                 let src_path = nc_dav::row::disk_path(&datadir, &uid, &fc_path);
-                let bytes = tokio::fs::read(&src_path).await.map_err(|e| GenError::Io(e.to_string()))?;
+                let bytes = tokio::fs::read(&src_path)
+                    .await
+                    .map_err(|e| GenError::Io(e.to_string()))?;
                 let gen = backend
                     .generate_max(Bytes::from(bytes), &source_mime, max_w, max_h)
                     .await?;
                 let out_id = resolve_mime_id(&st, &gen.output_mime).await?;
-                let name = store::preview_name(-1, gen.width, gen.height, false, true, &gen.output_mime);
+                let name =
+                    store::preview_name(-1, gen.width, gen.height, false, true, &gen.output_mime);
                 let id = snowflake.next_id();
-                persist::write_preview_bytes(&datadir, &st.instanceid, file_id, &name, &gen.bytes, id)
-                    .await
-                    .map_err(|e| GenError::Io(e.to_string()))?;
+                persist::write_preview_bytes(
+                    &datadir,
+                    &st.instanceid,
+                    file_id,
+                    &name,
+                    &gen.bytes,
+                    id,
+                )
+                .await
+                .map_err(|e| GenError::Io(e.to_string()))?;
                 let np = NewPreview {
                     file_id,
                     storage_id: fc_row.storage,
@@ -231,19 +252,34 @@ impl PreviewGen {
                 let _permit = semaphore.acquire().await.map_err(|_| GenError::Semaphore)?;
                 let datadir = data_dir(&st);
                 let max_name = store::preview_name(
-                    max_version, max_px_w, max_px_h, max_cropped, max_is_max, &max_mime,
+                    max_version,
+                    max_px_w,
+                    max_px_h,
+                    max_cropped,
+                    max_is_max,
+                    &max_mime,
                 );
-                let max_path = store::preview_byte_path(&datadir, &st.instanceid, file_id, &max_name);
-                let max_bytes = tokio::fs::read(&max_path).await.map_err(|e| GenError::Io(e.to_string()))?;
+                let max_path =
+                    store::preview_byte_path(&datadir, &st.instanceid, file_id, &max_name);
+                let max_bytes = tokio::fs::read(&max_path)
+                    .await
+                    .map_err(|e| GenError::Io(e.to_string()))?;
                 let gen = backend
                     .render_from_max(Bytes::from(max_bytes), &source_mime, bw, bh, crop)
                     .await?;
                 let out_id = resolve_mime_id(&st, &gen.output_mime).await?;
                 let name = store::preview_name(-1, bw, bh, crop, false, &gen.output_mime);
                 let id = snowflake.next_id();
-                persist::write_preview_bytes(&datadir, &st.instanceid, file_id, &name, &gen.bytes, id)
-                    .await
-                    .map_err(|e| GenError::Io(e.to_string()))?;
+                persist::write_preview_bytes(
+                    &datadir,
+                    &st.instanceid,
+                    file_id,
+                    &name,
+                    &gen.bytes,
+                    id,
+                )
+                .await
+                .map_err(|e| GenError::Io(e.to_string()))?;
                 let np = NewPreview {
                     file_id,
                     storage_id: fc_row.storage,
@@ -271,8 +307,14 @@ impl PreviewGen {
 /// PHP-FPM, not a server error (the request still succeeds via the proxy).
 fn log_result(what: &str, file_id: i64, result: &Result<Arc<PreviewRow>, Arc<GenError>>) {
     match result {
-        Ok(row) => tracing::info!(file_id, preview_id = row.id, "native {what} preview generated"),
-        Err(e) => tracing::info!(file_id, error = %e, "native {what} generation failed; falling back to PHP-FPM"),
+        Ok(row) => tracing::info!(
+            file_id,
+            preview_id = row.id,
+            "native {what} preview generated"
+        ),
+        Err(e) => {
+            tracing::info!(file_id, error = %e, "native {what} generation failed; falling back to PHP-FPM")
+        }
     }
 }
 

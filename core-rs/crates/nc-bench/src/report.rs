@@ -249,8 +249,22 @@ pub fn render_load(rep: &LoadReport, json: bool) {
             "  {:<6} {:>10} {:>24} {:>10} {:>8}",
             "side", "req/s", "p50/p90/mean (ms)", "max (ms)", "errors"
         );
-        println!("  {:<6} {:>10} {:>24} {:>10} {:>8}", "rust", fmt_reqs(p.rust.reqs_per_sec()), triplet(&p.rust.stats), fmt_ms(p.rust.stats.max), p.rust.errors);
-        println!("  {:<6} {:>10} {:>24} {:>10} {:>8}", "php", fmt_reqs(p.php.reqs_per_sec()), triplet(&p.php.stats), fmt_ms(p.php.stats.max), p.php.errors);
+        println!(
+            "  {:<6} {:>10} {:>24} {:>10} {:>8}",
+            "rust",
+            fmt_reqs(p.rust.reqs_per_sec()),
+            triplet(&p.rust.stats),
+            fmt_ms(p.rust.stats.max),
+            p.rust.errors
+        );
+        println!(
+            "  {:<6} {:>10} {:>24} {:>10} {:>8}",
+            "php",
+            fmt_reqs(p.php.reqs_per_sec()),
+            triplet(&p.php.stats),
+            fmt_ms(p.php.stats.max),
+            p.php.errors
+        );
         println!(
             "  {:<6} {:>10} {:>24} {:>10} {:>8}",
             "ratio",

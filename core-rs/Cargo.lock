@@ -1871,10 +1871,14 @@ name = "nc-db"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "regex-lite",
  "serde",
  "serde_json",
  "sqlx",
+ "sqlx-core",
+ "sqlx-postgres",
+ "sqlx-sqlite",
  "thiserror 2.0.18",
  "tokio",
  "toml",

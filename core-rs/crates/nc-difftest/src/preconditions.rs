@@ -23,8 +23,7 @@ async fn fetch_status(inst: &Instance, user: &str, pass: &str) -> Result<Status>
         bail!("status.php returned {}", resp.status());
     }
     let body = resp.text().await.context("reading status.php body")?;
-    serde_json::from_str(&body)
-        .with_context(|| format!("parsing status.php body ({body:?})"))
+    serde_json::from_str(&body).with_context(|| format!("parsing status.php body ({body:?})"))
 }
 
 /// Enabled apps on one instance. Column is **`configvalue`** (live-verified
@@ -87,5 +86,8 @@ pub async fn check(cfg: &Config) -> Result<()> {
 }
 
 fn minus<'a>(a: &'a [String], b: &[String]) -> Vec<&'a str> {
-    a.iter().filter(|x| !b.contains(x)).map(|s| s.as_str()).collect()
+    a.iter()
+        .filter(|x| !b.contains(x))
+        .map(|s| s.as_str())
+        .collect()
 }

@@ -37,10 +37,7 @@ use crate::{
 /// Covers `/core/`, `/dist/`, `/themes/`, and app-level static assets such as
 /// `/apps/files/img/icon.svg` that the PHP route wildcards would otherwise
 /// swallow and send to PHP-FPM.
-async fn try_static_files_check(
-    state: &AppState,
-    req: &mut Request<Body>,
-) -> Option<Response> {
+async fn try_static_files_check(state: &AppState, req: &mut Request<Body>) -> Option<Response> {
     if matches!(req.method(), &Method::GET | &Method::HEAD) {
         let path = req.uri().path().to_string();
         // Phase 18: static files live only under the app's four asset roots
@@ -164,10 +161,7 @@ const PROXIED_DAV_SUBTREES: [&str; 10] = [
 ///   /uploads               → native upload handler (Phase 5.5)
 ///   /bulk (POST)           → native bulk handler (Phase 5.9)
 ///   everything else        → native files tree (dav_handler)
-async fn dav_arbiter_handler(
-    State(state): State<AppState>,
-    req: Request<Body>,
-) -> Response {
+async fn dav_arbiter_handler(State(state): State<AppState>, req: Request<Body>) -> Response {
     // Path remainder after the mount root.  Trim in this order so a
     // "/dav/…" path cannot consume the "/remote.php/dav" prefix.
     let remainder = req
@@ -180,7 +174,9 @@ async fn dav_arbiter_handler(
     // Proxied subtrees take precedence over the SEARCH/REPORT rule so a
     // SEARCH against e.g. /remote.php/dav/versions behaves as it did with
     // the explicit any()-method proxy routes.
-    if PROXIED_DAV_SUBTREES.iter().any(|p| remainder.starts_with(p))
+    if PROXIED_DAV_SUBTREES
+        .iter()
+        .any(|p| remainder.starts_with(p))
         || matches!(method, "SEARCH" | "REPORT")
     {
         if let Some(ref fpm) = state.fastcgi {
@@ -306,7 +302,10 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
         //   /mount/{*path}  — one or more path segments
         .route("/remote.php/dav", axum::routing::any(dav_arbiter_handler))
         .route("/remote.php/dav/", axum::routing::any(dav_arbiter_handler))
-        .route("/remote.php/dav/{*path}", axum::routing::any(dav_arbiter_handler))
+        .route(
+            "/remote.php/dav/{*path}",
+            axum::routing::any(dav_arbiter_handler),
+        )
         .route("/dav", axum::routing::any(dav_arbiter_handler))
         .route("/dav/", axum::routing::any(dav_arbiter_handler))
         .route("/dav/{*path}", axum::routing::any(dav_arbiter_handler))
@@ -357,5 +356,5 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
         http_middleware_stack,
     ))
     .layer(trace_layer)
-        .with_state(state)
+    .with_state(state)
 }

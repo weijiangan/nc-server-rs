@@ -85,24 +85,23 @@ pub async fn lookup_bearer(
     let hash_hex = hex::encode(hash);
     let table = format!("{prefix}authtoken");
 
-    let row: Option<(i64, String, i16, String, Option<i64>, i64)> =
-        match sqlx::query_as(&format!(
-            "SELECT id, uid, type, scope, expires, last_activity \
+    let row: Option<(i64, String, i16, String, Option<i64>, i64)> = match sqlx::query_as(&format!(
+        "SELECT id, uid, type, scope, expires, last_activity \
                  FROM {table} WHERE token = $1"
-        ))
-        .bind(&hash_hex)
-        .fetch_optional(pool)
-        .await
-        {
-            Ok(row) => row,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "bearer token lookup query failed — treating as token not found"
-                );
-                return None;
-            }
-        };
+    ))
+    .bind(&hash_hex)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "bearer token lookup query failed — treating as token not found"
+            );
+            return None;
+        }
+    };
 
     let (id, uid, token_type, scope, expires, last_activity) = row?;
 

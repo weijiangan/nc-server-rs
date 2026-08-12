@@ -28,11 +28,15 @@ pub async fn status(State(state): State<AppState>) -> Response {
     // `$OC_VersionString = '34.0.1'`).  We already parse the dotted version from
     // `config.php` ($CONFIG['version']).  Derive the human-readable string by
     // dropping the last component — `34.0.1.2` → `34.0.1`.
-    let version = state.nc_config.version.clone()
+    let version = state
+        .nc_config
+        .version
+        .clone()
         .or_else(|| ac.get_string("core", "oc_version"))
         .or_else(|| ac.get_string("core", "version"))
         .unwrap_or_else(|| "0.0.0.0".to_string());
-    let version_string = version.rfind('.')
+    let version_string = version
+        .rfind('.')
         .map(|pos| version[..pos].to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Unknown".to_string());

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-mod handlers;
 mod client_identity;
+mod handlers;
 mod middleware;
 mod preview;
 mod preview_gen;
@@ -69,9 +69,13 @@ async fn main() -> anyhow::Result<()> {
     // (read_dir, get_props, open) never re-looks them up per request.  The
     // mime cache is warm from `load_mime_cache`; the one-time INSERT runs
     // only if the rows are missing.
-    let dir_mime_id =
-        nc_db::mime::get_or_insert_mime_id(&pool, &table_prefix, &mime_cache, "httpd/unix-directory")
-            .await;
+    let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
+        &pool,
+        &table_prefix,
+        &mime_cache,
+        "httpd/unix-directory",
+    )
+    .await;
     let dir_mimepart_id =
         nc_db::mime::get_or_insert_mime_id(&pool, &table_prefix, &mime_cache, "httpd").await;
     let storage_cache: nc_dav::SharedStorageCache =
@@ -201,8 +205,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Phase 11.1: preview provider registry ────────────────────────────────
     // Resolve enabledPreviewProviders gating + binary/Imaginary availability once
     // at startup (includes a one-time $PATH search for ffmpeg/LibreOffice).
-    let preview_registry =
-        std::sync::Arc::new(nc_dav::ProviderRegistry::from_config(&config));
+    let preview_registry = std::sync::Arc::new(nc_dav::ProviderRegistry::from_config(&config));
 
     // ── Phase 11.4/11.5: native preview generation service ──────────────────
     // Builds the (optional) Imaginary backend, snowflake generator, admission
@@ -274,8 +277,8 @@ async fn main() -> anyhow::Result<()> {
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("HTTP server error")?;
+    .await
+    .context("HTTP server error")?;
 
     tracing::info!("Server shut down cleanly");
     Ok(())

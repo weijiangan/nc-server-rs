@@ -31,5 +31,8 @@ fn main() {
     let shim_path = std::path::Path::new(&share_dir)
         .join("php-shim")
         .join("index.php");
-    println!("cargo:rustc-env=NC_DEFAULT_SHIM_PATH={}", shim_path.display());
+    println!(
+        "cargo:rustc-env=NC_DEFAULT_SHIM_PATH={}",
+        shim_path.display()
+    );
 }

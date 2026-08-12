@@ -157,9 +157,7 @@ pub fn assert_table_parity(sut: &Snapshot, oracle: &Snapshot) -> Result<()> {
         .filter(|k| !sut.tables.contains_key(*k))
         .collect();
     if !sut_only.is_empty() || !oracle_only.is_empty() {
-        bail!(
-            "table-set mismatch:\n  SUT-only:    {sut_only:?}\n  oracle-only: {oracle_only:?}"
-        );
+        bail!("table-set mismatch:\n  SUT-only:    {sut_only:?}\n  oracle-only: {oracle_only:?}");
     }
     Ok(())
 }

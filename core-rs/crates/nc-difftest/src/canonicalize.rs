@@ -86,7 +86,10 @@ impl Registry {
     /// client-dictated value such as `X-OC-Mtime` is deterministic, so the
     /// scenario may promote a masked timestamp column to `stable`).
     pub fn set_class(&mut self, table: &str, col: &str, class: Class) {
-        self.tables.entry(table.to_string()).or_default().insert(col.to_string(), class);
+        self.tables
+            .entry(table.to_string())
+            .or_default()
+            .insert(col.to_string(), class);
     }
 }
 
@@ -116,36 +119,72 @@ struct TableSpec {
 }
 
 const SPECS: &[TableSpec] = &[
-    TableSpec { name: "oc_storages", pk: "numeric_id", key: &[KeyPart::Col("id")] },
-    TableSpec { name: "oc_mimetypes", pk: "id", key: &[KeyPart::Col("mimetype")] },
+    TableSpec {
+        name: "oc_storages",
+        pk: "numeric_id",
+        key: &[KeyPart::Col("id")],
+    },
+    TableSpec {
+        name: "oc_mimetypes",
+        pk: "id",
+        key: &[KeyPart::Col("mimetype")],
+    },
     TableSpec {
         name: "oc_filecache",
         pk: "fileid",
         key: &[KeyPart::FkCol("storage"), KeyPart::Col("path")],
     },
-    TableSpec { name: "oc_filecache_extended", pk: "fileid", key: &[KeyPart::FkCol("fileid")] },
-    TableSpec { name: "oc_files_metadata", pk: "id", key: &[KeyPart::FkCol("file_id")] },
+    TableSpec {
+        name: "oc_filecache_extended",
+        pk: "fileid",
+        key: &[KeyPart::FkCol("fileid")],
+    },
+    TableSpec {
+        name: "oc_files_metadata",
+        pk: "id",
+        key: &[KeyPart::FkCol("file_id")],
+    },
     TableSpec {
         name: "oc_properties",
         pk: "id",
-        key: &[KeyPart::Col("userid"), KeyPart::Col("propertypath"), KeyPart::Col("propertyname")],
+        key: &[
+            KeyPart::Col("userid"),
+            KeyPart::Col("propertypath"),
+            KeyPart::Col("propertyname"),
+        ],
     },
     TableSpec {
         name: "oc_files_trash",
         pk: "auto_id",
-        key: &[KeyPart::Col("user"), KeyPart::Col("location"), KeyPart::Col("type"), KeyPart::Col("mime")],
+        key: &[
+            KeyPart::Col("user"),
+            KeyPart::Col("location"),
+            KeyPart::Col("type"),
+            KeyPart::Col("mime"),
+        ],
     },
     // One version row per (file) for the scenarios considered; a file with
     // multiple same-size versions would need `timestamp` in the key, but that is
     // volatile — revisit when a versioning scenario lands.
-    TableSpec { name: "oc_files_versions", pk: "id", key: &[KeyPart::FkCol("file_id")] },
-    TableSpec { name: "oc_preview_generation", pk: "id", key: &[KeyPart::FkCol("file_id")] },
+    TableSpec {
+        name: "oc_files_versions",
+        pk: "id",
+        key: &[KeyPart::FkCol("file_id")],
+    },
+    TableSpec {
+        name: "oc_preview_generation",
+        pk: "id",
+        key: &[KeyPart::FkCol("file_id")],
+    },
     // Phase 16.11: preview row shape. `oc_preview_locations` first (oc_previews
     // references it via location_id).
     TableSpec {
         name: "oc_preview_locations",
         pk: "id",
-        key: &[KeyPart::Col("bucket_name"), KeyPart::Col("object_store_name")],
+        key: &[
+            KeyPart::Col("bucket_name"),
+            KeyPart::Col("object_store_name"),
+        ],
     },
     // The key mirrors the live unique index `previews_file_uniq_idx`
     // (file_id, width, height, mimetype_id, cropped, version_id). `max` is
@@ -188,14 +227,22 @@ const SPECS: &[TableSpec] = &[
     TableSpec {
         name: "oc_vcategory",
         pk: "id",
-        key: &[KeyPart::Col("uid"), KeyPart::Col("type"), KeyPart::Col("category")],
+        key: &[
+            KeyPart::Col("uid"),
+            KeyPart::Col("type"),
+            KeyPart::Col("category"),
+        ],
     },
     // Composite PK (categoryid, objid, type); leaf table — nothing references
     // it, so the empty `pk` (no single-column identity) is fine.
     TableSpec {
         name: "oc_vcategory_to_object",
         pk: "",
-        key: &[KeyPart::FkCol("objid"), KeyPart::FkCol("categoryid"), KeyPart::Col("type")],
+        key: &[
+            KeyPart::FkCol("objid"),
+            KeyPart::FkCol("categoryid"),
+            KeyPart::Col("type"),
+        ],
     },
 ];
 
@@ -247,7 +294,9 @@ impl Canonicalizer {
 
         // Pass 1: configured diff-set tables, in topological order.
         for spec in SPECS {
-            let Some(td) = snap.tables.get(spec.name) else { continue };
+            let Some(td) = snap.tables.get(spec.name) else {
+                continue;
+            };
             let col_idx = column_index(td);
             let mut pk_map: HashMap<String, String> = HashMap::new();
             let mut by_key: BTreeMap<String, BTreeMap<String, Option<String>>> = BTreeMap::new();
@@ -465,11 +514,18 @@ fn strip_volatile_path_suffixes(path: &str) -> String {
 }
 
 fn column_index(td: &TableData) -> HashMap<String, usize> {
-    td.columns.iter().enumerate().map(|(i, c)| (c.clone(), i)).collect()
+    td.columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.clone(), i))
+        .collect()
 }
 
 fn cell(row: &[Option<String>], col_idx: &HashMap<String, usize>, col: &str) -> Option<String> {
-    col_idx.get(col).and_then(|&i| row.get(i).cloned()).flatten()
+    col_idx
+        .get(col)
+        .and_then(|&i| row.get(i).cloned())
+        .flatten()
 }
 
 #[cfg(test)]
@@ -479,8 +535,11 @@ mod tests {
     use crate::delta;
 
     fn registry() -> Registry {
-        Registry::load(&format!("{}/column_registry.yaml", env!("CARGO_MANIFEST_DIR")))
-            .expect("column_registry.yaml loads")
+        Registry::load(&format!(
+            "{}/column_registry.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("column_registry.yaml loads")
     }
 
     fn storages_table(numeric_id: &str) -> TableData {
@@ -526,7 +585,8 @@ mod tests {
 
     fn snap_with(storage_nid: &str, fc: Vec<[&str; 9]>) -> Snapshot {
         let mut s = Snapshot::default();
-        s.tables.insert("oc_storages".into(), storages_table(storage_nid));
+        s.tables
+            .insert("oc_storages".into(), storages_table(storage_nid));
         if !fc.is_empty() {
             s.tables.insert("oc_filecache".into(), filecache_table(fc));
         }
@@ -537,8 +597,14 @@ mod tests {
     fn id_offset_hidden() {
         let canon = Canonicalizer::new(registry());
         // Identical logical state, different id sequences + FK ripple.
-        let a = snap_with("1", vec![["10", "1", "files/x", "x", "5", "100", "100", "e1", "27"]]);
-        let b = snap_with("99", vec![["500", "99", "files/x", "x", "5", "100", "100", "e1", "27"]]);
+        let a = snap_with(
+            "1",
+            vec![["10", "1", "files/x", "x", "5", "100", "100", "e1", "27"]],
+        );
+        let b = snap_with(
+            "99",
+            vec![["500", "99", "files/x", "x", "5", "100", "100", "e1", "27"]],
+        );
         let ca = canon.canonicalize(&a).unwrap();
         let cb = canon.canonicalize(&b).unwrap();
         assert_eq!(
@@ -550,7 +616,10 @@ mod tests {
     #[test]
     fn natural_key_mismatch_reported() {
         let canon = Canonicalizer::new(registry());
-        let with = snap_with("1", vec![["10", "1", "files/x", "x", "5", "100", "100", "e1", "27"]]);
+        let with = snap_with(
+            "1",
+            vec![["10", "1", "files/x", "x", "5", "100", "100", "e1", "27"]],
+        );
         let without = snap_with("1", vec![]);
         let c_with = canon.canonicalize(&with).unwrap();
         let c_without = canon.canonicalize(&without).unwrap();
@@ -609,32 +678,55 @@ mod tests {
     #[test]
     fn preview_snowflake_offset_hidden_shape_mismatch_reported() {
         let canon = Canonicalizer::new(registry());
-        let preview_row =
-            |id: &'static str, fid: &'static str, sid: &'static str, mid: &'static str, w: &'static str| {
-                [
-                    Some(id),
-                    Some(fid),
-                    Some(sid),
-                    None,
-                    None,
-                    Some(w),
-                    Some("200"),
-                    Some(mid),
-                    Some(mid),
-                    Some("t"),
-                    Some("f"),
-                    Some("f"),
-                    Some("e1"),
-                    Some("1700"),
-                    Some("828"),
-                    Some("-1"),
-                ]
-            };
-        let snap = |nid: &'static str, fid: &'static str, mid: &'static str, pid: &'static str, w: &'static str| {
-            let mut s = snap_with(nid, vec![(
-                [fid, nid, "files/img.png", "img.png", "1270", "1700", "1700", "e1", "27"]
-            )]);
-            s.tables.insert("oc_mimetypes".into(), mimetypes_table(vec![[mid, "image/png"]]));
+        let preview_row = |id: &'static str,
+                           fid: &'static str,
+                           sid: &'static str,
+                           mid: &'static str,
+                           w: &'static str| {
+            [
+                Some(id),
+                Some(fid),
+                Some(sid),
+                None,
+                None,
+                Some(w),
+                Some("200"),
+                Some(mid),
+                Some(mid),
+                Some("t"),
+                Some("f"),
+                Some("f"),
+                Some("e1"),
+                Some("1700"),
+                Some("828"),
+                Some("-1"),
+            ]
+        };
+        let snap = |nid: &'static str,
+                    fid: &'static str,
+                    mid: &'static str,
+                    pid: &'static str,
+                    w: &'static str| {
+            let mut s = snap_with(
+                nid,
+                vec![
+                    ([
+                        fid,
+                        nid,
+                        "files/img.png",
+                        "img.png",
+                        "1270",
+                        "1700",
+                        "1700",
+                        "e1",
+                        "27",
+                    ]),
+                ],
+            );
+            s.tables.insert(
+                "oc_mimetypes".into(),
+                mimetypes_table(vec![[mid, "image/png"]]),
+            );
             s.tables.insert(
                 "oc_previews".into(),
                 previews_table(vec![preview_row(pid, fid, nid, mid, w)]),
@@ -664,7 +756,10 @@ mod tests {
     fn put_delta(mtime: &str, smtime: &str) -> delta::Delta {
         let canon = Canonicalizer::new(registry());
         let before = snap_with("1", vec![]);
-        let after = snap_with("1", vec![["10", "1", "files/x", "x", "5", mtime, smtime, "e1", "27"]]);
+        let after = snap_with(
+            "1",
+            vec![["10", "1", "files/x", "x", "5", mtime, smtime, "e1", "27"]],
+        );
         let cb = canon.canonicalize(&before).unwrap();
         let ca = canon.canonicalize(&after).unwrap();
         delta::normalize_delta(delta::delta(&cb, &ca), &canon.registry)
@@ -674,9 +769,15 @@ mod tests {
     fn timestamp_equality_preserved() {
         let d1 = put_delta("100", "100"); // mtime == storage_mtime
         let d2 = put_delta("999", "999"); // equal pair, different absolute value
-        assert_eq!(d1, d2, "equal timestamp pairs must canonicalize identically");
+        assert_eq!(
+            d1, d2,
+            "equal timestamp pairs must canonicalize identically"
+        );
         let d3 = put_delta("999", "1000"); // mtime != storage_mtime
-        assert_ne!(d1, d3, "a broken timestamp-equality relationship must still be caught");
+        assert_ne!(
+            d1, d3,
+            "a broken timestamp-equality relationship must still be caught"
+        );
     }
 
     /// Two files sharing an etag on both sides -> same sentinel; distinct -> not.
@@ -699,9 +800,15 @@ mod tests {
     fn volatile_equality_preserved() {
         let shared_a = etag_delta("X", "X"); // equal etags
         let shared_b = etag_delta("Y", "Y"); // equal etags, different absolute
-        assert_eq!(shared_a, shared_b, "equal etags must stay equal after masking");
+        assert_eq!(
+            shared_a, shared_b,
+            "equal etags must stay equal after masking"
+        );
         let distinct = etag_delta("Y", "Z"); // distinct etags
-        assert_ne!(shared_a, distinct, "distinct etags must stay distinct after masking");
+        assert_ne!(
+            shared_a, distinct,
+            "distinct etags must stay distinct after masking"
+        );
     }
 
     #[test]
@@ -776,12 +883,20 @@ mod tests {
         ];
         let (known, unlisted) = inv.match_run("10_put_get", &divs);
         assert_eq!(known.len(), 2, "root-size + noise must match");
-        assert_eq!(unlisted.len(), 1, "the size column is not covered by the noise record");
+        assert_eq!(
+            unlisted.len(),
+            1,
+            "the size column is not covered by the noise record"
+        );
         assert_eq!(unlisted[0].key, "home::adminfiles/hello.txt");
 
         // Same divergences in a scenario the root-size record does not list.
         let (known2, _) = inv.match_run("99_other", &divs);
-        assert_eq!(known2.len(), 1, "only the scenario-less noise record matches");
+        assert_eq!(
+            known2.len(),
+            1,
+            "only the scenario-less noise record matches"
+        );
     }
 
     #[test]
@@ -846,28 +961,68 @@ mod tests {
     fn share_id_offset_and_parent_remap_hidden() {
         let canon = Canonicalizer::new(registry());
         let media = |fid: &'static str, nid: &'static str| -> [&'static str; 9] {
-            [fid, nid, "files/Media", "Media", "100", "100", "100", "e1", "31"]
+            [
+                fid,
+                nid,
+                "files/Media",
+                "Media",
+                "100",
+                "100",
+                "100",
+                "e1",
+                "31",
+            ]
         };
-        let group_and_child = |gid: &'static str, cid: &'static str, fid: &'static str|
-            -> Vec<[Option<&'static str>; 14]> {
+        let group_and_child = |gid: &'static str,
+                               cid: &'static str,
+                               fid: &'static str|
+         -> Vec<[Option<&'static str>; 14]> {
             vec![
                 [
-                    Some(gid), Some("1"), Some("admin"), Some("admin"), Some("admin"),
-                    None, Some("folder"), Some(fid), Some(fid), Some("/Media"),
-                    Some("31"), Some("100"), Some("0"), None,
+                    Some(gid),
+                    Some("1"),
+                    Some("admin"),
+                    Some("admin"),
+                    Some("admin"),
+                    None,
+                    Some("folder"),
+                    Some(fid),
+                    Some(fid),
+                    Some("/Media"),
+                    Some("31"),
+                    Some("100"),
+                    Some("0"),
+                    None,
                 ],
                 [
-                    Some(cid), Some("2"), Some("admin"), Some("admin"), Some("admin"),
-                    Some(gid), Some("folder"), Some(fid), Some(fid), Some("/Media"),
-                    Some("31"), Some("100"), Some("1"), None,
+                    Some(cid),
+                    Some("2"),
+                    Some("admin"),
+                    Some("admin"),
+                    Some("admin"),
+                    Some(gid),
+                    Some("folder"),
+                    Some(fid),
+                    Some(fid),
+                    Some("/Media"),
+                    Some("31"),
+                    Some("100"),
+                    Some("1"),
+                    None,
                 ],
             ]
         };
 
         let mut a = snap_with("1", vec![media("3", "1")]);
-        a.tables.insert("oc_share".into(), share_table(group_and_child("1", "2", "3")));
+        a.tables.insert(
+            "oc_share".into(),
+            share_table(group_and_child("1", "2", "3")),
+        );
         let mut b = snap_with("99", vec![media("55", "99")]);
-        b.tables.insert("oc_share".into(), share_table(group_and_child("41", "42", "55")));
+        b.tables.insert(
+            "oc_share".into(),
+            share_table(group_and_child("41", "42", "55")),
+        );
 
         let ca = canon.canonicalize(&a).unwrap();
         let cb = canon.canonicalize(&b).unwrap();
@@ -879,7 +1034,11 @@ mod tests {
         // The group parent and its USERGROUP child must land on DISTINCT natural
         // keys even though share_with is the same string ("admin" user vs group).
         let shares = &ca.tables["oc_share"];
-        assert_eq!(shares.len(), 2, "group parent + usergroup child are two rows");
+        assert_eq!(
+            shares.len(),
+            2,
+            "group parent + usergroup child are two rows"
+        );
     }
 
     /// Trashed/versioned filecache rows whose paths differ only in the
@@ -951,21 +1110,54 @@ mod tests {
         let rows = |child_parent: &'static str| -> Vec<[Option<&'static str>; 14]> {
             vec![
                 [
-                    Some("1"), Some("1"), Some("admin"), Some("admin"), Some("admin"),
-                    None, Some("folder"), Some("3"), Some("3"), Some("/Media"),
-                    Some("31"), Some("100"), Some("0"), None,
+                    Some("1"),
+                    Some("1"),
+                    Some("admin"),
+                    Some("admin"),
+                    Some("admin"),
+                    None,
+                    Some("folder"),
+                    Some("3"),
+                    Some("3"),
+                    Some("/Media"),
+                    Some("31"),
+                    Some("100"),
+                    Some("0"),
+                    None,
                 ],
                 // Second group share (a different natural key) the child could
                 // wrongly point at.
                 [
-                    Some("9"), Some("1"), Some("admin"), Some("admin"), Some("admin"),
-                    None, Some("folder"), Some("3"), Some("3"), Some("/Other"),
-                    Some("31"), Some("100"), Some("0"), None,
+                    Some("9"),
+                    Some("1"),
+                    Some("admin"),
+                    Some("admin"),
+                    Some("admin"),
+                    None,
+                    Some("folder"),
+                    Some("3"),
+                    Some("3"),
+                    Some("/Other"),
+                    Some("31"),
+                    Some("100"),
+                    Some("0"),
+                    None,
                 ],
                 [
-                    Some("2"), Some("2"), Some("admin"), Some("admin"), Some("admin"),
-                    Some(child_parent), Some("folder"), Some("3"), Some("3"), Some("/Media"),
-                    Some("31"), Some("100"), Some("1"), None,
+                    Some("2"),
+                    Some("2"),
+                    Some("admin"),
+                    Some("admin"),
+                    Some("admin"),
+                    Some(child_parent),
+                    Some("folder"),
+                    Some("3"),
+                    Some("3"),
+                    Some("/Media"),
+                    Some("31"),
+                    Some("100"),
+                    Some("1"),
+                    None,
                 ],
             ]
         };

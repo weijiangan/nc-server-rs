@@ -1,3 +1,4 @@
+use regex_lite::Regex;
 /// Rules for determining whether a CSRF check should be skipped.
 ///
 /// Implements REQ §4.3 and §4.4.
@@ -10,9 +11,7 @@
 ///
 /// Everything else (browser POST with session cookie) requires a valid CSRF
 /// token in the `requesttoken` header or form field.
-
 use std::sync::OnceLock;
-use regex_lite::Regex;
 
 /// Compiled UA patterns from REQ §4.4.
 /// Using `OnceLock` for lazy init without a dependency on `once_cell`.
@@ -23,7 +22,8 @@ fn ua_patterns() -> &'static [Regex] {
             // Desktop (mirall / csyncoC)
             Regex::new(r"^Mozilla/5\.0 \([A-Za-z ]+\) (?:mirall|csyncoC)/([^ ]*).*$").unwrap(),
             // Android
-            Regex::new(r"^Mozilla/5\.0 \(Android\) (?:ownCloud|Nextcloud)-android/([^ ]*).*$").unwrap(),
+            Regex::new(r"^Mozilla/5\.0 \(Android\) (?:ownCloud|Nextcloud)-android/([^ ]*).*$")
+                .unwrap(),
             // iOS
             Regex::new(r"^Mozilla/5\.0 \(iOS\) (?:ownCloud|Nextcloud)-iOS/([^ ]*).*$").unwrap(),
         ]
@@ -94,17 +94,23 @@ mod tests {
     fn sync_client_ua_skips() {
         // Desktop
         assert!(should_skip_csrf(
-            "POST", false, false,
+            "POST",
+            false,
+            false,
             "Mozilla/5.0 (Linux) mirall/3.1.0 (some info)"
         ));
         // Android
         assert!(should_skip_csrf(
-            "POST", false, false,
+            "POST",
+            false,
+            false,
             "Mozilla/5.0 (Android) Nextcloud-android/4.0.0"
         ));
         // iOS
         assert!(should_skip_csrf(
-            "POST", false, false,
+            "POST",
+            false,
+            false,
             "Mozilla/5.0 (iOS) Nextcloud-iOS/4.0.0"
         ));
     }
@@ -113,14 +119,21 @@ mod tests {
     fn generic_nextcloud_ua_does_not_skip() {
         // A bare "Nextcloud" in UA without the correct pattern should NOT skip.
         assert!(!should_skip_csrf(
-            "POST", false, false,
+            "POST",
+            false,
+            false,
             "Nextcloud SomeOtherClient/1.0"
         ));
     }
 
     #[test]
     fn browser_post_requires_csrf() {
-        assert!(!should_skip_csrf("POST", false, false, "Mozilla/5.0 (X11; Linux)"));
+        assert!(!should_skip_csrf(
+            "POST",
+            false,
+            false,
+            "Mozilla/5.0 (X11; Linux)"
+        ));
     }
 
     #[test]

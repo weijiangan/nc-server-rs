@@ -73,12 +73,7 @@ impl PreviewRow {
 
     /// Absolute path to this preview's bytes (`LocalPreviewStorage::constructPath`).
     pub fn byte_path(&self, datadir: &Path, instanceid: &str, output_mime: &str) -> PathBuf {
-        preview_byte_path(
-            datadir,
-            instanceid,
-            self.file_id,
-            &self.name(output_mime),
-        )
+        preview_byte_path(datadir, instanceid, self.file_id, &self.name(output_mime))
     }
 
     /// PHP `array_find` match (`Generator.php:168-170`): a row satisfies a request
@@ -105,8 +100,7 @@ impl PreviewRow {
 /// the first row with `max == true` whose version matches).  Returns `None` when no
 /// max row exists yet — the caller then generates one (11.4).
 pub fn find_max(rows: &[PreviewRow], version_id: i64) -> Option<&PreviewRow> {
-    rows.iter()
-        .find(|r| r.max && r.version_id == version_id)
+    rows.iter().find(|r| r.max && r.version_id == version_id)
 }
 
 /// Find a cached variant matching the bucketed request (`generatePreviews`'s
@@ -146,7 +140,7 @@ pub fn find_match(
 /// identical whether a hit (Rust) or a miss (PHP-FPM) served it — keeping
 /// `If-None-Match` → `304` working across the hit/miss boundary.
 pub async fn load_preview_rows(pool: &DbPool, prefix: &str, file_id: i64) -> Vec<PreviewRow> {
-    let backend = backend_kind(pool).await;
+    let backend = backend_kind(pool);
     let sql = format!(
         "SELECT id, file_id, storage_id, width, height, mimetype_id, source_mimetype_id, \
          max, cropped, encrypted, {etag}, mtime, size, version_id \
@@ -208,22 +202,15 @@ enum Backend {
     Sqlite,
 }
 
-/// Detect the pool's backend once per process and cache it (`AnyConnection::
-/// backend_name`): the dialect is fixed for a running server, so this is a single
-/// branch on the hot path thereafter.  Anything that is not SQLite is PostgreSQL —
-/// the uncompromised first-class target, and the safe default on detection failure.
-async fn backend_kind(pool: &DbPool) -> Backend {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<Backend> = OnceLock::new();
-    if let Some(&b) = CACHED.get() {
-        return b;
+/// The pool's backend from the `DbPool` enum variant (PHASE-22 T3.2): the
+/// dialect is fixed for a running server, so the variant is the answer — no
+/// connection round trip, no cache needed.
+fn backend_kind(pool: &DbPool) -> Backend {
+    if pool.is_postgres() {
+        Backend::Postgres
+    } else {
+        Backend::Sqlite
     }
-    let b = match pool.acquire().await {
-        Ok(conn) if conn.backend_name().eq_ignore_ascii_case("sqlite") => Backend::Sqlite,
-        _ => Backend::Postgres,
-    };
-    let _ = CACHED.set(b);
-    b
 }
 
 /// The `etag` column projection for a backend (see [`load_preview_rows`] for why
@@ -339,16 +326,52 @@ mod tests {
         let cases: &[(i64, u32, u32, bool, bool, &str, &str)] = &[
             (-1, 1024, 768, false, false, "image/jpeg", "1024-768.jpg"),
             (-1, 256, 256, true, false, "image/png", "256-256-crop.png"),
-            (-1, 4096, 4096, false, true, "image/jpeg", "4096-4096-max.jpg"),
-            (-1, 512, 512, true, true, "image/webp", "512-512-crop-max.webp"),
+            (
+                -1,
+                4096,
+                4096,
+                false,
+                true,
+                "image/jpeg",
+                "4096-4096-max.jpg",
+            ),
+            (
+                -1,
+                512,
+                512,
+                true,
+                true,
+                "image/webp",
+                "512-512-crop-max.webp",
+            ),
             (-1, 64, 64, false, false, "image/gif", "64-64.gif"),
             // svg output is stored as png
-            (-1, 200, 200, true, true, "image/svg+xml", "200-200-crop-max.png"),
+            (
+                -1,
+                200,
+                200,
+                true,
+                true,
+                "image/svg+xml",
+                "200-200-crop-max.png",
+            ),
             // versioned (object-store/S3 — out of scope, but the naming is faithful)
-            (1759276800, 300, 300, false, false, "image/jpeg", "1759276800-300-300.jpg"),
+            (
+                1759276800,
+                300,
+                300,
+                false,
+                false,
+                "image/jpeg",
+                "1759276800-300-300.jpg",
+            ),
         ];
         for &(v, w, h, crop, max, mime, exp) in cases {
-            assert_eq!(preview_name(v, w, h, crop, max, mime), exp, "name({v},{w},{h},{crop},{max},{mime})");
+            assert_eq!(
+                preview_name(v, w, h, crop, max, mime),
+                exp,
+                "name({v},{w},{h},{crop},{max},{mime})"
+            );
         }
     }
 
@@ -367,12 +390,7 @@ mod tests {
 
     #[test]
     fn byte_path_layout() {
-        let p = preview_byte_path(
-            Path::new("/data"),
-            "oc123",
-            123,
-            "256-256-crop.png",
-        );
+        let p = preview_byte_path(Path::new("/data"), "oc123", 123, "256-256-crop.png");
         assert_eq!(
             p,
             PathBuf::from("/data/appdata_oc123/preview/2/0/2/c/b/9/6/123/256-256-crop.png")
@@ -446,7 +464,10 @@ mod tests {
         ];
         // (256,256,cropped,jpeg,-1) → the cropped jpeg variant.
         let m = find_match(&rows, 256, 256, true, jpeg, -1).expect("match");
-        assert_eq!((m.width, m.height, m.cropped, m.mimetype_id), (256, 256, true, jpeg));
+        assert_eq!(
+            (m.width, m.height, m.cropped, m.mimetype_id),
+            (256, 256, true, jpeg)
+        );
         // uncropped variant
         let m2 = find_match(&rows, 256, 256, false, jpeg, -1).expect("match");
         assert!(!m2.cropped && !m2.max);
@@ -491,14 +512,15 @@ mod tests {
 
     #[tokio::test]
     async fn load_preview_rows_roundtrip() {
-        sqlx::any::install_default_drivers();
         // max_connections(1): a SQLite in-memory DB is per-connection, so a single
         // connection keeps the schema visible across the CREATE and the SELECT.
-        let pool = sqlx::any::AnyPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
+        let pool = DbPool::Sqlite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
         // oc_previews per REQ §9.10.  The boolean columns are declared INTEGER (not
         // BOOLEAN) because sqlx's `Any` driver cannot decode a SQLite boolean — on
         // SQLite they are read as integers (see `get_bool`); on PostgreSQL the
@@ -532,22 +554,58 @@ mod tests {
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,$11,$12,$13)";
         // max row for file 123
         sqlx::query(insert)
-            .bind(101i64).bind(123i64).bind(1i64).bind(4096i64).bind(4096i64)
-            .bind(5i32).bind(9i32).bind(true).bind(false)
-            .bind("srcetag").bind(1_700_000_000i64).bind(99_999i64).bind(-1i64)
-            .execute(&pool).await.unwrap();
+            .bind(101i64)
+            .bind(123i64)
+            .bind(1i64)
+            .bind(4096i64)
+            .bind(4096i64)
+            .bind(5i32)
+            .bind(9i32)
+            .bind(true)
+            .bind(false)
+            .bind("srcetag")
+            .bind(1_700_000_000i64)
+            .bind(99_999i64)
+            .bind(-1i64)
+            .execute(&pool)
+            .await
+            .unwrap();
         // derived cropped 256x256 for file 123
         sqlx::query(insert)
-            .bind(102i64).bind(123i64).bind(1i64).bind(256i64).bind(256i64)
-            .bind(5i32).bind(9i32).bind(false).bind(true)
-            .bind("srcetag").bind(1_700_000_001i64).bind(4096i64).bind(-1i64)
-            .execute(&pool).await.unwrap();
+            .bind(102i64)
+            .bind(123i64)
+            .bind(1i64)
+            .bind(256i64)
+            .bind(256i64)
+            .bind(5i32)
+            .bind(9i32)
+            .bind(false)
+            .bind(true)
+            .bind("srcetag")
+            .bind(1_700_000_001i64)
+            .bind(4096i64)
+            .bind(-1i64)
+            .execute(&pool)
+            .await
+            .unwrap();
         // a different file's row — must not be returned
         sqlx::query(insert)
-            .bind(103i64).bind(999i64).bind(1i64).bind(64i64).bind(64i64)
-            .bind(5i32).bind(9i32).bind(true).bind(false)
-            .bind("x").bind(1i64).bind(1i64).bind(-1i64)
-            .execute(&pool).await.unwrap();
+            .bind(103i64)
+            .bind(999i64)
+            .bind(1i64)
+            .bind(64i64)
+            .bind(64i64)
+            .bind(5i32)
+            .bind(9i32)
+            .bind(true)
+            .bind(false)
+            .bind("x")
+            .bind(1i64)
+            .bind(1i64)
+            .bind(-1i64)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let rows = load_preview_rows(&pool, "oc_", 123).await;
         assert_eq!(rows.len(), 2, "only file 123's rows");
@@ -556,9 +614,9 @@ mod tests {
         assert_eq!(max.id, 101);
         assert!(max.max);
         assert_eq!((max.width, max.height), (4096, 4096));
-        assert_eq!(max.etag, "srcetag");   // source etag at generation
+        assert_eq!(max.etag, "srcetag"); // source etag at generation
         assert_eq!(max.mtime, 1_700_000_000); // generation timestamp
-        assert_eq!(max.version_id, -1);    // un-versioned (local disk)
+        assert_eq!(max.version_id, -1); // un-versioned (local disk)
         assert!(!max.encrypted);
 
         // the derived cropped 256x256 jpeg matches; the max row's output mime is the key

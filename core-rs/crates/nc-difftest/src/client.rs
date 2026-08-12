@@ -95,7 +95,8 @@ impl NextcloudClient {
     }
 
     pub async fn get(&self, path: &str) -> Result<Response> {
-        self.request(Method::GET, path, HeaderMap::new(), None).await
+        self.request(Method::GET, path, HeaderMap::new(), None)
+            .await
     }
 
     pub async fn delete(&self, path: &str, headers: HeaderMap) -> Result<Response> {
@@ -103,7 +104,8 @@ impl NextcloudClient {
     }
 
     pub async fn mkcol(&self, path: &str) -> Result<Response> {
-        self.request(method("MKCOL")?, path, HeaderMap::new(), None).await
+        self.request(method("MKCOL")?, path, HeaderMap::new(), None)
+            .await
     }
 
     pub async fn move_(&self, from: &str, to: &str) -> Result<Response> {
@@ -129,7 +131,10 @@ impl NextcloudClient {
     pub async fn share_create(&self, params: &[(String, String)]) -> Result<Response> {
         let mut h = HeaderMap::new();
         h.insert("OCS-APIRequest", HeaderValue::from_static("true"));
-        h.insert(reqwest::header::ACCEPT, HeaderValue::from_static("application/json"));
+        h.insert(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
         // Without an explicit form Content-Type PHP never populates $_POST and
         // the controller rejects with "Please specify a file or folder path".
         h.insert(
@@ -167,12 +172,18 @@ impl NextcloudClient {
     pub async fn ocs_user_update(&self, user: &str, key: &str, value: &str) -> Result<Response> {
         let mut h = HeaderMap::new();
         h.insert("OCS-APIRequest", HeaderValue::from_static("true"));
-        h.insert(reqwest::header::ACCEPT, HeaderValue::from_static("application/json"));
+        h.insert(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
         h.insert(
             reqwest::header::CONTENT_TYPE,
             HeaderValue::from_static("application/x-www-form-urlencoded"),
         );
-        let body = form_urlencoded(&[("key".to_string(), key.to_string()), ("value".to_string(), value.to_string())]);
+        let body = form_urlencoded(&[
+            ("key".to_string(), key.to_string()),
+            ("value".to_string(), value.to_string()),
+        ]);
         self.request(
             Method::PUT,
             &format!("/ocs/v2.php/cloud/users/{user}?format=json"),

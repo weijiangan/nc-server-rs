@@ -108,7 +108,10 @@ pub async fn auth_check(
     let is_dav = is_dav_path(&path);
     // Phase 15 F2: the composite resolved the client identity (trusted-proxy
     // XFF walk); the throttle key must use it, not the raw header.
-    let client_ip = match req.extensions().get::<crate::client_identity::ClientIdentity>() {
+    let client_ip = match req
+        .extensions()
+        .get::<crate::client_identity::ClientIdentity>()
+    {
         Some(identity) => identity.ip.to_string(),
         None => {
             tracing::warn!("auth_check without a resolved ClientIdentity extension");
@@ -210,12 +213,9 @@ pub async fn auth_check(
                     // provider check and the admin-group check are cached per
                     // uid (60 s TTL); permanent app tokens are exempt from
                     // the 2FA gate.
-                    let user_state = nc_auth::cached_user_state(
-                        &cached.uid,
-                        &state.pool,
-                        &state.table_prefix,
-                    )
-                    .await;
+                    let user_state =
+                        nc_auth::cached_user_state(&cached.uid, &state.pool, &state.table_prefix)
+                            .await;
                     let user_state = match user_state {
                         Ok(s) => s,
                         Err(e) => {
@@ -425,9 +425,8 @@ pub async fn auth_check(
             // ── Session identity cache lookup (§7.9.5) ──────────────────────
             // Key: SHA-256(raw PHP session cookie value).
             let cache_key = nc_auth::make_cache_key(&raw_val);
-            let positive_ttl = std::time::Duration::from_secs(
-                state.nc_config.session_cache_ttl.unwrap_or(60),
-            );
+            let positive_ttl =
+                std::time::Duration::from_secs(state.nc_config.session_cache_ttl.unwrap_or(60));
             let identity = match nc_auth::cache_lookup(session_cache, &cache_key, positive_ttl) {
                 nc_auth::CacheLookup::Positive(cached) => cached,
                 // F3 (Wave 2.1): a fresh negative entry — a junk cookie or
@@ -443,12 +442,7 @@ pub async fn auth_check(
                     // Excess requests wait a bounded time, then fall through
                     // anonymous (the handler may still 401).
                     let sem = fpm.session_resolve_semaphore.clone();
-                    match tokio::time::timeout(
-                        RESOLVE_ACQUIRE_TIMEOUT,
-                        sem.acquire_owned(),
-                    )
-                    .await
-                    {
+                    match tokio::time::timeout(RESOLVE_ACQUIRE_TIMEOUT, sem.acquire_owned()).await {
                         Ok(Ok(_permit)) => {}
                         Ok(Err(e)) => {
                             tracing::warn!(error = %e, "session-resolve: semaphore closed");
@@ -634,12 +628,13 @@ mod tests {
 
     /// Same, with an explicit `nc_root` (the static-file whitelist resolves
     /// candidates against it).
-    async fn make_test_state_with_root(
-        instanceid: &str,
-        nc_root: std::path::PathBuf,
-    ) -> AppState {
-        sqlx::any::install_default_drivers();
-        let pool = sqlx::AnyPool::connect("sqlite::memory:").await.unwrap();
+    async fn make_test_state_with_root(instanceid: &str, nc_root: std::path::PathBuf) -> AppState {
+        let pool = DbPool::Sqlite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
         let appconfig_cache = Arc::new(RwLock::new(AppConfigCache::default()));
         let capability_cache = nc_ocs::load_capability_cache(&appconfig_cache, None);
         let nc_config = NcConfig {
@@ -891,10 +886,7 @@ mod tests {
     struct ScratchRoot(std::path::PathBuf);
     impl ScratchRoot {
         fn new(name: &str, files: &[(&str, &str)]) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "nc-static-{}-{name}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir().join(format!("nc-static-{}-{name}", std::process::id()));
             for (rel, content) in files {
                 let p = dir.join(rel);
                 std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -935,7 +927,10 @@ mod tests {
     #[tokio::test]
     async fn static_denies_data_directory() {
         let root = ScratchRoot::new("data-dir", &[("data/.ocdata", "x")]);
-        assert_eq!(static_request(&root, "/data/.ocdata").await, StatusCode::NOT_FOUND);
+        assert_eq!(
+            static_request(&root, "/data/.ocdata").await,
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// Root-level dotfiles (`.htaccess`, `.user.ini`, …) are not whitelisted
@@ -943,7 +938,10 @@ mod tests {
     #[tokio::test]
     async fn static_denies_dotfile_path() {
         let root = ScratchRoot::new("dotfile", &[(".htaccess", "x")]);
-        assert_eq!(static_request(&root, "/.htaccess").await, StatusCode::NOT_FOUND);
+        assert_eq!(
+            static_request(&root, "/.htaccess").await,
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// `3rdparty/` (PHP's bundled libraries) is not a whitelisted root — a

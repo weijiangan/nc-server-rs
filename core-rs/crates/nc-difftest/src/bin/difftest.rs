@@ -15,7 +15,10 @@ use nc_difftest::{
 };
 
 #[derive(Parser)]
-#[command(name = "difftest", about = "Differential integration-test harness (Phase 16)")]
+#[command(
+    name = "difftest",
+    about = "Differential integration-test harness (Phase 16)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -110,7 +113,10 @@ async fn snapshot_check(cfg: &Config) -> Result<()> {
         }
         anyhow::bail!("idle snapshot not stable — extend the skip-list/masking (Phase 16.5)");
     }
-    println!("idle double-snapshot: IDENTICAL ({} tables, quiesced)", sut.tables.len());
+    println!(
+        "idle double-snapshot: IDENTICAL ({} tables, quiesced)",
+        sut.tables.len()
+    );
 
     println!("snapshotting Oracle ({}) ...", cfg.oracle.dsn);
     let oracle = db::snapshot(&cfg.oracle.dsn).await?;
@@ -118,14 +124,21 @@ async fn snapshot_check(cfg: &Config) -> Result<()> {
     println!("table-set parity OK ({} tables each)", sut.tables.len());
 
     for t in ["oc_filecache", "oc_storages", "oc_mimetypes"] {
-        let s = sut.tables.get(t).with_context(|| format!("SUT missing {t}"))?;
+        let s = sut
+            .tables
+            .get(t)
+            .with_context(|| format!("SUT missing {t}"))?;
         let o = oracle
             .tables
             .get(t)
             .with_context(|| format!("oracle missing {t}"))?;
         anyhow::ensure!(!s.rows.is_empty(), "SUT {t} is empty");
         anyhow::ensure!(!o.rows.is_empty(), "oracle {t} is empty");
-        println!("  {t}: SUT {} rows, oracle {} rows", s.rows.len(), o.rows.len());
+        println!(
+            "  {t}: SUT {} rows, oracle {} rows",
+            s.rows.len(),
+            o.rows.len()
+        );
     }
 
     // Phase 16.8: the file tree must also be quiesced when idle.
@@ -137,7 +150,10 @@ async fn snapshot_check(cfg: &Config) -> Result<()> {
             t1 == t2,
             "{label} idle file-tree snapshot not stable — residual background writes"
         );
-        println!("  {label}: {} files, idle double-snapshot IDENTICAL", t1.len());
+        println!(
+            "  {label}: {} files, idle double-snapshot IDENTICAL",
+            t1.len()
+        );
     }
 
     println!("snapshot OK");
@@ -177,8 +193,12 @@ async fn quiesce_background(cfg: &Config) -> Result<()> {
                 .args([
                     "exec",
                     &inst.container,
-                    "sudo", "-E", "-u", "www-data",
-                    "php", "/var/www/html/occ",
+                    "sudo",
+                    "-E",
+                    "-u",
+                    "www-data",
+                    "php",
+                    "/var/www/html/occ",
                     "background-job:execute",
                     &job_id.to_string(),
                     "--force-execute",
@@ -193,8 +213,12 @@ async fn quiesce_background(cfg: &Config) -> Result<()> {
                 status = %o.status,
                 "background-job:execute exited non-zero"
             ),
-            Ok(Err(e)) => tracing::warn!(container = %inst.container, error = %e, "docker exec background-job:execute failed"),
-            Err(_) => tracing::warn!(container = %inst.container, "background-job:execute timed out after 60s"),
+            Ok(Err(e)) => {
+                tracing::warn!(container = %inst.container, error = %e, "docker exec background-job:execute failed")
+            }
+            Err(_) => {
+                tracing::warn!(container = %inst.container, "background-job:execute timed out after 60s")
+            }
         }
     }
     // No drainer registered anywhere (oc_jobs is shared) — the queue cannot
@@ -256,8 +280,10 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
     println!("[ops] replaying '{}' ({} ops) ...", sc.name, sc.ops.len());
     // Captured values are per-side: share ids (and any future captures) differ
     // between the SUT and Oracle DBs.
-    let (mut sut_vars, mut oracle_vars) =
-        (std::collections::HashMap::new(), std::collections::HashMap::new());
+    let (mut sut_vars, mut oracle_vars) = (
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+    );
     let sut_res = nc_difftest::scenario::run(&sut, &sc, &mut sut_vars).await?;
     let oracle_res = nc_difftest::scenario::run(&oracle, &sc, &mut oracle_vars).await?;
     let mut status_ok = true;
@@ -270,7 +296,10 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
                 a.op, a.status, b.status
             );
         } else if a.status != b.status {
-            println!("  STATUS MISMATCH {}: SUT {} vs oracle {}", a.op, a.status, b.status);
+            println!(
+                "  STATUS MISMATCH {}: SUT {} vs oracle {}",
+                a.op, a.status, b.status
+            );
             status_ok = false;
         } else {
             println!("  {}: {} == {}", a.op, a.status, b.status);
@@ -380,7 +409,10 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
                 );
             }
         }
-        println!("IDENTICAL: scenario '{}' produced matching deltas on both sides.", sc.name);
+        println!(
+            "IDENTICAL: scenario '{}' produced matching deltas on both sides.",
+            sc.name
+        );
         Ok(())
     } else {
         println!("DIVERGENCE in scenario '{}':", sc.name);

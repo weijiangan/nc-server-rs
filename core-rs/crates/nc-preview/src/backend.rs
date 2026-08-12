@@ -361,7 +361,15 @@ mod tests {
         // PHP default 'invalid' and '' mean "not configured" → no client.
         assert!(ImaginaryClient::new("", "", None, "80".into(), "80".into(), 50).is_none());
         assert!(ImaginaryClient::new("invalid", "", None, "80".into(), "80".into(), 50).is_none());
-        assert!(ImaginaryClient::new("http://localhost:9090", "", None, "80".into(), "80".into(), 50).is_some());
+        assert!(ImaginaryClient::new(
+            "http://localhost:9090",
+            "",
+            None,
+            "80".into(),
+            "80".into(),
+            50
+        )
+        .is_some());
     }
 
     #[test]
@@ -398,7 +406,10 @@ mod tests {
             .query_pairs()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
-        assert_eq!(pairs.get("operations").map(String::as_str), Some(ops.as_str()));
+        assert_eq!(
+            pairs.get("operations").map(String::as_str),
+            Some(ops.as_str())
+        );
         assert_eq!(pairs.get("key").map(String::as_str), Some("sekrit-key"));
 
         // Content-Type = the source mimetype; operations/key are NOT headers.
@@ -410,10 +421,7 @@ mod tests {
         assert!(req.headers().get("key").is_none());
 
         // Body is the raw source.
-        assert_eq!(
-            req.body().and_then(|b| b.as_bytes()).unwrap(),
-            b"SRC"
-        );
+        assert_eq!(req.body().and_then(|b| b.as_bytes()).unwrap(), b"SRC");
     }
 
     #[test]
@@ -485,35 +493,37 @@ mod tests {
         use axum::{extract::State, routing::post, Router};
         let captured = std::sync::Arc::new(tokio::sync::Mutex::new(Captured::default()));
         let cap = captured.clone();
-        let app = Router::new().route(
-            "/pipeline",
-            post(
-                move |State(cap): State<std::sync::Arc<tokio::sync::Mutex<Captured>>>,
-                      axum::extract::Query(q): axum::extract::Query<
-                    std::collections::HashMap<String, String>,
-                >,
-                      headers: axum::http::HeaderMap,
-                      body: axum::body::Bytes| async move {
-                    let mut c = cap.lock().await;
-                    c.operations = q.get("operations").cloned();
-                    c.key = q.get("key").cloned();
-                    c.content_type = headers
-                        .get("content-type")
-                        .and_then(|v| v.to_str().ok())
-                        .map(String::from);
-                    c.body = body.to_vec();
-                    drop(c);
-                    let mut h = axum::http::HeaderMap::new();
-                    h.insert("Image-Width", "100".parse().unwrap());
-                    h.insert("Image-Height", "80".parse().unwrap());
-                    h.insert(
-                        axum::http::header::CONTENT_TYPE,
-                        "image/jpeg".parse().unwrap(),
-                    );
-                    (status, h, axum::body::Body::from(FAKE_IMAGE.to_vec()))
-                },
-            ),
-        ).with_state(cap);
+        let app = Router::new()
+            .route(
+                "/pipeline",
+                post(
+                    move |State(cap): State<std::sync::Arc<tokio::sync::Mutex<Captured>>>,
+                          axum::extract::Query(q): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >,
+                          headers: axum::http::HeaderMap,
+                          body: axum::body::Bytes| async move {
+                        let mut c = cap.lock().await;
+                        c.operations = q.get("operations").cloned();
+                        c.key = q.get("key").cloned();
+                        c.content_type = headers
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .map(String::from);
+                        c.body = body.to_vec();
+                        drop(c);
+                        let mut h = axum::http::HeaderMap::new();
+                        h.insert("Image-Width", "100".parse().unwrap());
+                        h.insert("Image-Height", "80".parse().unwrap());
+                        h.insert(
+                            axum::http::header::CONTENT_TYPE,
+                            "image/jpeg".parse().unwrap(),
+                        );
+                        (status, h, axum::body::Body::from(FAKE_IMAGE.to_vec()))
+                    },
+                ),
+            )
+            .with_state(cap);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -528,7 +538,10 @@ mod tests {
         let (url, cap) = spawn_mock(axum::http::StatusCode::OK).await;
         let c = ImaginaryClient::new(&url, "k", None, "80".into(), "80".into(), 50).unwrap();
         let src = Bytes::from_static(b"RAWSOURCE");
-        let gp = c.generate_max(src.clone(), "image/png", 4096, 4096).await.unwrap();
+        let gp = c
+            .generate_max(src.clone(), "image/png", 4096, 4096)
+            .await
+            .unwrap();
 
         // Parsed from the response headers/body.
         assert_eq!(gp.bytes.as_ref(), FAKE_IMAGE);
@@ -564,9 +577,7 @@ mod tests {
         let got = cap.lock().await;
         assert_eq!(
             got.operations.as_deref(),
-            Some(
-                format::derive_operations_json(256, 256, true, OutputFormat::Jpeg, "80").as_str()
-            )
+            Some(format::derive_operations_json(256, 256, true, OutputFormat::Jpeg, "80").as_str())
         );
         assert_eq!(got.content_type.as_deref(), Some("image/jpeg"));
         assert_eq!(got.body, b"MAXJPEG");

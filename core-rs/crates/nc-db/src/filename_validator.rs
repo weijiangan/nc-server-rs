@@ -161,9 +161,7 @@ impl FilenameValidator {
                 Some(pos) => &filename_lc[..pos],
                 None => &filename_lc[..],
             };
-            if !basename.is_empty()
-                && self.forbidden_basenames.iter().any(|b| b == basename)
-            {
+            if !basename.is_empty() && self.forbidden_basenames.iter().any(|b| b == basename) {
                 return Err(FilenameError::ForbiddenBasename);
             }
         }
@@ -187,10 +185,7 @@ mod tests {
     use crate::config::NcConfig;
 
     fn default_validator() -> FilenameValidator {
-        let cfg = NcConfig::from_php_config(
-            "<?php\n$CONFIG = ['dbtype' => 'sqlite3'];",
-        )
-        .unwrap();
+        let cfg = NcConfig::from_php_config("<?php\n$CONFIG = ['dbtype' => 'sqlite3'];").unwrap();
         FilenameValidator::from_config(&cfg)
     }
 
@@ -215,10 +210,7 @@ mod tests {
 
     #[test]
     fn empty_string_rejected() {
-        assert_eq!(
-            default_validator().validate(""),
-            Err(FilenameError::Empty)
-        );
+        assert_eq!(default_validator().validate(""), Err(FilenameError::Empty));
     }
 
     #[test]
@@ -334,7 +326,10 @@ mod tests {
         .unwrap();
         let v = FilenameValidator::from_config(&cfg);
         // "Thumbs.db" → basename "thumbs" (lowercase) → forbidden
-        assert_eq!(v.validate("Thumbs.db"), Err(FilenameError::ForbiddenBasename));
+        assert_eq!(
+            v.validate("Thumbs.db"),
+            Err(FilenameError::ForbiddenBasename)
+        );
     }
 
     #[test]
@@ -390,9 +385,15 @@ mod tests {
         )
         .unwrap();
         let v = FilenameValidator::from_config(&cfg);
-        assert_eq!(v.validate("malware.exe"), Err(FilenameError::ForbiddenExtension));
+        assert_eq!(
+            v.validate("malware.exe"),
+            Err(FilenameError::ForbiddenExtension)
+        );
         // Still has the built-in ones too
-        assert_eq!(v.validate("upload.part"), Err(FilenameError::ForbiddenExtension));
+        assert_eq!(
+            v.validate("upload.part"),
+            Err(FilenameError::ForbiddenExtension)
+        );
     }
 
     #[test]

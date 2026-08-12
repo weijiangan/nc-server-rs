@@ -7,17 +7,17 @@
 
 #[cfg(test)]
 mod tests {
-    use sqlx::{any::AnyPoolOptions, AnyPool, Row};
+    use nc_db::pool::DbPool;
+    use sqlx::Row;
 
-    async fn fresh_db() -> AnyPool {
-        // Install the SQLite driver for AnyPool
-        sqlx::any::install_default_drivers();
-
-        let pool = AnyPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("in-memory SQLite failed");
+    async fn fresh_db() -> DbPool {
+        let pool = DbPool::Sqlite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("in-memory SQLite failed"),
+        );
 
         nc_db::migrate::run(&pool)
             .await
@@ -27,7 +27,7 @@ mod tests {
     }
 
     /// Check that a table exists by querying it.
-    async fn table_exists(pool: &AnyPool, table: &str) -> bool {
+    async fn table_exists(pool: &DbPool, table: &str) -> bool {
         let sql = format!("SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'");
         let row = sqlx::query(&sql).fetch_optional(pool).await.unwrap();
         row.is_some()

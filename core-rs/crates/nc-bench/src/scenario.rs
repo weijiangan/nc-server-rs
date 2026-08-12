@@ -37,9 +37,9 @@ pub async fn bench(
     iterations: u32,
     warmup: u32,
 ) -> Result<Vec<ScenarioReport>> {
-    nc_difftest::preconditions::check(cfg)
-        .await
-        .context("preconditions failed — is the stack up (`make diff-up`) and the sides identical?")?;
+    nc_difftest::preconditions::check(cfg).await.context(
+        "preconditions failed — is the stack up (`make diff-up`) and the sides identical?",
+    )?;
 
     // Clear throttler state, then authenticate with per-instance app tokens
     // (hot path — see `auth`).
@@ -84,10 +84,7 @@ pub async fn bench(
     let mut out = Vec::new();
     for path in paths {
         let sc = Scenario::load(&path.to_string_lossy())?;
-        eprintln!(
-            "── {} ({iterations} iterations, {warmup} warmup)",
-            sc.name
-        );
+        eprintln!("── {} ({iterations} iterations, {warmup} warmup)", sc.name);
         out.push(run_one(&sut, &oracle, &sc, iterations, warmup).await?);
     }
     Ok(out)
@@ -131,7 +128,10 @@ async fn run_one(
             first_times.entry(r.op.clone()).or_default().push(r.elapsed);
         }
         for r in &second_results {
-            second_times.entry(r.op.clone()).or_default().push(r.elapsed);
+            second_times
+                .entry(r.op.clone())
+                .or_default()
+                .push(r.elapsed);
         }
 
         // Restore pre-scenario state so the next iteration measures the same

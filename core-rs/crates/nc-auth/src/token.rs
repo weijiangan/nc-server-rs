@@ -103,10 +103,7 @@ mod tests {
     fn concurrent_reads_do_not_block() {
         use std::sync::Arc;
         let cache = new_token_cache();
-        cache
-            .write()
-            .unwrap()
-            .insert([0u8; 64], make_token(None));
+        cache.write().unwrap().insert([0u8; 64], make_token(None));
 
         // Spawn 20 reader threads; if any panics (deadlock/poison) the test fails.
         let handles: Vec<_> = (0..20)

@@ -91,9 +91,7 @@ pub async fn get_tags_batch(
 
     // PHP chunks at 900; we do a single query since Rust has no 65k placeholder limit.
     // Parameters 1-3 are uid, type, type — IN-clause placeholders start at $4.
-    let placeholders: Vec<String> = (4..=fileids.len() + 3)
-        .map(|i| format!("${i}"))
-        .collect();
+    let placeholders: Vec<String> = (4..=fileids.len() + 3).map(|i| format!("${i}")).collect();
     let ph_str = placeholders.join(", ");
 
     let sql = format!(
@@ -236,9 +234,8 @@ async fn get_or_create_category(
     }
 
     // Read back the ID (whether we inserted it or it already existed).
-    let select_sql = format!(
-        "SELECT id FROM {prefix}vcategory WHERE uid = $1 AND type = $2 AND category = $3"
-    );
+    let select_sql =
+        format!("SELECT id FROM {prefix}vcategory WHERE uid = $1 AND type = $2 AND category = $3");
     match sqlx::query_scalar::<_, i64>(&select_sql)
         .bind(uid)
         .bind(OBJ_TYPE)
@@ -554,10 +551,7 @@ mod tests {
     #[test]
     fn format_tags_xml_basic() {
         let xml = format_tags_xml(&["work".to_string(), "personal".to_string()]);
-        assert_eq!(
-            xml,
-            "<oc:tag>work</oc:tag><oc:tag>personal</oc:tag>"
-        );
+        assert_eq!(xml, "<oc:tag>work</oc:tag><oc:tag>personal</oc:tag>");
     }
 
     #[test]

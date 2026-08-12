@@ -123,7 +123,11 @@ pub async fn check_throttle(
                     error = %e,
                     "brute-force short-window COUNT failed — skipping throttle check for this request"
                 );
-                return ThrottleResult { delay: None, should_reject: false, retry_after_secs: 0 };
+                return ThrottleResult {
+                    delay: None,
+                    should_reject: false,
+                    retry_after_secs: 0,
+                };
             }
         };
 
@@ -155,7 +159,11 @@ pub async fn check_throttle(
                     error = %e,
                     "brute-force long-window COUNT failed — skipping delay"
                 );
-                return ThrottleResult { delay: None, should_reject: false, retry_after_secs: 0 };
+                return ThrottleResult {
+                    delay: None,
+                    should_reject: false,
+                    retry_after_secs: 0,
+                };
             }
         };
 
@@ -312,7 +320,7 @@ mod tests {
         ac.set_raw("bruteForce", "whitelist_2", "192.168.1.0/24".to_string());
         ac.set_raw("bruteForce", "whitelist_5", "172.16.0.0/24".to_string());
         // All three subnets must be found despite gaps.
-        assert!(is_ip_allowlisted("10.0.0.5", &ac));  // matches subnet string 10.0.0.0/24
+        assert!(is_ip_allowlisted("10.0.0.5", &ac)); // matches subnet string 10.0.0.0/24
         assert!(is_ip_allowlisted("192.168.1.99", &ac));
         assert!(is_ip_allowlisted("172.16.0.1", &ac));
         assert!(!is_ip_allowlisted("8.8.8.8", &ac));

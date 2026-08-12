@@ -48,9 +48,9 @@ Goal: `enum DbPool { Pg(PgPool), Sqlite(SqlitePool) }` replacing `sqlx::AnyPool`
 | S0 | T3.1, T3.2 | Workspace builds + `cargo test --lib` (SQLite arm); perf-gate holds; bench SC=14 p50 ≤ 21.4 numbers. |
 | S1 | T3.3 | Builds without the `any` feature; unit tests green; milestone suite (D-gates). |
 
-- [ ] **T3.1** The enum in `nc-db/src/pool.rs`; `build_pool` picks the variant from `config.dbtype`; `impl<'c> Executor<'c>` (+ `Acquire` where `pool.acquire()`/`pool.begin()` are used — the propagator).
-- [ ] **T3.2** Replace the dialect checks (`backend_is_postgres()`, `tx.backend_name()`) with the variant; a `DbTxn` enum may be needed for `begin()` call sites.
-- [ ] **T3.3** Drop the `any` driver: remove `install_default_drivers()`, make the `postgres`/`sqlite` features explicit, shed the Any driver from `Cargo.lock`; delete the `string_to_array`-era comments referencing the Any limitation (the SQL stays until T4).
+- [x] **T3.1** The enum in `nc-db/src/pool.rs`; `build_pool` picks the variant from `config.dbtype`; `impl<'c> Executor<'c>` (+ `Acquire` where `pool.acquire()`/`pool.begin()` are used — the propagator).
+- [x] **T3.2** Replace the dialect checks (`backend_is_postgres()`, `tx.backend_name()`) with the variant; a `DbTxn` enum may be needed for `begin()` call sites.
+- [x] **T3.3** Drop the `any` driver: remove `install_default_drivers()`, make the `postgres`/`sqlite` features explicit, shed the Any driver from `Cargo.lock`; delete the `string_to_array`-era comments referencing the Any limitation (the SQL stays until T4).
 
 ---
 
@@ -158,6 +158,7 @@ Goal: verify the index claims against the live DB — verification only. Plan fi
 
 ## Deviations from the task descriptions
 
+- **T3.3** — "builds without the `any` feature" is not achievable within T3: the `Executor` delegation and the `string_to_array` SQL are Any-typed by construction (a single `DbPool` type serving both backends forces `Database = Any` at unmigrated call sites — verified against sqlx 0.8.6's `Executor`/`IntoArguments`/`AnyConnection` APIs). T3 sheds the Any *machinery* (AnyPool/AnyPoolOptions/`install_default_drivers`, the driver registry, the global `backend_is_postgres` latch) and builds native pools; the `any` cargo feature + the array-interim SQL stay until T4/T7 migrate the call sites to per-variant native queries, at which point the feature can be dropped for real.
 - **T6.6** — the task scopes prop-set gating to `read_dir`; the `{oc:}favorite`/`{oc:}tags` family additionally gates `get_props`'s `get_tag_info` call. Without it, skipping the prefetch turns one batch query into one query per child (the N+1 the batch exists to prevent) — the task's own goal would fail. Same predicate on both sides; behavior-neutral (PropWriter's 12.1 filter drops the props either way).
 
 ## Changes
