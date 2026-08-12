@@ -136,9 +136,9 @@ Goal: the remaining low-value trims — build SQL once, single-lock the batch, h
 |---|---|---|
 | S0 | T8.1-T8.3 | Unit tests green; perf-gate holds; bench flat. |
 
-- [ ] **T8.1** `OnceLock<Queries>` of the fixed SQL strings (after T4's texts stabilize).
-- [ ] **T8.2** `PropfindBatch` → one `Mutex<PropfindBatchInner>` (9 locks → 1) keeping the `Arc` sharing.
-- [ ] **T8.3** Hoist the remaining `get_or_insert_mime_id("httpd/unix-directory"|"httpd")` call sites (`create_dir`, `versions.rs`, `archive.rs`, `handler.rs`) onto the `AppState` ids from 21.4.
+- [x] **T8.1** `OnceLock<Queries>` of the fixed SQL strings (after T4's texts stabilize).
+- [x] **T8.2** `PropfindBatch` → one `Mutex<PropfindBatchInner>` (9 locks → 1) keeping the `Arc` sharing.
+- [x] **T8.3** Hoist the remaining `get_or_insert_mime_id("httpd/unix-directory"|"httpd")` call sites (`create_dir`, `versions.rs`, `archive.rs`, `handler.rs`) onto the `AppState` ids from 21.4.
 
 ---
 
@@ -164,6 +164,7 @@ Goal: verify the index claims against the live DB — verification only. Plan fi
 
 ## Changes
 
+- 2026-08-13: **T8.1 scope note:** the cached SQL set is the per-request PG-path texts (the depth-1 CTE, `custom_properties_batch`, the two display-name lookups) — the other batch statements (counts, comments, system tags, share scan, `list_extended_batch`, `lookup_by_ids`) run only on the SQLite path / write path post-T7, where their texts vary by list size or aren't per-request hot; caching them would add churn for sub-μs wins. T8.2 collapses the nine per-map mutexes into one `Mutex<PropfindBatchInner>` (all maps were touched one at a time; every read clones out before any await). T8.3 hoists the `httpd`/`httpd/unix-directory` lookups in `create_dir`, `rename`, COPY's mimetype recompute, `store_version`/`insert_version_entity` (threaded through `WriteCtx`), `try_serve_archive`, and the DELETE-directory check onto the 21.4 AppState ids.
 - 2026-08-13: **T9.2 decision (measured, not merged):** `put_new` after T9.1 = 15 statements; the filecache INSERT + extended upsert merge would save 1 (6%) and change the extended-upsert failure from warn-only to fatal (the merged statement fails atomically). PUT is already the fastest-vs-PHP area (SC=10: 46.9 ms p50, 2.16× vs PHP — improved from the 55 ms / 2.3× baseline). Not justified per the task's own condition; the separate upsert stays.
 - 2026-08-13: T6 landed (merges, de-correlation, prop-set plumbing + gating). **Divergence candidate (unchanged, needs an explicit decision):** PHP's `getNumberOfUnreadCommentsForObjects` has no `actor_type`/`actor_id` filter (`Manager.php:673-689`) — a user's own comment newer than the marker counts as unread in PHP; Rust's `get_comments_unread` excludes it since phase 12.6, and no difftest scenario exercises comments, so it was never A/B'd.
 - 2026-08-13: Phase created as the combined doc for the plan's remaining items T6-T10 (the amended execution order after Tier 1; plan section 21). T6 grounding: `PropWriter.requested` already exists (`handle_props.rs:233-236`); harness + perf-gate send allprop, so budgets drop only from the merges (delta 9 → 7, propfind_depth1 20 → 18); the share-pair filters differ and split in Rust; the unread-marker de-correlation is its own task. T3-T10 grounding per plan findings 3-10; T2 is the largest refactor (row-API change) and intentionally last among the structural items.

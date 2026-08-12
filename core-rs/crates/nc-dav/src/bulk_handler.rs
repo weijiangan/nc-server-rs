@@ -375,6 +375,8 @@ async fn write_file(
             ext.upload_time,
             old.fileid,
             old.etag.as_deref().unwrap_or(""),
+            state.dir_mime_id,
+            state.dir_mimepart_id,
         )
         .await;
     }

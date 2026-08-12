@@ -152,6 +152,9 @@ pub struct WriteCtx {
     /// Upload time of the existing file before overwrite (0 for new files).
     /// Inherited by the version row (§9.4).
     pub old_upload_time: i64,
+    /// `httpd/unix-directory` + `httpd` ids (PHASE-22 T8.3 hoist).
+    pub dir_mime_id: i64,
+    pub dir_mimepart_id: i64,
     /// Etag of the existing file before overwrite.  Inherited by the version
     /// row — PHP's `Cache::copyFromCache` clones the source row as-is, so the
     /// version file carries the old content's etag (live-verified).
@@ -412,6 +415,8 @@ impl DavFile for NcDavFile {
                     ctx.old_upload_time,
                     source_fileid,
                     ctx.old_etag.as_deref().unwrap_or(""),
+                    ctx.dir_mime_id,
+                    ctx.dir_mimepart_id,
                 )
                 .await;
             }

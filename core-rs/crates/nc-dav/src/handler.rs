@@ -379,10 +379,10 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
                 &state.pool,
                 &state.table_prefix,
                 storage_id,
+                state.dir_mime_id,
                 &fc_path,
                 &state.data_directory,
                 &uid,
-                &state.mime_cache,
                 &state.appconfig_cache,
                 accept_header,
                 uri_query,
@@ -542,13 +542,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
         if let Some(fc_row) =
             crate::row::lookup_by_path(&pool_ref, &prefix_ref, storage_id, &fc_path).await
         {
-            let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
-                &state.pool,
-                &state.table_prefix,
-                &state.mime_cache,
-                "httpd/unix-directory",
-            )
-            .await;
+            let dir_mime_id = state.dir_mime_id;
             if fc_row.mimetype == dir_mime_id {
                 // Check if trashbin is enabled before intercepting.
                 let trash_enabled = {

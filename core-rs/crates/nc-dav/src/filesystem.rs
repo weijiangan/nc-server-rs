@@ -82,63 +82,82 @@ pub struct NcFileSystem {
     pub(crate) requested_props: Option<Vec<(Option<String>, String)>>,
 }
 
-/// Read a value from a per-request batch map, or `None` when the node is
+/// Read a value from the per-request batch, or `None` when the node is
 /// outside the batch (caller falls back to the single-row query).
-fn batch_get<K, V, Q>(m: &Arc<Mutex<HashMap<K, V>>>, k: &Q) -> Option<V>
+fn batch_get<K, V, Q>(
+    inner: &PropfindBatchInner,
+    m: impl Fn(&PropfindBatchInner) -> &HashMap<K, V>,
+    k: &Q,
+) -> Option<V>
 where
     K: Eq + std::hash::Hash + std::borrow::Borrow<Q> + Clone,
     Q: Eq + std::hash::Hash + ?Sized,
     V: Clone,
 {
-    m.lock().expect("propfind batch lock").get(k).cloned()
+    m(inner).get(k).cloned()
 }
 
 /// Is `k` part of the `read_dir` batch?  If yes, a map miss means "no data"
 /// and `get_props` must NOT fall back to a single-row query; if no, the node
 /// is outside the batch (depth-0 root) and the single-row query is the only
 /// source.
-fn batch_contains<K, Q>(m: &Arc<Mutex<std::collections::HashSet<K>>>, k: &Q) -> bool
+fn batch_contains<K, Q>(
+    inner: &PropfindBatchInner,
+    m: impl Fn(&PropfindBatchInner) -> &std::collections::HashSet<K>,
+    k: &Q,
+) -> bool
 where
     K: Eq + std::hash::Hash + std::borrow::Borrow<Q>,
     Q: Eq + std::hash::Hash + ?Sized,
 {
-    m.lock().expect("propfind batch lock").contains(k)
+    m(inner).contains(k)
 }
 
 /// Per-request cache of everything depth-1 PROPFIND needs per child.
 ///
-/// All maps are `Arc<Mutex<…>>` because dav-server-rs clones the filesystem
-/// per resource (`PropWriter`), and the clones must share one cache — a
-/// plain `Mutex<HashMap>` would be snapshotted at every clone and the batch
-/// would never reach the consumers.
+/// PHASE-22 T8.2: one `Arc<Mutex<PropfindBatchInner>>` instead of nine
+/// per-map mutexes — the maps were only ever touched one at a time, so the
+/// consolidation removes eight lock acquisitions per access without holding
+/// any lock across an await (every read clones its value out first).
+///
+/// The `Arc` is required because dav-server-rs clones the filesystem per
+/// resource (`PropWriter`), and the clones must share one cache — a plain
+/// `Mutex<…>` would be snapshotted at every clone and the batch would never
+/// reach the consumers.
 ///
 /// Populated only by `read_dir` (a pure read path) and the per-request
 /// uid-only lookups in `get_props`; write requests never run `read_dir`, so
 /// no stale-row risk exists within a request.
 #[derive(Clone, Default)]
 pub(crate) struct PropfindBatch {
+    pub(crate) inner: Arc<Mutex<PropfindBatchInner>>,
+}
+
+/// The maps behind [`PropfindBatch::inner`] (see the struct doc).
+#[derive(Default)]
+pub(crate) struct PropfindBatchInner {
     /// The fileids `read_dir` batched.  `get_props` uses this to distinguish
     /// "child with no data" (in the set → map miss means empty, no query)
     /// from "node outside the batch" (not in the set → single-row query).
-    pub(crate) children: Arc<Mutex<std::collections::HashSet<i64>>>,
+    pub(crate) children: std::collections::HashSet<i64>,
     /// The fc paths `read_dir` batched (same role as `children`, for the
     /// path-keyed `oc_properties` lookup).
-    pub(crate) child_paths: Arc<Mutex<std::collections::HashSet<String>>>,
+    pub(crate) child_paths: std::collections::HashSet<String>,
     /// `fc_path` → metadata, keyed trailing-slash-normalized.  Serves
     /// `load_meta` so `get_props` never re-fetches a row `read_dir` holds.
-    pub(crate) meta: Arc<Mutex<HashMap<String, NcMetaData>>>,
+    pub(crate) meta: HashMap<String, NcMetaData>,
     /// fileid → (dir_count, file_count) for `{nc:}contained-*-count`.
-    pub(crate) dir_counts: Arc<Mutex<HashMap<i64, (i64, i64)>>>,
+    pub(crate) dir_counts: HashMap<i64, (i64, i64)>,
     /// fileid → share rows for `{oc:}share-types` / `{nc:}sharees`.
-    pub(crate) share_details: Arc<Mutex<HashMap<i64, Vec<row::ShareDetail>>>>,
+    pub(crate) share_details: HashMap<i64, Vec<row::ShareDetail>>,
     /// fileid → most-recent non-empty share note.
-    pub(crate) share_notes: Arc<Mutex<HashMap<i64, String>>>,
+    pub(crate) share_notes: HashMap<i64, String>,
     /// fileid → (count, unread) for `{oc:}comments-*`.
-    pub(crate) comments: Arc<Mutex<HashMap<i64, (i64, i64)>>>,
+    pub(crate) comments: HashMap<i64, (i64, i64)>,
     /// fileid → system tags for `{nc:}system-tags`.
-    pub(crate) system_tags: Arc<Mutex<HashMap<i64, Vec<row::SystemTagRow>>>>,
+    pub(crate) system_tags: HashMap<i64, Vec<row::SystemTagRow>>,
     /// raw `fc_path` → custom properties from `oc_properties`.
-    pub(crate) custom_props: Arc<Mutex<HashMap<String, Vec<(String, String, i16)>>>>,
+    pub(crate) custom_props: HashMap<String, Vec<(String, String, i16)>>,
 }
 
 impl NcFileSystem {
@@ -1239,7 +1258,7 @@ impl NcFileSystem {
         // paths call `lookup_by_path` directly and never consult the batch,
         // so an entry cannot go stale within a request.
         let key = fc_path.trim_end_matches('/');
-        if let Some(meta) = batch_get(&self.propfind_batch.meta, key) {
+        if let Some(meta) = { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.meta, key) } {
             return Some(meta);
         }
         let found = row::lookup_by_path_with_ext(
@@ -1268,9 +1287,10 @@ impl NcFileSystem {
         let mut meta = NcMetaData::from_row(&row, mime_type, ext.metadata_etag.clone());
         meta.apply_extended(ext.creation_time, ext.upload_time, ext.metadata_etag);
         self.propfind_batch
-            .meta
+            .inner
             .lock()
             .expect("propfind batch lock")
+            .meta
             .insert(key.to_string(), meta.clone());
         Some(meta)
     }
@@ -1353,7 +1373,7 @@ impl DavFileSystem for NcFileSystem {
             // root is usually already in the batch (load_meta store-on-miss
             // from `fs.metadata`/`get_props`), so reuse it instead of a
             // second lookup (round-3 Task 10).
-            let dir_fileid = match batch_get(&self.propfind_batch.meta, fc_path.trim_end_matches('/'))
+            let dir_fileid = match { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.meta, fc_path.trim_end_matches('/')) }
             {
                 Some(meta) => meta.fileid,
                 None => row::lookup_by_path(
@@ -1476,13 +1496,11 @@ impl DavFileSystem for NcFileSystem {
 
             let batch = &self.propfind_batch;
             {
-                let mut meta_cache = batch.meta.lock().expect("propfind batch lock");
-                let mut children = batch.children.lock().expect("propfind batch lock");
-                let mut child_paths = batch.child_paths.lock().expect("propfind batch lock");
+                let mut batch_inner = batch.inner.lock().expect("propfind batch lock");
                 for (key, meta) in &metas {
-                    meta_cache.insert(key.clone(), meta.clone());
-                    child_paths.insert(key.clone());
-                    children.insert(meta.fileid);
+                    batch_inner.meta.insert(key.clone(), meta.clone());
+                    batch_inner.child_paths.insert(key.clone());
+                    batch_inner.children.insert(meta.fileid);
                 }
             }
             // ── Phase 18.1 / 21.1 / 22 T6.6: per-request batch, concurrently ─
@@ -1543,33 +1561,15 @@ impl DavFileSystem for NcFileSystem {
             // directly (the per-family statements do not exist on this path).
             if let Some((dir_counts, share_details, share_notes, comments, system_tags)) = cte {
                 if !child_ids.is_empty() {
-                    batch
-                        .dir_counts
-                        .lock()
-                        .expect("propfind batch lock")
-                        .extend(dir_counts);
-                    batch
-                        .share_details
-                        .lock()
-                        .expect("propfind batch lock")
-                        .extend(share_details);
-                    batch
-                        .share_notes
-                        .lock()
-                        .expect("propfind batch lock")
-                        .extend(share_notes);
-                    {
-                        let mut comments = batch.comments.lock().expect("propfind batch lock");
-                        for id in &child_ids {
-                            let (c, u) = comments.get(id).copied().unwrap_or((0, 0));
-                            comments.insert(*id, (c, u));
-                        }
+                    let mut batch_inner = batch.inner.lock().expect("propfind batch lock");
+                    batch_inner.dir_counts.extend(dir_counts);
+                    batch_inner.share_details.extend(share_details);
+                    batch_inner.share_notes.extend(share_notes);
+                    for id in &child_ids {
+                        let (c, u) = comments.get(id).copied().unwrap_or((0, 0));
+                        batch_inner.comments.insert(*id, (c, u));
                     }
-                    batch
-                        .system_tags
-                        .lock()
-                        .expect("propfind batch lock")
-                        .extend(system_tags);
+                    batch_inner.system_tags.extend(system_tags);
                 }
             } else {
                 // SQLite: the batched families (T6.1/T6.3 merges), gated per
@@ -1633,33 +1633,15 @@ impl DavFileSystem for NcFileSystem {
                 );
                 let (details, notes) = share_maps;
                 if !child_ids.is_empty() {
-                    batch
-                        .dir_counts
-                        .lock()
-                        .expect("propfind batch lock")
-                        .extend(counts);
-                    batch
-                        .share_details
-                        .lock()
-                        .expect("propfind batch lock")
-                        .extend(details);
-                    batch
-                        .share_notes
-                        .lock()
-                        .expect("propfind batch lock")
-                        .extend(notes);
-                    {
-                        let mut comments = batch.comments.lock().expect("propfind batch lock");
-                        for id in &child_ids {
-                            let (c, u) = cc_unreads.get(id).copied().unwrap_or((0, 0));
-                            comments.insert(*id, (c, u));
-                        }
+                    let mut batch_inner = batch.inner.lock().expect("propfind batch lock");
+                    batch_inner.dir_counts.extend(counts);
+                    batch_inner.share_details.extend(details);
+                    batch_inner.share_notes.extend(notes);
+                    for id in &child_ids {
+                        let (c, u) = cc_unreads.get(id).copied().unwrap_or((0, 0));
+                        batch_inner.comments.insert(*id, (c, u));
                     }
-                    batch
-                        .system_tags
-                        .lock()
-                        .expect("propfind batch lock")
-                        .extend(tags);
+                    batch_inner.system_tags.extend(tags);
                 }
             }
             // Custom props + the tag prefetch — both paths, gated (T6.6).
@@ -1700,9 +1682,10 @@ impl DavFileSystem for NcFileSystem {
             );
             if !child_ids.is_empty() {
                 batch
-                    .custom_props
+                    .inner
                     .lock()
                     .expect("propfind batch lock")
+                    .custom_props
                     .extend(props);
             }
             let s: FsStream<Box<dyn DavDirEntry>> = Box::pin(stream::iter(entries));
@@ -1892,6 +1875,8 @@ impl DavFileSystem for NcFileSystem {
                     old_creation_time,
                     old_upload_time,
                     old_etag,
+                    dir_mime_id: self.state.dir_mime_id,
+                    dir_mimepart_id: self.state.dir_mimepart_id,
                     old_storage_mtime,
                     expected_size: options.size,
                     oc_checksum: options.checksum.clone(),
@@ -1961,21 +1946,10 @@ impl DavFileSystem for NcFileSystem {
                 .as_secs() as i64;
             let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
 
-            // §10.8: mimetype = httpd/unix-directory, mimepart = httpd
-            let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
-                &self.state.pool,
-                &self.state.table_prefix,
-                &self.state.mime_cache,
-                "httpd/unix-directory",
-            )
-            .await;
-            let dir_mimepart_id = nc_db::mime::get_or_insert_mime_id(
-                &self.state.pool,
-                &self.state.table_prefix,
-                &self.state.mime_cache,
-                "httpd",
-            )
-            .await;
+            // §10.8: mimetype = httpd/unix-directory, mimepart = httpd —
+            // hoisted onto the AppState ids (PHASE-22 T8.3).
+            let dir_mime_id = self.state.dir_mime_id;
+            let dir_mimepart_id = self.state.dir_mimepart_id;
             let hash = row::path_hash(&fc_path);
             let name = fc_path.rsplit('/').next().unwrap_or("").to_string();
 
@@ -2091,14 +2065,8 @@ impl DavFileSystem for NcFileSystem {
 
             // Resolve directory mimetype ID early — used both for the
             // directory-guard in the mimetype recomputation below and the
-            // subtree-rename check further down.
-            let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
-                &self.state.pool,
-                &self.state.table_prefix,
-                &self.state.mime_cache,
-                "httpd/unix-directory",
-            )
-            .await;
+            // subtree-rename check further down.  Hoisted (PHASE-22 T8.3).
+            let dir_mime_id = self.state.dir_mime_id;
 
             // Update the node itself.  Path/path_hash/name/parent only — PHP
             // `Cache::move` (Cache.php:813-831) leaves the moved file's
@@ -2362,14 +2330,9 @@ impl DavFileSystem for NcFileSystem {
 
                     // §10.10: recompute mimetype on extension change for COPY.
                     // Matches PHP Updater::copyOrRenameFromStorage() —
-                    // skip for directories and trash targets.
-                    let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
-                        &self.state.pool,
-                        &self.state.table_prefix,
-                        &self.state.mime_cache,
-                        "httpd/unix-directory",
-                    )
-                    .await;
+                    // skip for directories and trash targets.  Hoisted
+                    // (PHASE-22 T8.3).
+                    let dir_mime_id = self.state.dir_mime_id;
                     let source_name = from_row.name.as_deref().unwrap_or("");
                     let source_ext = extension(source_name);
                     let target_ext = extension(&name);
@@ -2631,8 +2594,8 @@ impl DavFileSystem for NcFileSystem {
             // GROUP BY; an in-batch miss means an empty directory (0, 0), and
             // only nodes outside the batch (depth-0 root) run the single query.
             let (child_dirs, child_files) = if meta.is_dir_flag && do_content {
-                if batch_contains(&self.propfind_batch.children, &meta.fileid) {
-                    batch_get(&self.propfind_batch.dir_counts, &meta.fileid).unwrap_or((0, 0))
+                if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
+                    { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.dir_counts, &meta.fileid) }.unwrap_or((0, 0))
                 } else {
                     // Resolved once at startup (phase-21 S3).
                     let dir_mime_id = self.state.dir_mime_id;
@@ -2769,8 +2732,8 @@ impl DavFileSystem for NcFileSystem {
             // `note`: most-recent non-empty share note for this file.
             // Phase 18.1: batched by read_dir; an in-batch miss means no
             // note, and only nodes outside the batch run the single query.
-            let note = if batch_contains(&self.propfind_batch.children, &meta.fileid) {
-                batch_get(&self.propfind_batch.share_notes, &meta.fileid).unwrap_or_default()
+            let note = if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
+                { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.share_notes, &meta.fileid) }.unwrap_or_default()
             } else {
                 row::get_share_note(&self.state.pool, &self.state.table_prefix, meta.fileid).await
             };
@@ -2829,8 +2792,8 @@ impl DavFileSystem for NcFileSystem {
             // ── PHASE-12.5: share-types / sharees ──────────────────────────
             // Phase 18.1: batched by read_dir; single query for nodes
             // outside the batch.
-            let share_details = if batch_contains(&self.propfind_batch.children, &meta.fileid) {
-                batch_get(&self.propfind_batch.share_details, &meta.fileid).unwrap_or_default()
+            let share_details = if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
+                { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.share_details, &meta.fileid) }.unwrap_or_default()
             } else {
                 row::get_share_details(
                     &self.state.pool,
@@ -2857,9 +2820,9 @@ impl DavFileSystem for NcFileSystem {
                 // Phase 18.1: read_dir batches both counts per child; an
                 // in-batch miss means zero comments, and only nodes outside
                 // the batch run the single queries.
-                let (count, unread) = if batch_contains(&self.propfind_batch.children, &meta.fileid)
+                let (count, unread) = if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) }
                 {
-                    batch_get(&self.propfind_batch.comments, &meta.fileid).unwrap_or((0, 0))
+                    { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.comments, &meta.fileid) }.unwrap_or((0, 0))
                 } else {
                     let count = row::get_comments_count(
                         &self.state.pool,
@@ -2888,8 +2851,8 @@ impl DavFileSystem for NcFileSystem {
 
             // ── PHASE-12.7: system tags ────────────────────────────────────
             let system_tags_xml = if do_content {
-                let tags = if batch_contains(&self.propfind_batch.children, &meta.fileid) {
-                    batch_get(&self.propfind_batch.system_tags, &meta.fileid).unwrap_or_default()
+                let tags = if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
+                    { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.system_tags, &meta.fileid) }.unwrap_or_default()
                 } else {
                     row::get_system_tags_for_file(
                         &self.state.pool,
@@ -2944,8 +2907,8 @@ impl DavFileSystem for NcFileSystem {
             // the single query.
             if do_content {
                 let custom_props =
-                    if batch_contains(&self.propfind_batch.child_paths, fc_path.as_str()) {
-                        batch_get(&self.propfind_batch.custom_props, fc_path.as_str())
+                    if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.child_paths, fc_path.as_str()) } {
+                        { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.custom_props, fc_path.as_str()) }
                             .unwrap_or_default()
                     } else {
                         crate::row::list_custom_properties(

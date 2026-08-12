@@ -32,7 +32,6 @@ use axum::body::Body;
 use axum::response::Response;
 use http::{HeaderName, HeaderValue, StatusCode};
 use nc_db::appconfig::SharedAppConfigCache;
-use nc_db::mime::SharedMimeCache;
 use nc_db::pool::DbPool;
 use tar::Builder as TarBuilder;
 use zip::write::FileOptions as ZipFileOptions;
@@ -59,10 +58,10 @@ pub async fn try_serve_archive(
     pool: &DbPool,
     prefix: &str,
     storage_id: i64,
+    dir_mime_id: i64,
     fc_path: &str,
     data_dir: &std::path::Path,
     uid: &str,
-    mime_cache: &SharedMimeCache,
     _appconfig_cache: &SharedAppConfigCache,
     accept_header: Option<&str>,
     uri_query: Option<&str>,
@@ -75,10 +74,7 @@ pub async fn try_serve_archive(
 
     // 2. Confirm this is a directory.
     let fc_row = row::lookup_by_path(pool, prefix, storage_id, fc_path).await?;
-    // §10.8: use get-or-insert for correctness even on reads
-    let dir_mimetype_id =
-        nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, "httpd/unix-directory").await;
-    if fc_row.mimetype != dir_mimetype_id {
+    if fc_row.mimetype != dir_mime_id {
         return None;
     }
 
@@ -113,7 +109,7 @@ pub async fn try_serve_archive(
             fc_path,
             data_dir,
             uid,
-            dir_mimetype_id,
+            dir_mime_id,
         )
         .await
     } else {
@@ -124,7 +120,7 @@ pub async fn try_serve_archive(
             fc_path,
             data_dir,
             uid,
-            dir_mimetype_id,
+            dir_mime_id,
         )
         .await
     };
@@ -358,7 +354,7 @@ async fn collect_all_children(
     fc_path: &str,
     data_dir: &std::path::Path,
     uid: &str,
-    dir_mimetype_id: i64,
+    dir_mime_id: i64,
 ) -> Vec<ArchiveEntry> {
     let root_path = parent_fc_path(fc_path);
 
@@ -374,7 +370,7 @@ async fn collect_all_children(
         &root_path,
         data_dir,
         uid,
-        dir_mimetype_id,
+        dir_mime_id,
     )
     .await
 }
@@ -393,7 +389,7 @@ async fn collect_filtered_children(
     fc_path: &str,
     data_dir: &std::path::Path,
     uid: &str,
-    dir_mimetype_id: i64,
+    dir_mime_id: i64,
 ) -> Vec<ArchiveEntry> {
     let root_path = fc_path.to_string();
 
@@ -409,7 +405,7 @@ async fn collect_filtered_children(
                 &root_path,
                 data_dir,
                 uid,
-                dir_mimetype_id,
+                dir_mime_id,
             )
             .await;
             entries.extend(sub);
@@ -428,9 +424,9 @@ async fn collect_node(
     root_path: &str,
     data_dir: &std::path::Path,
     uid: &str,
-    dir_mimetype_id: i64,
+    dir_mime_id: i64,
 ) -> Vec<ArchiveEntry> {
-    let is_dir = row.mimetype == dir_mimetype_id;
+    let is_dir = row.mimetype == dir_mime_id;
 
     let fc_path = row.path.as_deref().unwrap_or("");
     let archive_path = if root_path.is_empty() {
@@ -457,7 +453,7 @@ async fn collect_node(
                     root_path,
                     data_dir,
                     uid,
-                    dir_mimetype_id,
+                    dir_mime_id,
                 ))
                 .await,
             );
@@ -497,7 +493,7 @@ async fn collect_node(
                 root_path,
                 data_dir,
                 uid,
-                dir_mimetype_id,
+                dir_mime_id,
             ))
             .await,
         );

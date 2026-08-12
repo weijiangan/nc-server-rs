@@ -899,6 +899,25 @@ pub struct PropfindCte {
     pub system_tags: std::collections::HashMap<i64, Vec<SystemTagRow>>,
 }
 
+/// PHASE-22 T8.1: the read_dir hot-path statement texts, built once per
+/// prefix (fixed for a running server).  The strings are leaked (&'static)
+/// so the hot path skips the per-call `format!`/alloc entirely.
+fn cached_sql(prefix: &str, build: fn(&str) -> String) -> &'static str {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, &'static str>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(s) = cache.lock().expect("sql cache lock").get(prefix) {
+        return s;
+    }
+    let s: &'static str = Box::leak(build(prefix).into_boxed_str());
+    cache
+        .lock()
+        .expect("sql cache lock")
+        .insert(prefix.to_string(), s);
+    s
+}
+
 pub async fn propfind_batch_cte(
     pool: &DbPool,
     prefix: &str,
@@ -907,7 +926,8 @@ pub async fn propfind_batch_cte(
     dir_mime_id: i64,
     uid: &str,
 ) -> PropfindCte {
-    let sql = format!(
+    let sql = cached_sql(prefix, |prefix| {
+        format!(
         "WITH kids AS ( \
              SELECT fc.fileid, fc.storage, fc.path, fc.path_hash, fc.parent, fc.name, \
                     fc.mimetype, fc.mimepart, fc.size, fc.mtime, fc.storage_mtime, \
@@ -947,7 +967,8 @@ pub async fn propfind_batch_cte(
                  WHERE m.objectid = k.fileid::text AND m.objecttype = 'files' \
                    AND t.visibility = 1) AS system_tags         FROM kids k",
         prefix = prefix,
-    );
+    )
+    });
 
     let rows = match pool {
         DbPool::Pg(p) => match sqlx::query::<Postgres>(&sql)
@@ -1265,12 +1286,14 @@ pub async fn custom_properties_batch(
     // containing commas) obsolete.  $1 is the userid (bound first).
     let rows: Vec<(String, String, String, i16)> = match pool {
         DbPool::Pg(p) => {
-            let sql = format!(
+            let sql = cached_sql(prefix, |prefix| {
+                format!(
                 "SELECT propertypath, propertyname, propertyvalue, valuetype \
                  FROM {prefix}properties \
                  WHERE userid = $1 AND propertypath = ANY($2::text[])",
                 prefix = prefix,
-            );
+            )
+            });
             let formatted: Vec<String> = paths.iter().map(|p| format_property_path(p)).collect();
             sqlx::query::<Postgres>(&sql)
                 .bind(userid)
@@ -1659,11 +1682,13 @@ async fn batch_lookup_display_names(
     //    text[] bind on Postgres (PHASE-22 T4).
     let user_rows: Vec<(String, Option<String>)> = match pool {
         DbPool::Pg(p) => {
-            let sql = format!(
+            let sql = cached_sql(prefix, |prefix| {
+                format!(
                 "SELECT uid, displayname FROM {prefix}users \
                  WHERE uid = ANY($1::text[])",
                 prefix = prefix
-            );
+            )
+            });
             sqlx::query::<Postgres>(&sql)
                 .bind(uids)
                 .fetch_all(p)
@@ -1716,11 +1741,13 @@ async fn batch_lookup_display_names(
     if !unresolved.is_empty() {
         let account_rows: Vec<(String, String)> = match pool {
             DbPool::Pg(p) => {
-                let sql = format!(
+                let sql = cached_sql(prefix, |prefix| {
+                    format!(
                     "SELECT uid, data FROM {prefix}accounts \
                      WHERE uid = ANY($1::text[])",
                     prefix = prefix
-                );
+                )
+                });
                 let uids: Vec<String> =
                     unresolved.iter().map(|s| s.as_str().to_string()).collect();
                 sqlx::query::<Postgres>(&sql)

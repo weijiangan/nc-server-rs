@@ -41,6 +41,8 @@ pub async fn store_version(
     old_upload_time: i64,
     source_fileid: i64,
     old_etag: &str,
+    dir_mime_id: i64,
+    dir_mimepart_id: i64,
 ) {
     debug!(
         fc_path,
@@ -94,10 +96,11 @@ pub async fn store_version(
         pool,
         prefix,
         storage_id,
-        mime_cache,
         data_dir,
         uid,
         &version_fc,
+        dir_mime_id,
+        dir_mimepart_id,
     )
     .await
     {
@@ -284,10 +287,11 @@ async fn ensure_version_parents(
     pool: &DbPool,
     prefix: &str,
     storage_id: i64,
-    mime_cache: &SharedMimeCache,
     data_dir: &Path,
     uid: &str,
     version_fc: &str,
+    dir_mime_id: i64,
+    dir_mimepart_id: i64,
 ) -> Result<(), String> {
     // Split into segments: "files_versions/X/Y/file.v123"
     let segments: Vec<&str> = version_fc.split('/').collect();
@@ -352,11 +356,6 @@ async fn ensure_version_parents(
         let name = seg.to_string();
         let now = current_timestamp();
 
-        let dir_mime_id =
-            nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, "httpd/unix-directory")
-                .await;
-        let dir_mimepart_id =
-            nc_db::mime::get_or_insert_mime_id(pool, prefix, mime_cache, "httpd").await;
         let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
 
         let sql = format!(
@@ -781,6 +780,8 @@ mod tests {
             0,   // old_upload_time
             4,   // source_fileid
             "old-etag",
+            2, // dir_mime_id (fixture: mimetype 2 = directory)
+            1, // dir_mimepart_id
         )
         .await;
 
