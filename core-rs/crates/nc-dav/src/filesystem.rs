@@ -1382,31 +1382,6 @@ impl DavFileSystem for NcFileSystem {
             )
             .await;
 
-            let child_fileids: Vec<i64> = children.iter().map(|c| c.fileid).collect();
-
-            // §9.5: prefetch tags for the directory + all children so that
-            // depth-1 PROPFIND has {oc:}favorite and {oc:}tags ready without
-            // N+1 DB queries.  Include the directory itself.
-            let mut prefetch_ids = child_fileids.clone();
-            prefetch_ids.push(dir_fileid);
-            crate::tags::prefetch_tags(
-                &self.state.pool,
-                &self.state.table_prefix,
-                &self.uid,
-                &prefetch_ids,
-                &self.tag_cache,
-            )
-            .await;
-
-            // ── Phase 18.1: per-request batch ────────────────────────────────
-            // Build every child's metadata once, then populate the per-request
-            // `propfind_batch` so per-child `get_props` reads cached values
-            // instead of re-issuing ~11 queries per node (load_meta, dir
-            // counts, shares, comments, system tags, custom properties).
-            // `get_props` runs after `read_dir` for every child, so the batch
-            // is always consumed; nodes outside it (the depth-0 root, which
-            // dav-server-rs visits before `read_dir`) fall back to the
-            // single-row queries.
             let child_ids: Vec<i64> = children.iter().map(|c| c.fileid).collect();
             let (metas, entries): (
                 Vec<(String, NcMetaData)>,
@@ -1453,92 +1428,103 @@ impl DavFileSystem for NcFileSystem {
                     children.insert(meta.fileid);
                 }
             }
-            if !child_ids.is_empty() {
-                let child_paths: Vec<String> = metas.iter().map(|(k, _)| k.clone()).collect();
-                // One GROUP BY count query for every dir child instead of one
-                // per directory ({nc:}contained-folder-count/-file-count).
-                let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &self.state.mime_cache,
-                    "httpd/unix-directory",
-                )
-                .await;
-                let counts = row::count_children_batch(
+            // ── Phase 18.1 / 21.1: per-request batch, run concurrently ───────
+            // Build every child's metadata once, then populate the per-request
+            // `propfind_batch` so per-child `get_props` reads cached values
+            // instead of re-issuing ~11 queries per node (load_meta, dir
+            // counts, shares, comments, system tags, custom properties).
+            // `get_props` runs after `read_dir` for every child, so the batch
+            // is always consumed; nodes outside it (the depth-0 root, which
+            // dav-server-rs visits before `read_dir`) fall back to the
+            // single-row queries.
+            //
+            // Every family depends only on the child-id list (plus the dir
+            // mime id — a cache hit after startup warmup), so all 8 run in
+            // one `tokio::join!` instead of 8 serial RTTs.  Each helper
+            // early-returns on empty input, so the join is unconditional; the
+            // results land in disjoint batch maps, so the extends below are
+            // lock- and order-safe.
+            let child_paths: Vec<String> = metas.iter().map(|(k, _)| k.clone()).collect();
+            // §9.5: prefetch tags for the directory + all children so that
+            // depth-1 PROPFIND has {oc:}favorite and {oc:}tags ready without
+            // N+1 DB queries.  Include the directory itself.
+            let mut prefetch_ids = child_ids.clone();
+            prefetch_ids.push(dir_fileid);
+            // One GROUP BY count query for every dir child instead of one
+            // per directory ({nc:}contained-folder-count/-file-count).
+            let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.state.mime_cache,
+                "httpd/unix-directory",
+            )
+            .await;
+            let (counts, details, notes, ccounts, unreads, tags, props, _) = tokio::join!(
+                row::count_children_batch(
                     &self.state.pool,
                     &self.state.table_prefix,
                     &child_ids,
                     self.storage_id,
                     dir_mime_id,
-                )
-                .await;
+                ),
+                // Shares, comments, system tags, custom properties — one
+                // query per family instead of one per child.
+                row::share_details_batch(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    &self.uid,
+                    &child_ids,
+                ),
+                row::share_notes_batch(&self.state.pool, &self.state.table_prefix, &child_ids),
+                row::comments_counts_batch(&self.state.pool, &self.state.table_prefix, &child_ids),
+                row::comments_unread_batch(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    &child_ids,
+                    &self.uid,
+                ),
+                row::system_tags_batch(&self.state.pool, &self.state.table_prefix, &child_ids),
+                row::custom_properties_batch(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    &self.uid,
+                    &child_paths,
+                ),
+                crate::tags::prefetch_tags(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    &self.uid,
+                    &prefetch_ids,
+                    &self.tag_cache,
+                ),
+            );
+            if !child_ids.is_empty() {
                 batch
                     .dir_counts
                     .lock()
                     .expect("propfind batch lock")
                     .extend(counts);
-                // Shares, comments, system tags, custom properties — one
-                // query per family instead of one per child.
-                let details = row::share_details_batch(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &self.uid,
-                    &child_ids,
-                )
-                .await;
                 batch
                     .share_details
                     .lock()
                     .expect("propfind batch lock")
                     .extend(details);
-                let notes = row::share_notes_batch(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &child_ids,
-                )
-                .await;
                 batch
                     .share_notes
                     .lock()
                     .expect("propfind batch lock")
                     .extend(notes);
-                let ccounts = row::comments_counts_batch(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &child_ids,
-                )
-                .await;
-                let unreads = row::comments_unread_batch(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &child_ids,
-                    &self.uid,
-                )
-                .await;
                 {
                     let mut comments = batch.comments.lock().expect("propfind batch lock");
                     for id in &child_ids {
                         comments.insert(*id, (*ccounts.get(id).unwrap_or(&0), *unreads.get(id).unwrap_or(&0)));
                     }
                 }
-                let tags = row::system_tags_batch(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &child_ids,
-                )
-                .await;
                 batch
                     .system_tags
                     .lock()
                     .expect("propfind batch lock")
                     .extend(tags);
-                let props = row::custom_properties_batch(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &self.uid,
-                    &child_paths,
-                )
-                .await;
                 batch
                     .custom_props
                     .lock()
