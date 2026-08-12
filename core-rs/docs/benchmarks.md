@@ -495,3 +495,74 @@ exempts `remote.php`).
 
 **Not a perf change** — identity resolution is a per-request constant (~µs of
 header parsing); the diff-test suite's per-scenario cost is unchanged.
+
+## Phase 21 — DAV read-path round-trip reduction, Tier 1 (2026-08-13)
+
+**Problem**: Phase 18.1 batched depth-1 PROPFIND to a fixed family set, but
+`read_dir` awaited every family **strictly sequentially** — 9+ serial network
+round trips per request, all mutually independent. On top of that, sqlx
+pinged the pooled connection on **every** `acquire()` (default
+`test_before_acquire`, a full flush round trip per ping), and the batch
+`IN ($1, …, $N)` lists built a **distinct prepared statement per child
+count** — a directory with 137 children generated a statement no other
+directory reuses, evicting shared ones from the 100-entry per-connection LRU.
+
+**Fixes** (phase-21 S0-S3, all behavior-neutral — same statements, same
+bytes; full plan in `SPECS/03-implementation-plan/plan/21-propfind-round-trip-reduction.md`):
+
+- **S0 pool flags** (`nc-db/src/pool.rs`): `.test_before_acquire(false)` —
+  dead connections are caught on first use, `max_lifetime`/`idle_timeout`
+  prune idle ones; `max_connections` 50 → `4 × physical_cores` clamped
+  [16, 64], physical cores from unique `(package_id, core_id)` sysfs pairs
+  (hyperthreads excluded — production is 2 physical / 4 logical; 2-core →
+  16, 6-core → 24, 16-core → 64). Also adds the cached `backend_is_postgres()`
+  dialect check (CLAUDE.md principle 6 — cache the backend once).
+- **S1 `tokio::join!`** (`nc-dav/src/filesystem.rs::read_dir`): the 8 batch
+  families (tag prefetch, dir counts, shares, notes, comments ×2, system
+  tags, custom props) run concurrently — one wall-clock RTT instead of 8.
+  All helpers early-return on empty input; results land in disjoint batch
+  maps, so statement counts and semantics are unchanged.
+- **S2 stable statement text** (`row.rs`, `propagator.rs`): Postgres binds
+  batch lists as one text bind expanded server-side via
+  `= ANY(string_to_array($1, ',')::…)` — one stable statement text forever
+  (sqlx's Any driver cannot bind arrays; the native `bigint[]` bind arrives
+  with the PgPool enum, Tier 3). SQLite keeps `IN` behind the cached dialect
+  check. Converted: `count_children_batch`, `share_details_batch` (+ its
+  users/accounts display-name lists), `share_notes_batch`,
+  `comments_counts_batch`, `comments_unread_batch`, `system_tags_batch`,
+  `list_extended_batch`, `lookup_by_ids`, and the propagator's pre-lock +
+  both UPDATEs. `custom_properties_batch` deliberately stays on `IN`
+  (property paths may contain commas).
+- **S3 hoisted statics** (`state.rs`, `main.rs`, `lib.rs`, `filesystem.rs`):
+  `httpd/unix-directory`/`httpd` mime ids resolved once at startup and
+  carried on `AppState` → `NcDavState`; the `oc_storages` numeric→string
+  lookup (per node on non-home storages) goes through a process-wide cache
+  with negative entries.
+
+**Measured** (30-iteration `bench-one SC=14_propfind_depth1`, SUT vs PHP on
+the same stack, median-of-3 windows):
+
+| step | root p50 (ms) | Media p50 (ms) | total p50 (ms) |
+|---|---|---|---|
+| baseline (pre-21) | 2.68 | 1.89 | 4.23 |
+| after S0+S1 (join! live) | 2.09 | 1.69 | 3.73 |
+| after S0+S1+S2+S3 | 2.09 | 1.73 | 3.90 |
+
+Root p50 −22% (2.68 → 2.09 ms); Media −11% (1.89 → 1.69). The round-trip
+collapse is worth most on slower storage where each RTT costs ms — the local
+hot DB keeps the visible win in the 10-20% band.
+
+**Statement-text stability probe**: depth-1 PROPFINDs across directories of
+1/12/37 children + the root produced **21 distinct SQL texts total**
+(arity-independent — the `ANY` forms serve every size); the old code added
+~7 new statement texts per distinct child count.
+
+**Perf-gate** stays green unchanged at every stop: status 0, get_file 5,
+propfind_depth0 11, propfind_depth1 20, put_new 16, scaling delta 9 (Tier 1
+changes no statement counts; budgets are lowered in later tiers that remove
+statements).
+
+**Verification**: 312 nc-dav + 38 nc-db unit tests green at every stop
+(SQLite `IN` path pinned by the batch-vs-single parity tests); full
+differential scenario suite run at the milestone on a `down -v`-reset stack
+(D-gates deviation — the suite runs at milestones, not per stop).
