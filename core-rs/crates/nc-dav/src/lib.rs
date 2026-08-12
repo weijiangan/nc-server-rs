@@ -27,6 +27,7 @@ pub use handler::dav_handler;
 pub use locksystem::NcLockSystem;
 pub use metadata::NcMetaData;
 pub use preview::ProviderRegistry;
+pub use row::SharedStorageCache;
 pub use upload::{SharedUploadStateStore, UploadMetadata, UploadStateStore};
 pub use upload_handler::upload_handler;
 
@@ -96,4 +97,12 @@ pub struct NcDavState {
     /// replaces the old `enable_previews` / `preview_ffmpeg_path` /
     /// `preview_libreoffice_path` fields.
     pub preview_registry: Arc<ProviderRegistry>,
+    // ── Phase 21 S3: hoisted static lookups ──────────────────────────────────
+    /// `httpd/unix-directory` mimetype id, resolved once at startup — the
+    /// read path (`read_dir`, `get_props`, `open`) never re-looks it up.
+    pub dir_mime_id: i64,
+    /// `httpd` mimepart id for directories, resolved once at startup.
+    pub dir_mimepart_id: i64,
+    /// Process-wide `oc_storages` numeric→string cache (negative entries).
+    pub storage_cache: SharedStorageCache,
 }

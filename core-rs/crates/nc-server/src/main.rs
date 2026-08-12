@@ -63,6 +63,20 @@ async fn main() -> anyhow::Result<()> {
     let mime_cache = nc_db::mime::load_mime_cache(&pool, prefix)
         .await
         .context("Failed to load mime-type cache")?;
+
+    // ── Phase 21 S3: hoisted static lookups ─────────────────────────────────
+    // Resolve the directory mimetype/mimepart ids once so the DAV read path
+    // (read_dir, get_props, open) never re-looks them up per request.  The
+    // mime cache is warm from `load_mime_cache`; the one-time INSERT runs
+    // only if the rows are missing.
+    let dir_mime_id =
+        nc_db::mime::get_or_insert_mime_id(&pool, &table_prefix, &mime_cache, "httpd/unix-directory")
+            .await;
+    let dir_mimepart_id =
+        nc_db::mime::get_or_insert_mime_id(&pool, &table_prefix, &mime_cache, "httpd").await;
+    let storage_cache: nc_dav::SharedStorageCache =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
     let appconfig_cache = nc_db::appconfig::load_appconfig_cache(&pool, prefix)
         .await
         .context("Failed to load app config cache")?;
@@ -211,6 +225,9 @@ async fn main() -> anyhow::Result<()> {
         upload_state_store,
         preview_registry,
         preview_gen,
+        dir_mime_id,
+        dir_mimepart_id,
+        storage_cache,
     };
 
     // ── Phase 7.7: Background capability refresh ──────────────────────────────

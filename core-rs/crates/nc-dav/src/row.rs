@@ -573,6 +573,35 @@ pub async fn get_storage_string_id(pool: &DbPool, prefix: &str, numeric_id: i64)
         .flatten()
 }
 
+/// Shared `oc_storages` `numeric_id → string_id` cache (phase-21 S3).
+///
+/// `oc_storages` is tiny and near-static; the table is consulted per node on
+/// non-home storages (`get_props`'s `is_mounted` decision).  Negative entries
+/// are cached too: storage rows exist before any filecache row referencing
+/// them (PHP creates the storage at user creation), so a cached `None` is
+/// safe.
+pub type SharedStorageCache =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i64, Option<String>>>>;
+
+/// `get_storage_string_id` with a process-wide cache: hit → return; miss →
+/// query + insert (`Some`/`None`).
+pub async fn get_storage_string_id_cached(
+    pool: &DbPool,
+    prefix: &str,
+    cache: &SharedStorageCache,
+    numeric_id: i64,
+) -> Option<String> {
+    if let Some(v) = cache.lock().expect("storage cache lock").get(&numeric_id) {
+        return v.clone();
+    }
+    let v = get_storage_string_id(pool, prefix, numeric_id).await;
+    cache
+        .lock()
+        .expect("storage cache lock")
+        .insert(numeric_id, v.clone());
+    v
+}
+
 /// Return the MAX permissions from `oc_share` for a given file and owner/initiator.
 ///
 /// Query: `SELECT MAX(permissions) FROM oc_share WHERE (uid_owner = ? OR

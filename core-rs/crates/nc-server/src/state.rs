@@ -59,6 +59,13 @@ pub struct AppState {
     /// is `None` when Imaginary is not configured+gated, in which case generation
     /// misses proxy to PHP-FPM (hit-serving stays on regardless).
     pub preview_gen: Arc<crate::preview_gen::PreviewGen>,
+    // ── Phase 21 S3: hoisted static lookups ──────────────────────────────────
+    /// `httpd/unix-directory` / `httpd` mimetype ids, resolved once at
+    /// startup (after `load_mime_cache`); copied into `NcDavState` per request.
+    pub dir_mime_id: i64,
+    pub dir_mimepart_id: i64,
+    /// Process-wide `oc_storages` numeric→string cache (negative entries).
+    pub storage_cache: nc_dav::SharedStorageCache,
 }
 
 /// Allow axum to extract `OcsState` from the top-level `AppState` using the
@@ -105,6 +112,9 @@ impl FromRef<AppState> for nc_dav::NcDavState {
             base_url,
             upload_state_store: state.upload_state_store.clone(),
             preview_registry: state.preview_registry.clone(),
+            dir_mime_id: state.dir_mime_id,
+            dir_mimepart_id: state.dir_mimepart_id,
+            storage_cache: state.storage_cache.clone(),
         }
     }
 }

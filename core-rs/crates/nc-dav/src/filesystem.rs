@@ -281,21 +281,10 @@ impl NcFileSystem {
                 .as_secs() as i64;
             let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
 
-            // §10.8: mimetype = httpd/unix-directory, mimepart = httpd
-            let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
-                &self.state.pool,
-                &self.state.table_prefix,
-                &self.state.mime_cache,
-                "httpd/unix-directory",
-            )
-            .await;
-            let dir_mimepart_id = nc_db::mime::get_or_insert_mime_id(
-                &self.state.pool,
-                &self.state.table_prefix,
-                &self.state.mime_cache,
-                "httpd",
-            )
-            .await;
+            // §10.8: mimetype = httpd/unix-directory, mimepart = httpd.
+            // Resolved once at startup (phase-21 S3).
+            let dir_mime_id = self.state.dir_mime_id;
+            let dir_mimepart_id = self.state.dir_mimepart_id;
             let hash = row::path_hash(&built);
             let name = seg.to_string();
 
@@ -1452,13 +1441,9 @@ impl DavFileSystem for NcFileSystem {
             prefetch_ids.push(dir_fileid);
             // One GROUP BY count query for every dir child instead of one
             // per directory ({nc:}contained-folder-count/-file-count).
-            let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
-                &self.state.pool,
-                &self.state.table_prefix,
-                &self.state.mime_cache,
-                "httpd/unix-directory",
-            )
-            .await;
+            // Resolved once at startup (phase-21 S3) — the read path never
+            // re-looks it up.
+            let dir_mime_id = self.state.dir_mime_id;
             let (counts, details, notes, ccounts, unreads, tags, props, _) = tokio::join!(
                 row::count_children_batch(
                     &self.state.pool,
@@ -2468,13 +2453,8 @@ impl DavFileSystem for NcFileSystem {
                 if batch_contains(&self.propfind_batch.children, &meta.fileid) {
                     batch_get(&self.propfind_batch.dir_counts, &meta.fileid).unwrap_or((0, 0))
                 } else {
-                    let dir_mime_id = nc_db::mime::get_or_insert_mime_id(
-                        &self.state.pool,
-                        &self.state.table_prefix,
-                        &self.state.mime_cache,
-                        "httpd/unix-directory",
-                    )
-                    .await;
+                    // Resolved once at startup (phase-21 S3).
+                    let dir_mime_id = self.state.dir_mime_id;
                     row::count_children(
                         &self.state.pool,
                         &self.state.table_prefix,
@@ -2521,10 +2501,17 @@ impl DavFileSystem for NcFileSystem {
             let is_mounted = if meta.storage == self.storage_id {
                 false
             } else {
-                row::get_storage_string_id(&self.state.pool, &self.state.table_prefix, meta.storage)
-                    .await
-                    .map(|id| !id.starts_with("home::"))
-                    .unwrap_or(false)
+                // Phase-21 S3: process-wide cache (negative entries) — the
+                // table is tiny and near-static.
+                row::get_storage_string_id_cached(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    &self.state.storage_cache,
+                    meta.storage,
+                )
+                .await
+                .map(|id| !id.starts_with("home::"))
+                .unwrap_or(false)
             };
 
             // is_shared: false for home-storage nodes — the file is the user's own.
@@ -4031,6 +4018,9 @@ mod tests {
             base_url: Arc::new(String::new()),
             upload_state_store: Arc::new(UploadStateStore::new()),
             preview_registry: Arc::new(ProviderRegistry::build(false, None, false, false, false, &[])),
+            dir_mime_id: 1,
+            dir_mimepart_id: 1,
+            storage_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let write_result: SharedWriteResult = Arc::new(std::sync::Mutex::new(None::<WriteResult>));
         let put_error: crate::SharedPutError = Arc::new(std::sync::Mutex::new(None));
