@@ -19,7 +19,8 @@ Phase-by-phase execution tracking. Each phase is intentionally kept as a single 
   - [`phase-11.md`](phase-11.md) — Native Preview / Thumbnail Fast Path — ⬜
   - [`phase-16.md`](phase-16.md) — Differential Integration-Test Harness — ⬜
   - [`phase-18.md`](phase-18.md) — Performance improvements (flamegraph rounds 1-4) — ✅
-  - [`phase-21.md`](phase-21.md) — DAV read-path round-trip reduction, Tier 1 — 🔧
+  - [`phase-21.md`](phase-21.md) — DAV read-path round-trip reduction, Tier 1 — ✅
+  - [`phase-22.md`](phase-22.md) — Remaining plan items T6-T10 — ⬜
 
 ## Related
 - How to write/track tasks: [`../05-llm-playbooks/README.md`](../05-llm-playbooks/README.md)
