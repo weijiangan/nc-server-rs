@@ -72,6 +72,14 @@ pub struct NcFileSystem {
     /// which dav-server-rs visits before `read_dir`) fall back to the
     /// single-row queries.
     pub(crate) propfind_batch: PropfindBatch,
+    /// NEXTCLOUD-RS PATCH (PHASE-22 T6.5): the client's explicitly requested
+    /// property set `(namespace, name)` for `<prop>` PROPFIND requests, set
+    /// by dav-server's `handle_propfind` before any read_dir work.  `None`
+    /// for allprop/propname (everything requested).  Gates the read_dir
+    /// batch families (T6.6).  A plain field is fine: dav-server clones the
+    /// fs into `PropWriter` only after the setter runs, and `read_dir` runs
+    /// on the instance the setter was called on.
+    pub(crate) requested_props: Option<Vec<(Option<String>, String)>>,
 }
 
 /// Read a value from a per-request batch map, or `None` when the node is
@@ -162,6 +170,21 @@ impl NcFileSystem {
             skip_trashbin,
             tag_cache,
             propfind_batch: PropfindBatch::default(),
+            requested_props: None,
+        }
+    }
+
+    /// Is `(ns, name)` requested by the current PROPFIND request?
+    ///
+    /// `None` (allprop / propname / non-PROPFIND requests) means every
+    /// property is requested.  `Some(list)` is the client's explicit
+    /// `<d:prop>` set (PHASE-22 T6.5).
+    pub(crate) fn prop_requested(&self, ns: &str, name: &str) -> bool {
+        match &self.requested_props {
+            None => true,
+            Some(list) => list
+                .iter()
+                .any(|(n, nm)| n.as_deref() == Some(ns) && nm == name),
         }
     }
 
@@ -1309,6 +1332,12 @@ fn trash_fc_name(basename: &str, ts: i64) -> String {
 // ─── DavFileSystem impl ────────────────────────────────────────────────────────
 
 impl DavFileSystem for NcFileSystem {
+    // ── requested props (PHASE-22 T6.5) ─────────────────────────────────────
+
+    fn set_requested_props(&mut self, requested: Option<Vec<(Option<String>, String)>>) {
+        self.requested_props = requested;
+    }
+
     // ── metadata ─────────────────────────────────────────────────────────────
 
     fn metadata<'a>(
@@ -1386,6 +1415,17 @@ impl DavFileSystem for NcFileSystem {
             }
 
             let child_ids: Vec<i64> = children.iter().map(|c| c.fileid).collect();
+            // Resolved once at startup (phase-21 S3) — the read path never
+            // re-looks it up.
+            let dir_mime_id = self.state.dir_mime_id;
+            // Only directory children can have children of their own (T6.2):
+            // keep the dir-count batch's parent list to directories so files
+            // never enter the IN list or the GROUP BY scan.
+            let dir_child_ids: Vec<i64> = children
+                .iter()
+                .filter(|c| c.mimetype == dir_mime_id)
+                .map(|c| c.fileid)
+                .collect();
             let (metas, entries): (
                 Vec<(String, NcMetaData)>,
                 Vec<Result<Box<dyn DavDirEntry>, FsError>>,
@@ -1431,7 +1471,7 @@ impl DavFileSystem for NcFileSystem {
                     children.insert(meta.fileid);
                 }
             }
-            // ── Phase 18.1 / 21.1: per-request batch, run concurrently ───────
+            // ── Phase 18.1 / 21.1 / 22 T6.6: per-request batch, concurrently ─
             // Build every child's metadata once, then populate the per-request
             // `propfind_batch` so per-child `get_props` reads cached values
             // instead of re-issuing ~11 queries per node (load_meta, dir
@@ -1442,61 +1482,132 @@ impl DavFileSystem for NcFileSystem {
             // single-row queries.
             //
             // Every family depends only on the child-id list (plus the dir
-            // mime id — a cache hit after startup warmup), so all 8 run in
-            // one `tokio::join!` instead of 8 serial RTTs.  Each helper
-            // early-returns on empty input, so the join is unconditional; the
-            // results land in disjoint batch maps, so the extends below are
-            // lock- and order-safe.
+            // mime id — a cache hit after startup warmup), so the families
+            // run in one `tokio::join!` instead of serial RTTs.  Each helper
+            // early-returns on empty input; the results land in disjoint
+            // batch maps, so the extends below are lock- and order-safe.
+            //
+            // PHASE-22 T6.6: gate each family on the client's explicit
+            // `<prop>` set (`requested_props` = None → allprop/propname →
+            // everything).  Skipped families leave their batch maps empty:
+            // in-batch `get_props` consumers read the empty maps (no per-node
+            // queries), and PropWriter's 12.1 filter drops the props from the
+            // response anyway — identical bytes, less work.
             let child_paths: Vec<String> = metas.iter().map(|(k, _)| k.clone()).collect();
-            // §9.5: prefetch tags for the directory + all children so that
-            // depth-1 PROPFIND has {oc:}favorite and {oc:}tags ready without
-            // N+1 DB queries.  Include the directory itself.
-            let mut prefetch_ids = child_ids.clone();
-            prefetch_ids.push(dir_fileid);
-            // One GROUP BY count query for every dir child instead of one
-            // per directory ({nc:}contained-folder-count/-file-count).
-            // Resolved once at startup (phase-21 S3) — the read path never
-            // re-looks it up.
-            let dir_mime_id = self.state.dir_mime_id;
-            let (counts, details, notes, ccounts, unreads, tags, props, _) = tokio::join!(
-                row::count_children_batch(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &child_ids,
-                    self.storage_id,
-                    dir_mime_id,
-                ),
-                // Shares, comments, system tags, custom properties — one
-                // query per family instead of one per child.
-                row::share_details_batch(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &self.uid,
-                    &child_ids,
-                ),
-                row::share_notes_batch(&self.state.pool, &self.state.table_prefix, &child_ids),
-                row::comments_counts_batch(&self.state.pool, &self.state.table_prefix, &child_ids),
-                row::comments_unread_batch(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &child_ids,
-                    &self.uid,
-                ),
-                row::system_tags_batch(&self.state.pool, &self.state.table_prefix, &child_ids),
-                row::custom_properties_batch(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &self.uid,
-                    &child_paths,
-                ),
-                crate::tags::prefetch_tags(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &self.uid,
-                    &prefetch_ids,
-                    &self.tag_cache,
-                ),
+            let oc_ns = "http://owncloud.org/ns";
+            let nc_ns = "http://nextcloud.org/ns";
+            let want_dir_counts = self.prop_requested(nc_ns, "contained-folder-count")
+                || self.prop_requested(nc_ns, "contained-file-count");
+            // T6.1 merged the share scan, so share-types/sharees/note share
+            // one gate; T6.3 merged the comments query (count + unread).
+            let want_shares = self.prop_requested(oc_ns, "share-types")
+                || self.prop_requested(oc_ns, "sharees")
+                || self.prop_requested(nc_ns, "note");
+            let want_comments = self.prop_requested(oc_ns, "comments-count")
+                || self.prop_requested(oc_ns, "comments-unread");
+            let want_system_tags = self.prop_requested(nc_ns, "system-tags");
+            // §9.5 prefetch — gated in `get_props` too (same predicate), or
+            // skipping the prefetch would re-introduce one query per child.
+            let want_tags = self.prop_requested(oc_ns, "favorite")
+                || self.prop_requested(oc_ns, "tags");
+            // Custom props serve any prop outside the known server namespaces
+            // (the same list `get_props`' custom-prop emission uses).
+            let want_custom_props = match &self.requested_props {
+                None => true,
+                Some(list) => list.iter().any(|(n, _)| {
+                    !matches!(
+                        n.as_deref(),
+                        Some("DAV:")
+                            | Some("http://owncloud.org/ns")
+                            | Some("http://nextcloud.org/ns")
+                            | Some("http://open-collaboration-services.org/ns")
+                    )
+                }),
+            };
+            let (counts, share_maps, cc_unreads, tags, props, _) = tokio::join!(
+                async {
+                    if want_dir_counts {
+                        row::count_children_batch(
+                            &self.state.pool,
+                            &self.state.table_prefix,
+                            &dir_child_ids,
+                            self.storage_id,
+                            dir_mime_id,
+                        )
+                        .await
+                    } else {
+                        std::collections::HashMap::new()
+                    }
+                },
+                async {
+                    if want_shares {
+                        row::share_details_and_notes_batch(
+                            &self.state.pool,
+                            &self.state.table_prefix,
+                            &self.uid,
+                            &child_ids,
+                        )
+                        .await
+                    } else {
+                        (
+                            std::collections::HashMap::new(),
+                            std::collections::HashMap::new(),
+                        )
+                    }
+                },
+                async {
+                    if want_comments {
+                        row::comments_counts_batch(
+                            &self.state.pool,
+                            &self.state.table_prefix,
+                            &child_ids,
+                            &self.uid,
+                        )
+                        .await
+                    } else {
+                        std::collections::HashMap::new()
+                    }
+                },
+                async {
+                    if want_system_tags {
+                        row::system_tags_batch(&self.state.pool, &self.state.table_prefix, &child_ids)
+                            .await
+                    } else {
+                        std::collections::HashMap::new()
+                    }
+                },
+                async {
+                    if want_custom_props {
+                        row::custom_properties_batch(
+                            &self.state.pool,
+                            &self.state.table_prefix,
+                            &self.uid,
+                            &child_paths,
+                        )
+                        .await
+                    } else {
+                        std::collections::HashMap::new()
+                    }
+                },
+                async {
+                    if want_tags {
+                        // §9.5: prefetch tags for the directory + all
+                        // children so {oc:}favorite/{oc:}tags are ready
+                        // without N+1 DB queries.  Include the directory.
+                        let mut prefetch_ids = child_ids.clone();
+                        prefetch_ids.push(dir_fileid);
+                        crate::tags::prefetch_tags(
+                            &self.state.pool,
+                            &self.state.table_prefix,
+                            &self.uid,
+                            &prefetch_ids,
+                            &self.tag_cache,
+                        )
+                        .await;
+                    }
+                },
             );
+            let (details, notes) = share_maps;
             if !child_ids.is_empty() {
                 batch
                     .dir_counts
@@ -1516,7 +1627,8 @@ impl DavFileSystem for NcFileSystem {
                 {
                     let mut comments = batch.comments.lock().expect("propfind batch lock");
                     for id in &child_ids {
-                        comments.insert(*id, (*ccounts.get(id).unwrap_or(&0), *unreads.get(id).unwrap_or(&0)));
+                        let (c, u) = cc_unreads.get(id).copied().unwrap_or((0, 0));
+                        comments.insert(*id, (c, u));
                     }
                 }
                 batch
@@ -2638,14 +2750,26 @@ impl DavFileSystem for NcFileSystem {
                 .is_available(&meta.mime_type, is_mounted);
 
             // §9.5: resolve tags / favorite from oc_vcategory / oc_vcategory_to_object.
-            let tag_info = crate::tags::get_tag_info(
-                &self.state.pool,
-                &self.state.table_prefix,
-                &self.uid,
-                meta.fileid,
-                &self.tag_cache,
-            )
-            .await;
+            // PHASE-22 T6.6: gate on the requested props like read_dir's
+            // prefetch — an ungated lookup here would re-introduce one query
+            // per child whenever the prefetch was skipped.
+            let tag_info = if self.prop_requested("http://owncloud.org/ns", "favorite")
+                || self.prop_requested("http://owncloud.org/ns", "tags")
+            {
+                crate::tags::get_tag_info(
+                    &self.state.pool,
+                    &self.state.table_prefix,
+                    &self.uid,
+                    meta.fileid,
+                    &self.tag_cache,
+                )
+                .await
+            } else {
+                crate::tags::TagInfo {
+                    tags: Vec::new(),
+                    is_favorite: false,
+                }
+            };
 
             // ── PHASE-12.5: share-types / sharees ──────────────────────────
             // Phase 18.1: batched by read_dir; single query for nodes

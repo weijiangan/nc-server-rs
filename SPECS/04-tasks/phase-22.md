@@ -28,12 +28,12 @@ Goal: stop doing work the client didn't ask for, and merge the batch families th
 
 ### T6 tasks
 
-- [ ] **T6.1** Merge `share_details_batch` + `share_notes_batch` into one `oc_share` scan (`row.rs`): one query with the details filter (uid conditions + share_type list), rows split in Rust — `note != ''` rows feed the notes map with per-file most-recent-`stime`; all rows feed `share_details` (preserving `ShareDetail` + the display-name batch). Extend the SQLite tests to pin the merged behavior.
-- [ ] **T6.2** `count_children_batch`: `SUM(CASE WHEN …)` → `count(*) FILTER (WHERE mimetype = …)`; filter `parent_ids` to directory children (mimetype == dir_mime_id) before building the list.
-- [ ] **T6.3** Merge `comments_counts_batch` + `comments_unread_batch` into one `GROUP BY c.object_id` with `COUNT(*)` + `COUNT(*) FILTER (WHERE …)`; `read_dir`'s comment-map filling consumes (count, unread) per fileid; update `comments_batches_match_singles`.
-- [ ] **T6.4** De-correlate the unread-marker subquery: `LEFT JOIN {prefix}comments_read_markers m ON m.user_id = $uid AND m.object_type = 'files' AND m.object_id = c.object_id`, `COALESCE(m.marker_datetime, '1970-01-01 00:00:00')`; same in the single-row `get_comments_unread` fallback.
-- [ ] **T6.5** Vendored patch: new `Filesystem` trait method (default no-op) receiving the parsed requested props; `handle_propfind` calls it; `NcFileSystem` stores them per-request with a `prop_requested(ns, name)` helper.
-- [ ] **T6.6** Gate each batch family in `read_dir` (`filesystem.rs:1445-1547`) on the family→prop mapping; `custom_properties_batch` skipped when every requested prop is in the known namespaces; the lazy `cache/` ensure (phase-21) stays outside the filtering.
+- [x] **T6.1** Merge `share_details_batch` + `share_notes_batch` into one `oc_share` scan (`row.rs`): one query with the details filter (uid conditions + share_type list), rows split in Rust — `note != ''` rows feed the notes map with per-file most-recent-`stime`; all rows feed `share_details` (preserving `ShareDetail` + the display-name batch). Extend the SQLite tests to pin the merged behavior.
+- [x] **T6.2** `count_children_batch`: `SUM(CASE WHEN …)` → `count(*) FILTER (WHERE mimetype = …)`; filter `parent_ids` to directory children (mimetype == dir_mime_id) before building the list.
+- [x] **T6.3** Merge `comments_counts_batch` + `comments_unread_batch` into one `GROUP BY c.object_id` with `COUNT(*)` + `COUNT(*) FILTER (WHERE …)`; `read_dir`'s comment-map filling consumes (count, unread) per fileid; update `comments_batches_match_singles`.
+- [x] **T6.4** De-correlate the unread-marker subquery: `LEFT JOIN {prefix}comments_read_markers m ON m.user_id = $uid AND m.object_type = 'files' AND m.object_id = c.object_id`, `COALESCE(m.marker_datetime, '1970-01-01 00:00:00')`; same in the single-row `get_comments_unread` fallback.
+- [x] **T6.5** Vendored patch: new `Filesystem` trait method (default no-op) receiving the parsed requested props; `handle_propfind` calls it; `NcFileSystem` stores them per-request with a `prop_requested(ns, name)` helper.
+- [x] **T6.6** Gate each batch family in `read_dir` (`filesystem.rs:1445-1547`) on the family→prop mapping; `custom_properties_batch` skipped when every requested prop is in the known namespaces; the lazy `cache/` ensure (phase-21) stays outside the filtering.
 
 ---
 
@@ -158,8 +158,9 @@ Goal: verify the index claims against the live DB — verification only. Plan fi
 
 ## Deviations from the task descriptions
 
-(none yet — record departures here per the documentation conventions.)
+- **T6.6** — the task scopes prop-set gating to `read_dir`; the `{oc:}favorite`/`{oc:}tags` family additionally gates `get_props`'s `get_tag_info` call. Without it, skipping the prefetch turns one batch query into one query per child (the N+1 the batch exists to prevent) — the task's own goal would fail. Same predicate on both sides; behavior-neutral (PropWriter's 12.1 filter drops the props either way).
 
 ## Changes
 
+- 2026-08-13: T6 landed (merges, de-correlation, prop-set plumbing + gating). **Divergence candidate (unchanged, needs an explicit decision):** PHP's `getNumberOfUnreadCommentsForObjects` has no `actor_type`/`actor_id` filter (`Manager.php:673-689`) — a user's own comment newer than the marker counts as unread in PHP; Rust's `get_comments_unread` excludes it since phase 12.6, and no difftest scenario exercises comments, so it was never A/B'd.
 - 2026-08-13: Phase created as the combined doc for the plan's remaining items T6-T10 (the amended execution order after Tier 1; plan section 21). T6 grounding: `PropWriter.requested` already exists (`handle_props.rs:233-236`); harness + perf-gate send allprop, so budgets drop only from the merges (delta 9 → 7, propfind_depth1 20 → 18); the share-pair filters differ and split in Rust; the unread-marker de-correlation is its own task. T3-T10 grounding per plan findings 3-10; T2 is the largest refactor (row-API change) and intentionally last among the structural items.

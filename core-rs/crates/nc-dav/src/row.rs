@@ -505,8 +505,8 @@ pub async fn count_children_batch(
     let sql = if pg {
         format!(
             "SELECT parent, \
-             SUM(CASE WHEN mimetype = $2 THEN 1 ELSE 0 END) AS dirs, \
-             SUM(CASE WHEN mimetype != $2 THEN 1 ELSE 0 END) AS files \
+             count(*) FILTER (WHERE mimetype = $2) AS dirs, \
+             count(*) FILTER (WHERE mimetype != $2) AS files \
              FROM {prefix}filecache \
              WHERE parent = ANY(string_to_array($1, ',')::bigint[]) AND storage = $3 \
              GROUP BY parent",
@@ -520,8 +520,8 @@ pub async fn count_children_batch(
             .join(", ");
         format!(
             "SELECT parent, \
-             SUM(CASE WHEN mimetype = $1 THEN 1 ELSE 0 END) AS dirs, \
-             SUM(CASE WHEN mimetype != $1 THEN 1 ELSE 0 END) AS files \
+             count(*) FILTER (WHERE mimetype = $1) AS dirs, \
+             count(*) FILTER (WHERE mimetype != $1) AS files \
              FROM {prefix}filecache \
              WHERE parent IN ({placeholders}) AND storage = ${storage} \
              GROUP BY parent",
@@ -648,26 +648,45 @@ pub async fn get_share_note(pool: &DbPool, prefix: &str, fileid: i64) -> String 
         .unwrap_or_default()
 }
 
-/// Most-recent non-empty share note for a **batch** of files in one query.
+/// Share details + most-recent share notes for a **batch** of files in one
+/// `oc_share` scan (T6.1 merge of the former `share_details_batch` +
+/// `share_notes_batch` pair).
 ///
-/// Mirrors `get_share_note` (`ORDER BY stime DESC LIMIT 1` per file) via a
-/// single `ORDER BY file_source, stime DESC` — the first row per file in the
-/// result is its most recent note.  Files without a note are absent from the
-/// map (callers fall back to the single query, which returns `""`).
-pub async fn share_notes_batch(
+/// One query fetches every `oc_share` row for the file ids (no WHERE beyond
+/// the list — the two consumers filter differently, see below); the rows are
+/// split in Rust:
+///
+/// - **details**: rows passing the `get_share_details` filter (share_type
+///   `IN (0,1,3,4,6,7,10,12)` and the user is owner / initiator / share_with),
+///   with the same display-name resolution.  Per-file row order preserves
+///   the scan order — the pre-merge batch had no `ORDER BY` either, so the
+///   emitted `{oc:}share-types` / `{nc:}sharees` XML bytes are unchanged.
+/// - **notes**: the most-recent (`stime`-max) row with `note != ''` per
+///   file — exactly `get_share_note`'s `WHERE note != '' ORDER BY stime
+///   DESC LIMIT 1`.  Note rows are deliberately NOT restricted to the
+///   details filter: the most-recent note may live on a share the user is
+///   not a party to (the single-row query has no such filter either).
+///
+/// Files without shares / notes are absent from the respective maps (callers
+/// fall back to the single queries, which return `[]` / `""`).
+pub async fn share_details_and_notes_batch(
     pool: &DbPool,
     prefix: &str,
+    uid: &str,
     fileids: &[i64],
-) -> std::collections::HashMap<i64, String> {
+) -> (
+    std::collections::HashMap<i64, Vec<ShareDetail>>,
+    std::collections::HashMap<i64, String>,
+) {
     if fileids.is_empty() {
-        return std::collections::HashMap::new();
+        return (std::collections::HashMap::new(), std::collections::HashMap::new());
     }
     let pg = backend_is_postgres();
     let sql = if pg {
         format!(
-            "SELECT file_source, note FROM {prefix}share \
-             WHERE file_source = ANY(string_to_array($1, ',')::bigint[]) AND note != '' \
-             ORDER BY file_source, stime DESC",
+            "SELECT file_source, share_type, share_with, uid_owner, uid_initiator, note, stime \
+             FROM {prefix}share \
+             WHERE file_source = ANY(string_to_array($1, ',')::bigint[])",
             prefix = prefix,
         )
     } else {
@@ -676,9 +695,9 @@ pub async fn share_notes_batch(
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "SELECT file_source, note FROM {prefix}share \
-             WHERE file_source IN ({placeholders}) AND note != '' \
-             ORDER BY file_source, stime DESC",
+            "SELECT file_source, share_type, share_with, uid_owner, uid_initiator, note, stime \
+             FROM {prefix}share \
+             WHERE file_source IN ({placeholders})",
             prefix = prefix,
         )
     };
@@ -690,14 +709,80 @@ pub async fn share_notes_batch(
             query = query.bind(*id);
         }
     }
-    let mut notes = std::collections::HashMap::new();
-    for row in query.fetch_all(pool).await.unwrap_or_default() {
-        let file_source: i64 = row.get("file_source");
-        notes
-            .entry(file_source)
-            .or_insert_with(|| row.get("note"));
+    let rows = match query.fetch_all(pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(uid, error = %e, "share_details_and_notes_batch: SQL error");
+            return (std::collections::HashMap::new(), std::collections::HashMap::new());
+        }
+    };
+
+    // Notes split: most-recent (max stime) non-empty note per file.  An
+    // empty-note row with a newer stime must not hide an older note.
+    let mut notes: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    let mut best_stime: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for r in &rows {
+        let note: String = r.get("note");
+        if note.is_empty() {
+            continue;
+        }
+        let file_source: i64 = r.get("file_source");
+        let stime: i64 = r.get("stime");
+        match best_stime.get(&file_source) {
+            Some(prev) if *prev >= stime => continue,
+            _ => {
+                best_stime.insert(file_source, stime);
+                notes.insert(file_source, note);
+            }
+        }
     }
-    notes
+
+    // Details split: the `get_share_details` filter, applied in Rust (the
+    // scan carries no WHERE beyond the file ids so the notes split sees
+    // every row).
+    let filtered = rows
+        .iter()
+        .filter(|r| {
+            let share_type: i16 = r.get("share_type");
+            if !matches!(share_type, 0 | 1 | 3 | 4 | 6 | 7 | 10 | 12) {
+                return false;
+            }
+            let owner: String = r.get("uid_owner");
+            let initiator: Option<String> = r.get("uid_initiator");
+            let with: Option<String> = r.get("share_with");
+            owner == uid || initiator.as_deref() == Some(uid) || with.as_deref() == Some(uid)
+        })
+        .collect::<Vec<_>>();
+
+    // Batch-resolve display names for user-type shares (share_type = 0) —
+    // one query for every user across all files, same as the single query.
+    let user_withs: Vec<String> = filtered
+        .iter()
+        .filter(|r| r.get::<i16, _>("share_type") == 0)
+        .filter_map(|r| r.get::<Option<String>, _>("share_with"))
+        .collect();
+    let display_names = batch_lookup_display_names(pool, prefix, &user_withs).await;
+
+    let mut out: std::collections::HashMap<i64, Vec<ShareDetail>> =
+        std::collections::HashMap::new();
+    for r in filtered {
+        let file_source: i64 = r.get("file_source");
+        let share_type: i16 = r.get("share_type");
+        let share_with: Option<String> = r.get("share_with");
+        let displayname = match share_type {
+            0 => share_with
+                .as_ref()
+                .and_then(|sw| display_names.get(sw.as_str()).cloned())
+                .unwrap_or_else(|| share_with.clone().unwrap_or_default()),
+            _ => share_with.clone().unwrap_or_default(),
+        };
+        out.entry(file_source).or_default().push(ShareDetail {
+            share_type,
+            share_with,
+            share_with_displayname: displayname,
+        });
+    }
+    (out, notes)
 }
 
 /// All `oc_filecache` rows in the subtree of `fc_path` whose `mtime >
@@ -1160,94 +1245,6 @@ pub async fn get_share_details(
         .collect()
 }
 
-/// Share details for a **batch** of files in one query, keyed by fileid.
-///
-/// Same filter and display-name resolution as `get_share_details`; the
-/// per-file row order matches what the single query returns (no ORDER BY).
-/// Files without shares are absent from the map.
-pub async fn share_details_batch(
-    pool: &DbPool,
-    prefix: &str,
-    uid: &str,
-    fileids: &[i64],
-) -> std::collections::HashMap<i64, Vec<ShareDetail>> {
-    if fileids.is_empty() {
-        return std::collections::HashMap::new();
-    }
-    let n = fileids.len();
-    let pg = backend_is_postgres();
-    let sql = if pg {
-        format!(
-            "SELECT file_source, share_type, share_with \
-             FROM {prefix}share \
-             WHERE file_source = ANY(string_to_array($1, ',')::bigint[]) \
-             AND share_type IN (0,1,3,4,6,7,10,12) \
-             AND (uid_owner = $2 OR uid_initiator = $2 OR share_with = $2)",
-            prefix = prefix,
-        )
-    } else {
-        let placeholders = (1..=n)
-            .map(|i| format!("${i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "SELECT file_source, share_type, share_with \
-             FROM {prefix}share \
-             WHERE file_source IN ({placeholders}) \
-             AND share_type IN (0,1,3,4,6,7,10,12) \
-             AND (uid_owner = ${uid} OR uid_initiator = ${uid} OR share_with = ${uid})",
-            prefix = prefix,
-            uid = n + 1,
-        )
-    };
-    let mut query = sqlx::query(&sql);
-    if pg {
-        query = query.bind(ids_csv(fileids));
-    } else {
-        for id in fileids {
-            query = query.bind(*id);
-        }
-    }
-    query = query.bind(uid);
-    let rows = match query.fetch_all(pool).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(uid, error = %e, "share_details_batch: SQL error");
-            return std::collections::HashMap::new();
-        }
-    };
-
-    // Batch-resolve display names for user-type shares (share_type = 0) —
-    // one query for every user across all files, same as the single query.
-    let user_withs: Vec<String> = rows
-        .iter()
-        .filter(|r| r.get::<i16, _>("share_type") == 0)
-        .filter_map(|r| r.get::<Option<String>, _>("share_with"))
-        .collect();
-    let display_names = batch_lookup_display_names(pool, prefix, &user_withs).await;
-
-    let mut out: std::collections::HashMap<i64, Vec<ShareDetail>> =
-        std::collections::HashMap::new();
-    for r in rows {
-        let file_source: i64 = r.get("file_source");
-        let share_type: i16 = r.get("share_type");
-        let share_with: Option<String> = r.get("share_with");
-        let displayname = match share_type {
-            0 => share_with
-                .as_ref()
-                .and_then(|sw| display_names.get(sw.as_str()).cloned())
-                .unwrap_or_else(|| share_with.clone().unwrap_or_default()),
-            _ => share_with.clone().unwrap_or_default(),
-        };
-        out.entry(file_source).or_default().push(ShareDetail {
-            share_type,
-            share_with,
-            share_with_displayname: displayname,
-        });
-    }
-    out
-}
-
 async fn batch_lookup_display_names(
     pool: &DbPool,
     prefix: &str,
@@ -1446,6 +1443,9 @@ pub async fn get_comments_count(pool: &DbPool, prefix: &str, fileid: i64) -> i64
 
 /// Return the number of unread comments for a file and user, matching PHP
 /// `ICommentsManager::getNumberOfUnreadCommentsForObjects()`.
+///
+/// The read marker is a de-correlated `LEFT JOIN` (T6.4), same shape as the
+/// batch query and PHP's own `Manager.php:678-688`.
 pub async fn get_comments_unread(
     pool: &DbPool,
     prefix: &str,
@@ -1454,20 +1454,16 @@ pub async fn get_comments_unread(
 ) -> i64 {
     let sql = format!(
         "SELECT COUNT(*) FROM {prefix}comments c \
+         LEFT JOIN {prefix}comments_read_markers m \
+           ON m.user_id = $2 AND m.object_type = 'files' AND m.object_id = c.object_id \
          WHERE c.object_type = 'files' AND c.object_id = $1 \
          AND c.actor_type = 'users' AND c.actor_id != $2 \
-         AND c.creation_timestamp > COALESCE( \
-             (SELECT marker_datetime FROM {prefix}comments_read_markers \
-              WHERE user_id = $3 AND object_type = 'files' AND object_id = $4), \
-             '1970-01-01 00:00:00' \
-         )",
+         AND c.creation_timestamp > COALESCE(m.marker_datetime, '1970-01-01 00:00:00')",
         prefix = prefix
     );
     sqlx::query_scalar::<_, Option<i64>>(&sql)
         .bind(fileid.to_string())
         .bind(uid)
-        .bind(uid)
-        .bind(fileid.to_string())
         .fetch_optional(pool)
         .await
         .ok()
@@ -1476,71 +1472,25 @@ pub async fn get_comments_unread(
         .unwrap_or(0)
 }
 
-/// Comment counts for a **batch** of files in one query, keyed by fileid.
+/// Comment counts + unread counts for a **batch** of files in one query,
+/// keyed by fileid: `(count, unread)`.
 ///
-/// Mirrors `get_comments_count`; files without comments are absent from the
-/// map (callers fall back to the single query, which returns 0).
+/// T6.3 merge of the former `comments_counts_batch` + `comments_unread_batch`
+/// pair — one `GROUP BY c.object_id` with `COUNT(*)` and the unread
+/// predicate as `count(*) FILTER (WHERE …)`.  T6.4 de-correlates the read
+/// marker: a `LEFT JOIN` (PK `(user_id, object_type, object_id)` on the live
+/// schema — at most one marker row per comment row, so `COUNT(*)` is
+/// unaffected) with `COALESCE(m.marker_datetime, epoch)` — the same shape
+/// PHP's `CommentsManager::getNumberOfUnreadCommentsForObjects` uses
+/// (`Manager.php:678-688`).  Mirrors `get_comments_count` +
+/// `get_comments_unread`; files without comments are absent from the map
+/// (callers fall back to the single queries, which return 0).
 pub async fn comments_counts_batch(
     pool: &DbPool,
     prefix: &str,
     fileids: &[i64],
-) -> std::collections::HashMap<i64, i64> {
-    if fileids.is_empty() {
-        return std::collections::HashMap::new();
-    }
-    let pg = backend_is_postgres();
-    let sql = if pg {
-        format!(
-            "SELECT object_id, COUNT(*) AS n FROM {prefix}comments \
-             WHERE object_type = 'files' \
-             AND object_id = ANY(string_to_array($1, ',')::text[]) \
-             GROUP BY object_id",
-            prefix = prefix,
-        )
-    } else {
-        let placeholders = (1..=fileids.len())
-            .map(|i| format!("${i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "SELECT object_id, COUNT(*) AS n FROM {prefix}comments \
-             WHERE object_type = 'files' AND object_id IN ({placeholders}) \
-             GROUP BY object_id",
-            prefix = prefix,
-        )
-    };
-    let mut query = sqlx::query(&sql);
-    if pg {
-        query = query.bind(ids_csv(fileids));
-    } else {
-        for id in fileids {
-            query = query.bind(id.to_string());
-        }
-    }
-    query
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| {
-            let object_id: String = r.get("object_id");
-            (object_id.parse::<i64>().unwrap_or(0), r.get::<i64, _>("n"))
-        })
-        .collect()
-}
-
-/// Unread comment counts for a **batch** of files in one query, keyed by fileid.
-///
-/// Mirrors `get_comments_unread` — same actor filter and read-marker
-/// comparison, with the marker subquery correlated per row.  Files with no
-/// unread comments are absent from the map (callers fall back to the single
-/// query, which returns 0).
-pub async fn comments_unread_batch(
-    pool: &DbPool,
-    prefix: &str,
-    fileids: &[i64],
     uid: &str,
-) -> std::collections::HashMap<i64, i64> {
+) -> std::collections::HashMap<i64, (i64, i64)> {
     if fileids.is_empty() {
         return std::collections::HashMap::new();
     }
@@ -1548,15 +1498,14 @@ pub async fn comments_unread_batch(
     let pg = backend_is_postgres();
     let sql = if pg {
         format!(
-            "SELECT c.object_id, COUNT(*) AS n FROM {prefix}comments c \
+            "SELECT c.object_id, COUNT(*) AS n, \
+             count(*) FILTER (WHERE c.actor_type = 'users' AND c.actor_id != $2 \
+                 AND c.creation_timestamp > COALESCE(m.marker_datetime, '1970-01-01 00:00:00')) AS unread \
+             FROM {prefix}comments c \
+             LEFT JOIN {prefix}comments_read_markers m \
+               ON m.user_id = $2 AND m.object_type = 'files' AND m.object_id = c.object_id \
              WHERE c.object_type = 'files' \
              AND c.object_id = ANY(string_to_array($1, ',')::text[]) \
-             AND c.actor_type = 'users' AND c.actor_id != $2 \
-             AND c.creation_timestamp > COALESCE( \
-                 (SELECT marker_datetime FROM {prefix}comments_read_markers m \
-                  WHERE m.user_id = $2 AND m.object_type = 'files' AND m.object_id = c.object_id), \
-                 '1970-01-01 00:00:00' \
-             ) \
              GROUP BY c.object_id",
             prefix = prefix,
         )
@@ -1566,14 +1515,13 @@ pub async fn comments_unread_batch(
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "SELECT c.object_id, COUNT(*) AS n FROM {prefix}comments c \
+            "SELECT c.object_id, COUNT(*) AS n, \
+             count(*) FILTER (WHERE c.actor_type = 'users' AND c.actor_id != ${uid} \
+                 AND c.creation_timestamp > COALESCE(m.marker_datetime, '1970-01-01 00:00:00')) AS unread \
+             FROM {prefix}comments c \
+             LEFT JOIN {prefix}comments_read_markers m \
+               ON m.user_id = ${uid} AND m.object_type = 'files' AND m.object_id = c.object_id \
              WHERE c.object_type = 'files' AND c.object_id IN ({placeholders}) \
-             AND c.actor_type = 'users' AND c.actor_id != ${uid} \
-             AND c.creation_timestamp > COALESCE( \
-                 (SELECT marker_datetime FROM {prefix}comments_read_markers m \
-                  WHERE m.user_id = ${uid} AND m.object_type = 'files' AND m.object_id = c.object_id), \
-                 '1970-01-01 00:00:00' \
-             ) \
              GROUP BY c.object_id",
             prefix = prefix,
             uid = n + 1,
@@ -1595,7 +1543,9 @@ pub async fn comments_unread_batch(
         .into_iter()
         .map(|r| {
             let object_id: String = r.get("object_id");
-            (object_id.parse::<i64>().unwrap_or(0), r.get::<i64, _>("n"))
+            let n: i64 = r.get("n");
+            let unread: i64 = r.get::<Option<i64>, _>("unread").unwrap_or(0);
+            (object_id.parse::<i64>().unwrap_or(0), (n, unread))
         })
         .collect()
 }
@@ -2101,9 +2051,13 @@ mod tests {
         .await
         .expect("comments");
         sqlx::query(
+            // PK mirrors the live PostgreSQL schema (verified 2026-08-13) —
+            // the de-correlated LEFT JOIN (T6.4) relies on it for at-most-one
+            // marker row per (user, object).
             "CREATE TABLE oc_comments_read_markers (
                 user_id VARCHAR(64) NOT NULL, object_type VARCHAR(64) NOT NULL DEFAULT '',
-                object_id VARCHAR(64) NOT NULL DEFAULT '', marker_datetime TIMESTAMP
+                object_id VARCHAR(64) NOT NULL DEFAULT '', marker_datetime TIMESTAMP,
+                PRIMARY KEY (user_id, object_type, object_id)
             )",
         )
         .execute(&pool)
@@ -2274,52 +2228,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn share_notes_batch_matches_single() {
-        let pool = fresh_batch_db().await;
-        let prefix = "oc_";
-        for (id, fs, stime, note) in [
-            (1, 10, 100, "old"),
-            (2, 10, 200, "new"),
-            (3, 11, 300, "only"),
-            (4, 12, 400, ""),
-        ] {
-            sqlx::query("INSERT INTO oc_share (id, file_source, stime, note) VALUES (?, ?, ?, ?)")
-                .bind(id)
-                .bind(fs)
-                .bind(stime)
-                .bind(note)
-                .execute(&pool)
-                .await
-                .expect("insert");
-        }
-        let batch = share_notes_batch(&pool, prefix, &[10, 11, 12]).await;
-        assert_eq!(batch.get(&10).map(String::as_str), Some("new"));
-        assert_eq!(batch.get(&11).map(String::as_str), Some("only"));
-        assert_eq!(batch.get(&12), None);
-        for id in [10, 11, 12] {
-            assert_eq!(
-                batch.get(&id).cloned().unwrap_or_default(),
-                get_share_note(&pool, prefix, id).await,
-                "fileid {id}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn share_details_batch_matches_single() {
+    async fn share_details_and_notes_batch_matches_singles() {
         let pool = fresh_batch_db().await;
         let prefix = "oc_";
         // alice owns files 10/11/12; bob shares his file 11 WITH alice.
-        for (id, stype, swith, owner, init, fs) in [
-            (1, 0, "bob", "alice", "alice", 10),
-            (2, 1, "staff", "alice", "alice", 10),
-            (3, 0, "alice", "bob", "bob", 11),
-            (4, 5, "x", "carol", "carol", 11), // share_type 5 — outside the filter
-            (5, 0, "dave", "alice", "alice", 12),
+        // (id, share_type, share_with, uid_owner, uid_initiator, file_source, stime, note)
+        for (id, stype, swith, owner, init, fs, stime, note) in [
+            (1, 0, "bob", "alice", "alice", 10, 100, ""),          // detail, no note
+            (2, 1, "staff", "alice", "alice", 10, 200, "staff-note"), // detail + note
+            (3, 0, "erin", "alice", "alice", 10, 300, "erin-note"), // detail + most-recent note
+            (4, 0, "alice", "bob", "bob", 11, 100, "bob-note"),    // detail + note
+            (5, 5, "x", "carol", "carol", 11, 500, "carol-note"),  // outside details filter,
+            // but the most-recent note on file 11 — notes must still see it
+            (6, 0, "dave", "alice", "alice", 12, 500, ""),         // detail, empty note at
+            // the highest stime — must not hide the older note below
+            (7, 0, "frank", "alice", "alice", 12, 400, "frank-note"), // detail + note
+            (8, 1, "staff", "alice", "alice", 12, 300, ""),        // detail, no note
         ] {
             sqlx::query(
-                "INSERT INTO oc_share (id, share_type, share_with, uid_owner, uid_initiator, file_source) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO oc_share (id, share_type, share_with, uid_owner, uid_initiator, file_source, stime, note) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id)
             .bind(stype)
@@ -2327,6 +2255,8 @@ mod tests {
             .bind(owner)
             .bind(init)
             .bind(fs)
+            .bind(stime)
+            .bind(note)
             .execute(&pool)
             .await
             .expect("insert");
@@ -2337,10 +2267,29 @@ mod tests {
             .execute(&pool)
             .await
             .expect("user");
-        let batch = share_details_batch(&pool, prefix, "alice", &[10, 11, 12]).await;
+        let (details, notes) = share_details_and_notes_batch(&pool, prefix, "alice", &[10, 11, 12]).await;
+
+        // Notes: max-stime non-empty note per file, filter-free (carol-note
+        // lives on a share_type-5 row alice is not a party to).
+        assert_eq!(notes.get(&10).map(String::as_str), Some("erin-note"));
+        assert_eq!(notes.get(&11).map(String::as_str), Some("carol-note"));
+        assert_eq!(notes.get(&12).map(String::as_str), Some("frank-note"));
         for id in [10, 11, 12] {
-            let single = get_share_details(&pool, prefix, "alice", id).await;
-            let batched = batch.get(&id).cloned().unwrap_or_default();
+            assert_eq!(
+                notes.get(&id).cloned().unwrap_or_default(),
+                get_share_note(&pool, prefix, id).await,
+                "note fileid {id}"
+            );
+        }
+
+        // Details: same filter + display-name resolution as the single
+        // query; SQL row order is unspecified, so compare as sorted sets.
+        for id in [10, 11, 12] {
+            let mut single = get_share_details(&pool, prefix, "alice", id).await;
+            let mut batched = details.get(&id).cloned().unwrap_or_default();
+            let key = |d: &ShareDetail| (d.share_type, d.share_with.clone(), d.share_with_displayname.clone());
+            single.sort_by_key(key);
+            batched.sort_by_key(key);
             assert_eq!(batched.len(), single.len(), "fileid {id} len");
             for (b, s) in batched.iter().zip(single.iter()) {
                 assert_eq!(b.share_type, s.share_type, "fileid {id} type");
@@ -2351,10 +2300,13 @@ mod tests {
                 );
             }
         }
-        // bob's user-share resolves the oc_users displayname; unknown dave falls back.
-        let t10 = batch.get(&10).unwrap();
+        // The type-5 row and carol as owner/initiator never reach details.
+        assert!(details.get(&11).unwrap().iter().all(|d| d.share_type != 5));
+        // bob's user-share resolves the oc_users displayname; unknown dave
+        // falls back to the uid.
+        let t10 = details.get(&10).unwrap();
         assert!(t10.iter().any(|d| d.share_with_displayname == "Robert"));
-        assert_eq!(batch.get(&12).unwrap()[0].share_with_displayname, "dave");
+        assert!(details.get(&12).unwrap().iter().any(|d| d.share_with_displayname == "dave"));
     }
 
     #[tokio::test]
@@ -2392,11 +2344,9 @@ mod tests {
         .execute(&pool)
         .await
         .expect("marker");
-        let counts = comments_counts_batch(&pool, prefix, &[10, 11, 12]).await;
-        let unreads = comments_unread_batch(&pool, prefix, &[10, 11, 12], "alice").await;
+        let merged = comments_counts_batch(&pool, prefix, &[10, 11, 12], "alice").await;
         for id in [10, 11, 12] {
-            let c = counts.get(&id).copied().unwrap_or(0);
-            let u = unreads.get(&id).copied().unwrap_or(0);
+            let (c, u) = merged.get(&id).copied().unwrap_or((0, 0));
             assert_eq!(c, get_comments_count(&pool, prefix, id).await, "count {id}");
             assert_eq!(
                 u,
@@ -2404,9 +2354,9 @@ mod tests {
                 "unread {id}"
             );
         }
-        assert_eq!(counts.get(&10), Some(&3), "file 10 has 3 comments");
-        assert_eq!(unreads.get(&10), Some(&1), "file 10: only bob@day03 unread");
-        assert_eq!(counts.get(&12), Some(&1));
+        assert_eq!(merged.get(&10), Some(&(3, 1)), "file 10: 3 comments, bob@day03 unread");
+        assert_eq!(merged.get(&11), Some(&(1, 0)), "file 11: alice's own comment, nothing unread");
+        assert_eq!(merged.get(&12), Some(&(1, 1)), "file 12: bob's comment, no marker");
     }
 
     #[tokio::test]

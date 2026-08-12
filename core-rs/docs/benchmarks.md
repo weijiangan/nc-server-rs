@@ -537,3 +537,37 @@ count added ~7 new texts, evicting shared ones and forcing a re-`Parse` on
 first use per new directory shape — a cost that grows with directory-size
 diversity across the fleet, not with request count.
 
+
+## Phase 22 — prop-set filtering + batch-family merges, T6 (2026-08-13)
+
+**Budget gate** (same methodology as Phase 20; budgets lowered in
+`perf-budget.yaml`):
+
+| class | statements | budget |
+|---|---|---|
+| status | 0 | 0 |
+| get_file | 5 | 5 |
+| propfind_depth0 | 11 | 11 |
+| propfind_depth1 | **18** | **18** |
+| put_new | 16 | 16 |
+| **scaling delta** (depth1 − depth0) | **7** | **7** |
+
+The 20 → 18 drop is exactly the two merges (share details+notes, comments
+count+unread): one statement per family instead of two, `read_dir`'s join
+shrinks 8 → 6 branches. The delta 9 → 7 matches — the batch cost is now 5
+queries + listing + tag prefetch.
+
+**SC=14** (30-iteration `bench-one SC=14_propfind_depth1`, median-of-3
+windows): root 2.27 / Media 2.35 / total 4.42 ms p50, ratio ~11× vs PHP.
+Flat vs Phase 21 (3.90 total) within local-stack jitter — the merges remove
+statements, not round trips, and each local statement costs ~0.1-0.2 ms.
+The 2 removed statements are worth more on slower storage, as with Phase 21.
+
+**Filtering (statement-log replay, `log_statement='all'`)**: a depth-1
+PROPFIND requesting only `d:getetag` + `d:getcontentlength` runs **none** of
+the batch families (no oc_share scan, no comments GROUP BY, no dir-count
+GROUP BY, no system-tags/custom-props batch, no tag prefetch) — only the
+JOIN listing plus the depth-0 root's fixed single-row fallbacks. A
+desktop-like set (`d:getetag` + `oc:favorite` + `nc:system-tags`) runs
+exactly the requested families in batch form. Allprop requests are
+unchanged (bare PROPFIND → allprop → all families, the budget above).
