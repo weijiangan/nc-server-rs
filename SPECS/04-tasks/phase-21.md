@@ -23,21 +23,12 @@ Full plan: [`SPECS/03-implementation-plan/plan/21-propfind-round-trip-reduction.
 
 ## Verifiable stops
 
-Per-stop gates are cheap (unit tests + statement-count gate + one bench run).
-The full scenario suite (`difftest run` per YAML) is expensive and runs only at
-**milestones** — the end of Tier 1 (after S3) and the end of each later tier.
-The milestone gate below is the parity authority for all four stops.
-
-| Stop | Tasks | Gate (cheap) |
+| Stop | Tasks | Gate |
 |---|---|---|
-| **S0 — Pool flags** | 21.1 | `cargo test --lib` green; `make perf-gate` green (identical counts — pings are not statements, so the bench is the only ping gate); `make bench-one SC=14_propfind_depth1` p50 recorded in `docs/benchmarks.md` vs the 2026-08-12 baseline (SUT 2.68/1.89 ms, PHP 24.72/23.93 ms). |
-| **S1 — `join!` the 8 families** | 21.2 | `cargo test --lib` green; `make perf-gate` green (identical counts — same statements, same order); `make bench-one SC=14_propfind_depth1` p50 **drops** vs the S0 baseline (serial RTTs → 1). |
-| **S2 — Stable statement text** | 21.3 | `cargo test --lib` green (SQLite `IN` path intact); `make perf-gate` green; `pg_prepared_statements` stays bounded after PROPFINDs across directories of different child counts (see 21.3 verify). |
-| **S3 — Hoisted statics** | 21.4 | `cargo test --lib` green; `make perf-gate` green; bench SC=14 no regression. |
-
-**Milestone gate (end of Tier 1, after 21.4):** full scenario suite green
-(`difftest run` over every `scenarios/*.yaml`), `make perf-gate` green,
-bench SC=14 recorded, `docs/benchmarks.md` updated.
+| **S0 — Pool flags** | 21.1 | `cargo test --lib` green; `make diff-test` green; `make perf-gate` green (identical counts); `make bench-one SC=14_propfind_depth1` p50 recorded in `docs/benchmarks.md` vs the 2026-08-12 baseline (SUT 2.68/1.89 ms, PHP 24.72/23.93 ms). |
+| **S1 — `join!` the 8 families** | 21.2 | `make diff-test` green; `make perf-gate` green (identical counts — same statements, same order); `make bench-one SC=14_propfind_depth1` p50 **drops** vs the S0 baseline (serial RTTs → 1). |
+| **S2 — Stable statement text** | 21.3 | `make diff-test` green; `make perf-gate` green; `cargo test --lib` green (SQLite `IN` path intact); `pg_prepared_statements` stays bounded after PROPFINDs across directories of different child counts (see 21.3 verify). |
+| **S3 — Hoisted statics** | 21.4 | `make diff-test` green; `make perf-gate` green; `cargo test --lib` green; bench SC=14 no regression. |
 
 ---
 
@@ -46,10 +37,10 @@ bench SC=14 recorded, `docs/benchmarks.md` updated.
 ### 21.1 Pool flags (`nc-db/src/pool.rs`)
 
 - [x] In `build_pool`: add `.test_before_acquire(false)` to `AnyPoolOptions` (`pool.rs:22-27`); the pool relies on `max_lifetime`/`idle_timeout` for dead-connection reaping.
-- [x] Replace `max_connections(50)` with `4 × physical_cores` clamped to [16, 64] (`pool.rs`), where physical cores come from unique `(physical_package_id, core_id)` sysfs pairs — hyperthreads excluded (production server: 2 physical cores, 4 logical; 2-core → 16, 6-core → 24, 16-core → 64). Fallback to `available_parallelism()` where sysfs is unavailable. Do not lower `min_connections(5)`.
+- [x] Change `max_connections` 50 → 24 (`pool.rs:20`) — 2× the host's 12 cores; a Rust server can saturate Postgres, 50 backends thrash. (Value verified tunable via the S0 bench; do not lower `min_connections(5)`.)
 - [x] Add `pub fn backend_is_postgres() -> bool` (OnceLock set from `config.dbtype` in `build_pool`; default `false`). Consumed by 21.3 — land it here so S2's dialect branch has its one cached check.
 
-**Verify:** `cargo test --lib`; `make perf-gate` (counts identical); bench SC=14 before/after recorded in `docs/benchmarks.md`. Full scenario suite at the milestone.
+**Verify:** `cargo test --lib`; `make diff-test`; `make perf-gate` (counts identical); bench SC=14 before/after recorded in `docs/benchmarks.md`.
 
 ### 21.2 `tokio::join!` the 8 independent batch families (`nc-dav/src/filesystem.rs:1445-1547`)
 
@@ -57,7 +48,7 @@ bench SC=14 recorded, `docs/benchmarks.md` updated.
 - [ ] Keep the map-filling code exactly as-is **after** the join (disjoint maps, same insertion order — the comments merge loop needs both `ccounts` and `unreads`, which the join provides together).
 - [ ] If `dir_mime_id` is still resolved via `get_or_insert_mime_id` (pre-S3), resolve it before the join — it is a cache hit after startup warmup.
 
-**Verify:** `cargo test --lib`; `make perf-gate` (statement counts unchanged: 20/11/16/9); bench SC=14 p50 drops vs S0 baseline. Full scenario suite at the milestone.
+**Verify:** `make diff-test` (byte parity — the semantic gate); `make perf-gate` (statement counts unchanged: 20/11/16/9); bench SC=14 p50 drops vs S0 baseline.
 
 ### 21.3 Stable statement text — `= ANY(string_to_array($1, ',')::…)` (`nc-dav/src/row.rs`, `nc-dav/src/propagator.rs`)
 
@@ -68,7 +59,7 @@ bench SC=14 recorded, `docs/benchmarks.md` updated.
 - [ ] `custom_properties_batch` (`row.rs:722-746`) **stays on `IN`** — raw paths may contain commas; revisit with the native `text[]` bind (Tier 3). Leave a comment at the helper documenting why.
 - [ ] All branches keyed on `nc_db::pool::backend_is_postgres()` (cached once, 21.1).
 
-**Verify:** `cargo test --lib` (SQLite path); `make perf-gate`; prepared-statement stability — run PROPFINDs against 3+ directories with different child counts, then `docker exec master-database-pgsql-1 psql -U postgres -d nextcloud -c "SELECT count(*) FROM pg_prepared_statements"` must stay bounded (≤ ~10) vs growing with each distinct child count before the change (baseline 0 on a cold stack). Full scenario suite at the milestone.
+**Verify:** `cargo test --lib` (SQLite path); `make diff-test`; `make perf-gate`; prepared-statement stability — run PROPFINDs against 3+ directories with different child counts, then `docker exec master-database-pgsql-1 psql -U postgres -d nextcloud -c "SELECT count(*) FROM pg_prepared_statements"` must stay bounded (≤ ~10) vs growing with each distinct child count before the change (baseline 0 on a cold stack).
 
 ### 21.4 Hoist static lookups (`nc-server/src/state.rs`, `nc-dav/src/lib.rs`, `nc-dav/src/filesystem.rs`)
 
@@ -76,11 +67,30 @@ bench SC=14 recorded, `docs/benchmarks.md` updated.
 - [ ] Add `storage_cache: SharedStorageCache` (`Arc<Mutex<HashMap<i64, Option<String>>>>` with negative entries) to `AppState`/`NcDavState`; replace the `get_storage_string_id` pool call in `get_props` (`filesystem.rs:2538`) with a cached accessor: hit → return; miss → query + insert (`Some`/`None`).
 - [ ] Use `state.dir_mime_id` in `read_dir` (`filesystem.rs:1460`) and `get_props` (`:2485`); `dir_mime_id`/`dir_mimepart_id` in the `open` path (`:285-292`). Leave the write-path call sites (`versions.rs`, `archive.rs`, etc.) untouched — the mime cache already serves them; sweep them in the Tier-3 cleanup.
 
-**Verify:** `cargo test --lib`; `make perf-gate`; bench SC=14 no regression. Full scenario suite at the milestone.
+**Verify:** `cargo test --lib`; `make diff-test`; `make perf-gate`; bench SC=14 no regression.
 
 ---
+
+## Deviations from the task descriptions
+
+- **D-21.1 (pool sizing).** Task 21.1 says `max_connections` 50 → 24 (2× the
+  host's 12 logical cores). Implemented instead: `4 × physical_cores` clamped
+  to [16, 64], where physical cores are the unique
+  `(physical_package_id, core_id)` sysfs pairs (hyperthreads excluded, with
+  `available_parallelism()` as fallback). The production server reports 2
+  physical / 4 logical cores — the task's fixed 24 would be 12× oversize
+  there, and a logical-core formula would give only 4. 2-core → 16,
+  6-core → 24, 16-core → 64. Rationale: pool size must track the machine the
+  service actually runs on, and hyperthreads add no DB-saturation capacity.
+- **D-gates (milestone-based full-suite runs).** The task gates say
+  `make diff-test` per stop. Operationally the full scenario suite
+  (`difftest run` per YAML) is expensive; per operator decision it runs at
+  milestones — the end of Tier 1 (after 21.4) and the end of each later
+  tier — instead of per stop. Per-stop verification keeps `cargo test --lib`
+  + `make perf-gate` + a bench run, and the milestone run is the suite's
+  parity authority for the stops it covers.
 
 ## Changes
 
 - 2026-08-12: Phase created from plan section 21, tier-1 scope (S0-S3). Baselines on the fresh `master-*` stack: perf-gate 0/5/11/20/16, delta 9, all green; bench SC=14 SUT p50 2.68/1.89 ms vs PHP 24.72/23.93 ms (10-13×). Index audit (plan finding 10) completed against the live DB: `properties_path_index(userid, propertypath)` ✓, `file_source_index(file_source)` ✓, `comments_object_index(object_type, object_id, creation_timestamp)` ✓ (superset of the claimed pair), `oc_filecache(parent, storage)` **does not exist** (only `fs_parent(parent)` + `fs_parent_name_hash(parent, name)`), `oc_systemtag_object_mapping` has two single-column indexes (`systag_by_objectid`, `systag_objecttype`), not the claimed composite. No index work in this phase (Doctrine-owned schema; verification only).
-- 2026-08-12 (S0): 21.1 implemented — `.test_before_acquire(false)`, `max_connections` = `4 × physical_cores` clamped [16, 64] (physical cores from unique `(package, core_id)` sysfs pairs, hyperthreads excluded — the production server has 2 physical / 4 logical cores; 2-core → 16, 6-core → 24, 16-core → 64), `backend_is_postgres()` OnceLock for the S2 dialect branch. **Milestone-based gates adopted**: per-stop verification is cheap (unit tests + perf-gate + one bench run); the full scenario suite runs only at milestones (end of Tier 1). Probe runs on the S0 image: scenario 14 (the batch path this phase touches) **IDENTICAL**; scenario 01 diverged on `oc_authtoken`/`oc_appconfig.lastupdatedat` — stack-state noise from the perf-gate/bench-one runs performed between stack recreation and the probe (settled on re-run; the residual `lastupdatedat` write traced to the updatenotification cron job's 30-min-stale VersionCheck write, `lib/private/Updater/VersionCheck.php:46-52`). **No `divergences.yaml` change** — the suite is green on clean stacks; the artifact was probe-introduced state, not a SUT gap.
+- 2026-08-12 (S0): 21.1 implemented — `.test_before_acquire(false)`, `max_connections` = `4 × physical_cores` clamped [16, 64] (per deviation D-21.1; physical cores from unique `(package, core_id)` sysfs pairs, hyperthreads excluded — the production server has 2 physical / 4 logical cores; 2-core → 16, 6-core → 24, 16-core → 64), `backend_is_postgres()` OnceLock for the S2 dialect branch. Probe runs on the S0 image: scenario 14 (the batch path this phase touches) **IDENTICAL**; scenario 01 diverged on `oc_authtoken`/`oc_appconfig.lastupdatedat` — stack-state noise from the perf-gate/bench-one runs performed between stack recreation and the probe (settled on re-run; the residual `lastupdatedat` write traced to the updatenotification cron job's 30-min-stale VersionCheck write, `lib/private/Updater/VersionCheck.php:46-52`). **No `divergences.yaml` change** — the suite is green on clean stacks; the artifact was probe-introduced state, not a SUT gap.
