@@ -37,6 +37,12 @@
 
 ## Documentation Conventions
 
+**Applies to every document:**
+
+- **The gate is the definition of done — never a result.** A change is done only when its gate passes; reporting "green", "unchanged counts", or "no regression" states the bar, not the outcome. Report what changed: numbers, deltas, findings.
+- **One commit per doc change — amend, don't pile.** When a doc edit needs revising, fold it into the original commit instead of stacking a new one.
+- **Each document owns one thing.** Benchmarks = measurements; task docs = execution history; specs = PHP behavior. Don't copy another document's content into yours.
+
 **Phase task docs (`SPECS/04-tasks/phase-*.md`):**
 
 1. **Never modify original task descriptions.** The PHP/Rust-gap/Verify text is written as a best-effort spec up front and stays verbatim — even when it later proves wrong (a stale capture, a misidentified call site). Correct it with a note *below* the task, never by editing the task body.
@@ -51,6 +57,11 @@
 1. **They specify the PHP server's behavior — the target.** Describe exactly what PHP does (headers, XML shape, status codes, DB writes, edge cases), grounded in PHP source with `file:line` (or `file:function`) citations.
 2. **No implementation information.** No Rust state, commit hashes, vendored-crate internals, "what we tried / ruled out / matched for parity", testing narratives, or harness details. (Stating *which sub-tree Rust serves vs. delegates* is fine — that is architecture, not implementation state.)
 3. **Spec = PHP behavior even where we intentionally diverge.** If Rust deliberately differs, that decision belongs in `SPECS/02-specifications/improvements.md` and the phase docs — the requirement still records what PHP does.
+
+**Benchmarks (`docs/benchmarks.md`):**
+
+1. **Performance data and its significance only.** Measurements (latency tables, statement-text counts) plus *why the numbers behave as they do*. Implementation — flags, files, fix mechanics, the fix story — goes in the phase task docs.
+2. **Never report the gate as a result** (green, unchanged counts, no regression) and don't duplicate owned data (`perf-budget.yaml`, phase `## Changes` logs).
 
 ## Project Context
 
@@ -90,11 +101,19 @@ The php84 image is shared by the `nextcloud` and `oracle` compose services (`ima
 
 ### Differential-test quiescence — `oc_preview_generation`
 
-The previewgenerator app's PostWriteListener queues a `(uid, file_id, queued_at)` row into `oc_preview_generation` on every file write (Rust reproduces this side effect on the SUT). The queue is drained by `OCA\PreviewGenerator\BackgroundJob\PreviewJob`, registered in `oc_jobs` **at app install** — a job row seeded without the install flow, or removed by cron after a class-resolution failure, leaves the queue undrained, and every scenario then burns the quiesce drain-wait (~30 s × 2) **while still passing**. **Slow scenarios = stuck queue, not flakiness.** First check: `docker exec master-database-pgsql-1 psql -U postgres -d <db> -c "SELECT count(*) FROM oc_preview_generation"` — SUT = `nextcloud`, oracle = `oracle` (separate databases!). If rows sit, the drainer is missing: re-run the install flow (`occ app:disable previewgenerator && occ app:enable previewgenerator`); the fork's `scripts/enable-preview-imaginary.sh` does this on the `down -v` recovery path.
+**Slow scenarios = stuck preview queue, not flakiness.** Every file write queues a row into `oc_preview_generation`; the drainer (`OCA\PreviewGenerator\BackgroundJob\PreviewJob`) registers in `oc_jobs` only at app install. First check: `docker exec master-database-pgsql-1 psql -U postgres -d <db> -c "SELECT count(*) FROM oc_preview_generation"` — SUT = `nextcloud`, oracle = `oracle` (separate databases!). Rows sit → drainer missing → re-run the install flow (`occ app:disable previewgenerator && occ app:enable previewgenerator`; the fork's `scripts/enable-preview-imaginary.sh` does this on `down -v` recovery). The runner matches the drainer by its **exact** class — don't weaken the match (`%PreviewJob` also matches `OC\Preview\BackgroundCleanupJob` and drains nothing).
 
-The runner fails loudly when rows exist but no drainer is registered, and matches the drainer by its **exact** class (`difftest.rs quiesce_background`, `db.rs preview_job_id`) — a bare `%PreviewJob` LIKE also matches `OC\Preview\BackgroundCleanupJob` and drains nothing. Do not weaken either.
+Stall rules (2026-08-10):
+- **A one-sided divergence is a bug until proven timing.** Find why the sides differ before masking it; the harness must catch regressions, not paper over them.
+- **Don't silence the harness with config switches or `noise` entries** (`enable_previews => false` disables generation entirely; a `noise` mask once hid a broken SUT for a whole session).
+- **The dev `config.php` is drift-prone operational state** — when reconstructing it, re-verify `trusted_domains` (the difftest sends `Host: nextcloud.local`; if missing, the OCS quota scenario 400s while DAV paths skip the check).
 
-Rules from the 2026-08-10 stall (queue stuck for hours, ~2 min/scenario):
-- **A one-sided divergence is a bug until proven timing.** One side writing rows the other doesn't means *find why the sides differ* before adding a `noise` entry. The `preview-background-job-heartbeat` mask (added, then removed) hid the SUT's broken preview generation for an entire debugging session — the harness should catch that regression, not paper over it.
-- **`enable_previews => false` in the dev config is a feature switch, not a noise fix.** It disables generation via `PreviewManager::isMimeSupported` (Generator.php:175), so the SUT's job drains the queue without generating — one-sided `oc_previews` rows.
-- **The dev config.php is operational state outside git; when reconstructing it, re-verify every key the harness depends on.** The difftest sends `Host: nextcloud.local` — it must be in `trusted_domains`, or the OCS quota scenario 400s (DAV paths skip PHP's trusted-domain check; `/ocs/` does not). The SUT/oracle configs differ in exactly these drift-prone keys.
+### Differential-test operations — lessons from the 2026-08-13 milestone
+
+- **`make diff-test` runs only `preconditions_pass`** — the real suite is `difftest run <scenario.yaml>` per YAML (loop over `crates/nc-difftest/scenarios/*.yaml`); run it at milestones, not per stop.
+- **The replay must consume PROPFIND response bodies.** dav-server-rs streams `read_dir` + the batch work inside the body stream; a dropped body means the SUT's read-path work never executes during the replay while PHP builds eagerly — the DB-delta comparison then measures nothing on the SUT side (the root cause of a multi-hour divergence hunt; the fix in `scenario.rs` is load-bearing, keep it).
+- **`down -v` before a milestone run** (wipes both DB volumes → symmetric fresh install). Then wait for **full readiness**, not just `installed:true`: installing.html gone, all seeded users' data dirs present, ~90 s settle — background `occ user:add` and install tail-writes land after installed:true and race early scenarios.
+- **Fresh-install first-access artifacts**: PHP lazily materializes the user's `cache/` row + bumps the storage root (etag + storage_mtime) on the first home access (`View.php:1396-1417` shallow scan when the row is incomplete). Rust replicates it on the read path (once per storage per process) with an **un-collidable** storage_mtime bump (`GREATEST(+60)`) — the harness masks timestamp values and compares changed-column *sets*, so a same-second write reads as "unchanged".
+- **Rebuilds**: `make sut-image`'s `ADD https://github.com/…` step fails intermittently (network EOF). Never pipe the build output (`| tail` masks the failure; compose then recreates from the stale image) — run unmasked with retries, and verify the deployed binary by grepping a **string literal** from the change (identifiers don't survive compilation).
+- **Diagnostics**: count `execute sqlx` lines in the PG statement log (`log_statement='all'`, ms-precision timestamps — docker logs are UTC, the host is +08:00). `pg_prepared_statements` is per-session — useless cross-session. The proxy access log's response sizes distinguish a full depth-1 listing (~11 KB) from a root-only response (~2.8 KB).
+- **One-sided `oc_appconfig` timestamps** (`lastcron`, `lastjob`, `lastupdatedat`) are cron-timing artifacts (updatenotification's VersionCheck rewrites `lastupdatedat` when >30 min stale) — not code bugs. Nothing is added to `divergences.yaml` without explicit operator permission.
