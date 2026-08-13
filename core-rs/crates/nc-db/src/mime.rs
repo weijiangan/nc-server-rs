@@ -67,17 +67,33 @@ pub async fn get_or_insert_mime_id(
     // Try INSERT first.  The unique index on `mimetype` ensures we never
     // insert a duplicate; if a concurrent request already inserted it we
     // just fall through to the SELECT below.
-    let _ = sqlx::query(&format!("INSERT INTO {table} (mimetype) VALUES ($1)"))
-        .bind(mime)
-        .execute(pool)
-        .await;
+    let insert_sql = format!("INSERT INTO {table} (mimetype) VALUES ($1)");
+    let _ = match pool {
+        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&insert_sql)
+            .bind(mime)
+            .execute(p)
+            .await
+            .map(|_| ()),
+        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&insert_sql)
+            .bind(mime)
+            .execute(p)
+            .await
+            .map(|_| ()),
+    };
 
     // Read back the ID (ours or the concurrent winner's).
-    let id: i64 = sqlx::query_scalar(&format!("SELECT id FROM {table} WHERE mimetype = $1"))
-        .bind(mime)
-        .fetch_optional(pool)
-        .await
-        .ok()
+    let select_sql = format!("SELECT id FROM {table} WHERE mimetype = $1");
+    let id: i64 = match pool {
+        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&select_sql)
+            .bind(mime)
+            .fetch_optional(p)
+            .await,
+        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&select_sql)
+            .bind(mime)
+            .fetch_optional(p)
+            .await,
+    }
+    .ok()
         .flatten()
         .unwrap_or(1_i64);
 
@@ -95,9 +111,18 @@ pub async fn get_or_insert_mime_id(
 /// Load `oc_mimetypes` from the DB and return a shared, writable cache.
 pub async fn load_mime_cache(pool: &DbPool, table_prefix: &str) -> anyhow::Result<SharedMimeCache> {
     let table = format!("{table_prefix}mimetypes");
-    let rows: Vec<(i64, String)> = sqlx::query_as(&format!("SELECT id, mimetype FROM {table}"))
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<(i64, String)> = match pool {
+        DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (i64, String)>(
+            &format!("SELECT id, mimetype FROM {table}"),
+        )
+        .fetch_all(p)
+        .await?,
+        DbPool::Sqlite(p) => sqlx::query_as::<sqlx::Sqlite, (i64, String)>(
+            &format!("SELECT id, mimetype FROM {table}"),
+        )
+        .fetch_all(p)
+        .await?,
+    };
 
     let mut cache = MimeCache::default();
     for (id, mime) in rows {

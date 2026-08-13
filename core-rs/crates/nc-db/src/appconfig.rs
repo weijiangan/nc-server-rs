@@ -88,11 +88,18 @@ pub async fn load_appconfig_cache(
     table_prefix: &str,
 ) -> anyhow::Result<SharedAppConfigCache> {
     let table = format!("{table_prefix}appconfig");
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(&format!(
-        "SELECT appid, configkey, configvalue FROM {table} WHERE lazy = 0"
-    ))
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(String, String, Option<String>)> = match pool {
+        DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (String, String, Option<String>)>(
+            &format!("SELECT appid, configkey, configvalue FROM {table} WHERE lazy = 0"),
+        )
+        .fetch_all(p)
+        .await?,
+        DbPool::Sqlite(p) => sqlx::query_as::<sqlx::Sqlite, (String, String, Option<String>)>(
+            &format!("SELECT appid, configkey, configvalue FROM {table} WHERE lazy = 0"),
+        )
+        .fetch_all(p)
+        .await?,
+    };
 
     let mut cache = AppConfigCache::default();
     for (app, key, val) in rows {
@@ -119,11 +126,18 @@ pub async fn reload_appconfig_cache(
     cache: &SharedAppConfigCache,
 ) -> anyhow::Result<()> {
     let table = format!("{table_prefix}appconfig");
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(&format!(
-        "SELECT appid, configkey, configvalue FROM {table} WHERE lazy = 0"
-    ))
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(String, String, Option<String>)> = match pool {
+        DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (String, String, Option<String>)>(
+            &format!("SELECT appid, configkey, configvalue FROM {table} WHERE lazy = 0"),
+        )
+        .fetch_all(p)
+        .await?,
+        DbPool::Sqlite(p) => sqlx::query_as::<sqlx::Sqlite, (String, String, Option<String>)>(
+            &format!("SELECT appid, configkey, configvalue FROM {table} WHERE lazy = 0"),
+        )
+        .fetch_all(p)
+        .await?,
+    };
 
     let mut new_data = AppConfigCache::default();
     for (app, key, val) in rows {

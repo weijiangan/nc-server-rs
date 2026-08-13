@@ -123,25 +123,46 @@ pub async fn insert_preview(
          ON CONFLICT (file_id, width, height, mimetype_id, cropped, version_id) DO NOTHING \
          RETURNING id"
     );
-    let inserted = sqlx::query(&sql)
-        .bind(id)
-        .bind(p.file_id)
-        .bind(p.storage_id)
-        .bind(p.width as i32)
-        .bind(p.height as i32)
-        .bind(p.mimetype_id)
-        .bind(p.source_mimetype_id)
-        .bind(p.max)
-        .bind(p.cropped)
-        .bind(false) // encrypted
-        .bind(&p.etag)
-        .bind(p.mtime as i32)
-        .bind(p.size as i32)
-        .bind(p.version_id)
-        .fetch_optional(pool)
-        .await?;
+    let inserted: bool = match pool {
+        DbPool::Pg(pg) => sqlx::query::<sqlx::Postgres>(&sql)
+            .bind(id)
+            .bind(p.file_id)
+            .bind(p.storage_id)
+            .bind(p.width as i32)
+            .bind(p.height as i32)
+            .bind(p.mimetype_id)
+            .bind(p.source_mimetype_id)
+            .bind(p.max)
+            .bind(p.cropped)
+            .bind(false) // encrypted
+            .bind(&p.etag)
+            .bind(p.mtime as i32)
+            .bind(p.size as i32)
+            .bind(p.version_id)
+            .fetch_optional(pg)
+            .await?
+            .is_some(),
+        DbPool::Sqlite(sq) => sqlx::query::<sqlx::Sqlite>(&sql)
+            .bind(id)
+            .bind(p.file_id)
+            .bind(p.storage_id)
+            .bind(p.width as i32)
+            .bind(p.height as i32)
+            .bind(p.mimetype_id)
+            .bind(p.source_mimetype_id)
+            .bind(p.max)
+            .bind(p.cropped)
+            .bind(false) // encrypted
+            .bind(&p.etag)
+            .bind(p.mtime as i32)
+            .bind(p.size as i32)
+            .bind(p.version_id)
+            .fetch_optional(sq)
+            .await?
+            .is_some(),
+    };
 
-    if inserted.is_some() {
+    if inserted {
         // We won the race — this is the row we inserted.
         Ok(p.to_row(id))
     } else {
@@ -227,18 +248,36 @@ pub async fn invalidate_previews(
 
     // Delete the rows first (no new hits can start serving them).
     let sql = format!("DELETE FROM {prefix}previews WHERE file_id = $1");
-    match sqlx::query(&sql).bind(file_id).execute(pool).await {
-        Ok(res) => {
-            let deleted = res.rows_affected() as usize;
-            tracing::debug!(file_id, deleted, "invalidated preview rows on overwrite");
-        }
-        Err(e) => {
-            // Leave the bytes in place — the rows still reference them, so the
-            // previews keep serving.  Surface loudly (CLAUDE.md hygiene rule 1).
-            tracing::error!(error = %e, file_id, "invalidate: failed to delete preview rows");
-            return 0;
-        }
-    }
+    let deleted_rows = match pool {
+        DbPool::Pg(p) => match sqlx::query::<sqlx::Postgres>(&sql)
+            .bind(file_id)
+            .execute(p)
+            .await
+        {
+            Ok(res) => res.rows_affected(),
+            Err(e) => {
+                // Leave the bytes in place — the rows still reference them, so the
+                // previews keep serving.  Surface loudly (CLAUDE.md hygiene rule 1).
+                tracing::error!(error = %e, file_id, "invalidate: failed to delete preview rows");
+                return 0;
+            }
+        },
+        DbPool::Sqlite(p) => match sqlx::query::<sqlx::Sqlite>(&sql)
+            .bind(file_id)
+            .execute(p)
+            .await
+        {
+            Ok(res) => res.rows_affected(),
+            Err(e) => {
+                // Leave the bytes in place — the rows still reference them, so the
+                // previews keep serving.  Surface loudly (CLAUDE.md hygiene rule 1).
+                tracing::error!(error = %e, file_id, "invalidate: failed to delete preview rows");
+                return 0;
+            }
+        },
+    };
+    let deleted = deleted_rows as usize;
+    tracing::debug!(file_id, deleted, "invalidated preview rows on overwrite");
 
     // Resolve the byte paths to remove while holding the cache lock — crucially, with
     // NO await under the lock (a `std::sync` guard held across an await can stall the
@@ -300,6 +339,15 @@ mod tests {
     use super::*;
     use crate::store::find_max;
 
+    /// The in-memory test DB is always SQLite; unwrap the variant for the
+    /// native queries below (tests never construct a Pg pool).
+    fn test_pool(pool: &DbPool) -> &sqlx::SqlitePool {
+        match pool {
+            DbPool::Sqlite(p) => p,
+            DbPool::Pg(_) => panic!("test pools are sqlite"),
+        }
+    }
+
     async fn sqlite_pool() -> DbPool {
         // Single connection: an in-memory SQLite DB is per-connection.
         let pool = DbPool::Sqlite(
@@ -310,7 +358,7 @@ mod tests {
                 .unwrap(),
         );
         // oc_previews per REQ §9.10 (boolean columns as INTEGER for SQLite's Any driver).
-        sqlx::query(
+        sqlx::query::<sqlx::Sqlite>(
             "CREATE TABLE oc_previews (
                 id                 BIGINT  NOT NULL PRIMARY KEY,
                 file_id            BIGINT  NOT NULL,
@@ -330,21 +378,21 @@ mod tests {
                 version_id         BIGINT  NOT NULL DEFAULT -1
             )",
         )
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .unwrap();
-        sqlx::query(
+        sqlx::query::<sqlx::Sqlite>(
             "CREATE UNIQUE INDEX previews_file_uniq_idx ON oc_previews \
              (file_id, width, height, mimetype_id, cropped, version_id)",
         )
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .unwrap();
         // oc_mimetypes so invalidation can resolve output-mime ids → names.
-        sqlx::query(
+        sqlx::query::<sqlx::Sqlite>(
             "CREATE TABLE oc_mimetypes (id INTEGER PRIMARY KEY, mimetype VARCHAR(255) NOT NULL)",
         )
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .unwrap();
         for (id, mime) in [
@@ -352,10 +400,10 @@ mod tests {
             (6i64, "image/png"),
             (9i64, "application/octet-stream"),
         ] {
-            sqlx::query("INSERT INTO oc_mimetypes (id, mimetype) VALUES ($1, $2)")
+            sqlx::query::<sqlx::Sqlite>("INSERT INTO oc_mimetypes (id, mimetype) VALUES ($1, $2)")
                 .bind(id)
                 .bind(mime)
-                .execute(&pool)
+                .execute(test_pool(&pool))
                 .await
                 .unwrap();
         }

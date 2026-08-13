@@ -147,44 +147,71 @@ pub async fn load_preview_rows(pool: &DbPool, prefix: &str, file_id: i64) -> Vec
          FROM {prefix}previews WHERE file_id = $1",
         etag = etag_projection(backend),
     );
-    let rows = match sqlx::query(&sql).bind(file_id).fetch_all(pool).await {
-        Ok(r) => r,
-        Err(e) => {
-            // A query failure here must not be silent (CLAUDE.md hygiene rule 1) —
-            // the caller treats an empty result as a cache miss and proxies to PHP.
-            tracing::error!(error = %e, file_id = file_id, "load_preview_rows: SQL error");
-            return Vec::new();
-        }
+    let rows = match pool {
+        DbPool::Pg(p) => match sqlx::query::<sqlx::Postgres>(&sql)
+            .bind(file_id)
+            .fetch_all(p)
+            .await
+        {
+            Ok(r) => r
+                .iter()
+                .map(|r| PreviewRow {
+                    id: r.get("id"),
+                    file_id: r.get("file_id"),
+                    storage_id: r.get("storage_id"),
+                    width: r.get::<i64, _>("width") as u32,
+                    height: r.get::<i64, _>("height") as u32,
+                    mimetype_id: r.get("mimetype_id"),
+                    source_mimetype_id: r.get("source_mimetype_id"),
+                    mtime: r.get("mtime"),
+                    size: r.get("size"),
+                    max: r.get::<bool, _>("max"),
+                    cropped: r.get::<bool, _>("cropped"),
+                    encrypted: r.get::<bool, _>("encrypted"),
+                    etag: r.get("etag"),
+                    version_id: r.get("version_id"),
+                })
+                .collect(),
+            Err(e) => {
+                // A query failure here must not be silent (CLAUDE.md hygiene rule 1) —
+                // the caller treats an empty result as a cache miss and proxies to PHP.
+                tracing::error!(error = %e, file_id = file_id, "load_preview_rows: SQL error");
+                return Vec::new();
+            }
+        },
+        DbPool::Sqlite(p) => match sqlx::query::<sqlx::Sqlite>(&sql)
+            .bind(file_id)
+            .fetch_all(p)
+            .await
+        {
+            Ok(r) => r
+                .iter()
+                .map(|r| PreviewRow {
+                    id: r.get("id"),
+                    file_id: r.get("file_id"),
+                    storage_id: r.get("storage_id"),
+                    width: r.get::<i64, _>("width") as u32,
+                    height: r.get::<i64, _>("height") as u32,
+                    mimetype_id: r.get("mimetype_id"),
+                    source_mimetype_id: r.get("source_mimetype_id"),
+                    mtime: r.get("mtime"),
+                    size: r.get("size"),
+                    max: r.get::<i64, _>("max") != 0,
+                    cropped: r.get::<i64, _>("cropped") != 0,
+                    encrypted: r.get::<i64, _>("encrypted") != 0,
+                    etag: r.get("etag"),
+                    version_id: r.get("version_id"),
+                })
+                .collect(),
+            Err(e) => {
+                // A query failure here must not be silent (CLAUDE.md hygiene rule 1) —
+                // the caller treats an empty result as a cache miss and proxies to PHP.
+                tracing::error!(error = %e, file_id = file_id, "load_preview_rows: SQL error");
+                return Vec::new();
+            }
+        },
     };
-    let sqlite = backend == Backend::Sqlite;
-    rows.iter()
-        .map(|r| PreviewRow {
-            id: r.get("id"),
-            file_id: r.get("file_id"),
-            storage_id: r.get("storage_id"),
-            width: r.get::<i64, _>("width") as u32,
-            height: r.get::<i64, _>("height") as u32,
-            mimetype_id: r.get("mimetype_id"),
-            source_mimetype_id: r.get("source_mimetype_id"),
-            mtime: r.get("mtime"),
-            size: r.get("size"),
-            max: get_bool(r, "max", sqlite),
-            cropped: get_bool(r, "cropped", sqlite),
-            encrypted: get_bool(r, "encrypted", sqlite),
-            etag: r.get("etag"),
-            version_id: r.get("version_id"),
-        })
-        .collect()
-}
-
-/// Decode a boolean column: native `bool` everywhere except SQLite, where the `Any`
-/// driver cannot decode a boolean and the column is an integer 0/1.
-fn get_bool(r: &sqlx::any::AnyRow, col: &str, sqlite: bool) -> bool {
-    if sqlite {
-        r.get::<i64, _>(col) != 0
-    } else {
-        r.get::<bool, _>(col)
-    }
+    rows
 }
 
 /// The `oc_previews.etag` column width: `CHAR(40)` — `fixed => true, length => 40`
@@ -303,6 +330,15 @@ pub fn preview_byte_path(datadir: &Path, instanceid: &str, file_id: i64, name: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The in-memory test DB is always SQLite; unwrap the variant for the
+    /// native queries below (tests never construct a Pg pool).
+    fn test_pool(pool: &DbPool) -> &sqlx::SqlitePool {
+        match pool {
+            DbPool::Sqlite(p) => p,
+            DbPool::Pg(_) => panic!("test pools are sqlite"),
+        }
+    }
 
     // ── extension mapping (Preview::getExtension) ──────────────────────────
 
@@ -525,7 +561,7 @@ mod tests {
         // BOOLEAN) because sqlx's `Any` driver cannot decode a SQLite boolean — on
         // SQLite they are read as integers (see `get_bool`); on PostgreSQL the
         // PHP-created columns are real BOOLEAN and are decoded natively as `bool`.
-        sqlx::query(
+        sqlx::query::<sqlx::Sqlite>(
             "CREATE TABLE oc_previews (
                 id                 BIGINT  NOT NULL PRIMARY KEY,
                 file_id            BIGINT  NOT NULL,
@@ -545,7 +581,7 @@ mod tests {
                 version_id         BIGINT  NOT NULL DEFAULT -1
             )",
         )
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .unwrap();
 
@@ -553,7 +589,7 @@ mod tests {
              mimetype_id, source_mimetype_id, max, cropped, encrypted, etag, mtime, size, version_id) \
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,$11,$12,$13)";
         // max row for file 123
-        sqlx::query(insert)
+        sqlx::query::<sqlx::Sqlite>(insert)
             .bind(101i64)
             .bind(123i64)
             .bind(1i64)
@@ -567,11 +603,11 @@ mod tests {
             .bind(1_700_000_000i64)
             .bind(99_999i64)
             .bind(-1i64)
-            .execute(&pool)
+            .execute(test_pool(&pool))
             .await
             .unwrap();
         // derived cropped 256x256 for file 123
-        sqlx::query(insert)
+        sqlx::query::<sqlx::Sqlite>(insert)
             .bind(102i64)
             .bind(123i64)
             .bind(1i64)
@@ -585,11 +621,11 @@ mod tests {
             .bind(1_700_000_001i64)
             .bind(4096i64)
             .bind(-1i64)
-            .execute(&pool)
+            .execute(test_pool(&pool))
             .await
             .unwrap();
         // a different file's row — must not be returned
-        sqlx::query(insert)
+        sqlx::query::<sqlx::Sqlite>(insert)
             .bind(103i64)
             .bind(999i64)
             .bind(1i64)
@@ -603,7 +639,7 @@ mod tests {
             .bind(1i64)
             .bind(1i64)
             .bind(-1i64)
-            .execute(&pool)
+            .execute(test_pool(&pool))
             .await
             .unwrap();
 

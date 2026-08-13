@@ -10,7 +10,7 @@
 //! - `lib/private/Files/Cache/Propagator.php` (propagateChange)
 
 use nc_db::pool::{DbPool, DbTxn};
-use sqlx::{Postgres, Row as _};
+use sqlx::{Postgres, Row as _, Sqlite};
 use tracing::warn;
 
 use crate::row;
@@ -249,18 +249,23 @@ impl Propagator {
                 storage_idx = storage_idx,
                 in_clause = in_clause,
             );
-            let mut query = sqlx::query(&sql);
-            for h in parent_hashes {
-                query = query.bind(h);
+            match &mut tx {
+                DbTxn::Pg(_) => unreachable!("sqlite path is variant-gated"),
+                DbTxn::Sqlite(tx) => {
+                    let mut query = sqlx::query::<Sqlite>(&sql);
+                    for h in parent_hashes {
+                        query = query.bind(h);
+                    }
+                    query = query.bind(self.storage_id);
+                    query = query.bind(time);
+                    query = query.bind(etag);
+                    query = query.bind(size_difference);
+                    query
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|e| format!("propagate UPDATE with size failed: {e}"))?;
+                }
             }
-            query = query.bind(self.storage_id);
-            query = query.bind(time);
-            query = query.bind(etag);
-            query = query.bind(size_difference);
-            query
-                .execute(&mut tx)
-                .await
-                .map_err(|e| format!("propagate UPDATE with size failed: {e}"))?;
         } else {
             // No size change — only etag + mtime.
             let sql = format!(
@@ -275,17 +280,22 @@ impl Propagator {
                 storage_idx = storage_idx,
                 in_clause = in_clause,
             );
-            let mut query = sqlx::query(&sql);
-            for h in parent_hashes {
-                query = query.bind(h);
+            match &mut tx {
+                DbTxn::Pg(_) => unreachable!("sqlite path is variant-gated"),
+                DbTxn::Sqlite(tx) => {
+                    let mut query = sqlx::query::<Sqlite>(&sql);
+                    for h in parent_hashes {
+                        query = query.bind(h);
+                    }
+                    query = query.bind(self.storage_id);
+                    query = query.bind(time);
+                    query = query.bind(etag);
+                    query
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|e| format!("propagate UPDATE failed: {e}"))?;
+                }
             }
-            query = query.bind(self.storage_id);
-            query = query.bind(time);
-            query = query.bind(etag);
-            query
-                .execute(&mut tx)
-                .await
-                .map_err(|e| format!("propagate UPDATE failed: {e}"))?;
         }
 
         tx.commit()
@@ -322,12 +332,20 @@ impl Propagator {
              WHERE parent = $1 AND storage = $2 AND size > -1",
             prefix = self.prefix
         );
-        let new_size: i64 = sqlx::query_scalar(&sql)
-            .bind(folder.fileid)
-            .bind(self.storage_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| format!("correct_folder_size SUM query failed: {e}"))?;
+        let new_size: i64 = match &self.pool {
+            DbPool::Pg(p) => sqlx::query_scalar::<Postgres, _>(&sql)
+                .bind(folder.fileid)
+                .bind(self.storage_id)
+                .fetch_one(p)
+                .await
+                .map_err(|e| format!("correct_folder_size SUM query failed: {e}"))?,
+            DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, _>(&sql)
+                .bind(folder.fileid)
+                .bind(self.storage_id)
+                .fetch_one(p)
+                .await
+                .map_err(|e| format!("correct_folder_size SUM query failed: {e}"))?,
+        };
 
         if new_size == old_size {
             return Ok(());
@@ -338,12 +356,22 @@ impl Propagator {
             "UPDATE {prefix}filecache SET size = $1 WHERE fileid = $2",
             prefix = self.prefix
         );
-        sqlx::query(&update_sql)
-            .bind(new_size)
-            .bind(folder.fileid)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| format!("correct_folder_size UPDATE failed: {e}"))?;
+        match &self.pool {
+            DbPool::Pg(p) => sqlx::query::<Postgres>(&update_sql)
+                .bind(new_size)
+                .bind(folder.fileid)
+                .execute(p)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("correct_folder_size UPDATE failed: {e}"))?,
+            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&update_sql)
+                .bind(new_size)
+                .bind(folder.fileid)
+                .execute(p)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("correct_folder_size UPDATE failed: {e}"))?,
+        };
 
         // Propagate the size delta up to ancestors.
         let size_delta = new_size - old_size;
@@ -396,13 +424,24 @@ impl Propagator {
              WHERE storage = $2 AND path_hash = $3",
             prefix = self.prefix
         );
-        sqlx::query(&sql)
-            .bind(disk_mtime)
-            .bind(self.storage_id)
-            .bind(&hash)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| format!("correct_parent_storage_mtime UPDATE failed: {e}"))?;
+        match &self.pool {
+            DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+                .bind(disk_mtime)
+                .bind(self.storage_id)
+                .bind(&hash)
+                .execute(p)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("correct_parent_storage_mtime UPDATE failed: {e}"))?,
+            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
+                .bind(disk_mtime)
+                .bind(self.storage_id)
+                .bind(&hash)
+                .execute(p)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("correct_parent_storage_mtime UPDATE failed: {e}"))?,
+        };
 
         Ok(())
     }
@@ -450,14 +489,30 @@ impl Propagator {
              WHERE parent = $1 AND storage = $2",
             prefix = self.prefix
         );
-        let r = sqlx::query(&sql)
-            .bind(folder.fileid)
-            .bind(self.storage_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| format!("recompute_folder_size SUM/MIN query failed: {e}"))?;
-        let total: i64 = r.get("total");
-        let minsize: i64 = r.get("minsize");
+        let (total, minsize): (i64, i64) = match &self.pool {
+            DbPool::Pg(p) => {
+                let r = sqlx::query::<Postgres>(&sql)
+                    .bind(folder.fileid)
+                    .bind(self.storage_id)
+                    .fetch_one(p)
+                    .await
+                    .map_err(|e| format!("recompute_folder_size SUM/MIN query failed: {e}"))?;
+                let total: i64 = r.get("total");
+                let minsize: i64 = r.get("minsize");
+                (total, minsize)
+            }
+            DbPool::Sqlite(p) => {
+                let r = sqlx::query::<Sqlite>(&sql)
+                    .bind(folder.fileid)
+                    .bind(self.storage_id)
+                    .fetch_one(p)
+                    .await
+                    .map_err(|e| format!("recompute_folder_size SUM/MIN query failed: {e}"))?;
+                let total: i64 = r.get("total");
+                let minsize: i64 = r.get("minsize");
+                (total, minsize)
+            }
+        };
 
         // Any unscanned child (size = -1) marks the folder unscanned too.
         let new_size = if minsize == -1 { -1 } else { total };
@@ -470,12 +525,22 @@ impl Propagator {
             "UPDATE {prefix}filecache SET size = $1 WHERE fileid = $2",
             prefix = self.prefix
         );
-        sqlx::query(&update_sql)
-            .bind(new_size)
-            .bind(folder.fileid)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| format!("recompute_folder_size UPDATE failed: {e}"))?;
+        match &self.pool {
+            DbPool::Pg(p) => sqlx::query::<Postgres>(&update_sql)
+                .bind(new_size)
+                .bind(folder.fileid)
+                .execute(p)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("recompute_folder_size UPDATE failed: {e}"))?,
+            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&update_sql)
+                .bind(new_size)
+                .bind(folder.fileid)
+                .execute(p)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("recompute_folder_size UPDATE failed: {e}"))?,
+        };
 
         Ok(())
     }
@@ -487,6 +552,15 @@ impl Propagator {
 mod tests {
     use super::*;
     use nc_db::pool::DbPool;
+
+    /// The in-memory test DB is always SQLite; unwrap the variant for the
+    /// native queries below (tests never construct a Pg pool).
+    fn test_pool(pool: &DbPool) -> &sqlx::SqlitePool {
+        match pool {
+            DbPool::Sqlite(p) => p,
+            DbPool::Pg(_) => panic!("test pools are sqlite"),
+        }
+    }
 
     // ── Unit: get_parents ──────────────────────────────────────────────────
 
@@ -543,46 +617,46 @@ mod tests {
     /// ```
     async fn setup_test_fs(pool: &DbPool, prefix: &str, storage_id: i64) {
         // Root storage entry.
-        sqlx::query(&format!(
+        sqlx::query::<Sqlite>(&format!(
             "INSERT INTO {prefix}filecache (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, size, mtime, storage_mtime, etag, permissions, checksum) \
              VALUES (1, $1, '', $2, -1, NULL, 0, 0, -1, 0, 0, 'root_old', 31, '')"
         ))
         .bind(storage_id)
         .bind(row::path_hash(""))
-        .execute(pool)
+        .execute(test_pool(pool))
         .await
         .expect("insert root");
 
         // "files" directory.
-        sqlx::query(&format!(
+        sqlx::query::<Sqlite>(&format!(
             "INSERT INTO {prefix}filecache (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, size, mtime, storage_mtime, etag, permissions, checksum) \
              VALUES (2, $1, 'files', $2, 1, 'files', 0, 0, 100, 10, 10, 'files_old', 31, '')"
         ))
         .bind(storage_id)
         .bind(row::path_hash("files"))
-        .execute(pool)
+        .execute(test_pool(pool))
         .await
         .expect("insert files");
 
         // "files/A" directory.
-        sqlx::query(&format!(
+        sqlx::query::<Sqlite>(&format!(
             "INSERT INTO {prefix}filecache (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, size, mtime, storage_mtime, etag, permissions, checksum) \
              VALUES (3, $1, 'files/A', $2, 2, 'A', 0, 0, 50, 10, 10, 'a_old', 31, '')"
         ))
         .bind(storage_id)
         .bind(row::path_hash("files/A"))
-        .execute(pool)
+        .execute(test_pool(pool))
         .await
         .expect("insert files/A");
 
         // "files/A/file.txt".
-        sqlx::query(&format!(
+        sqlx::query::<Sqlite>(&format!(
             "INSERT INTO {prefix}filecache (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, size, mtime, storage_mtime, etag, permissions, checksum) \
              VALUES (4, $1, 'files/A/file.txt', $2, 3, 'file.txt', 0, 0, 50, 10, 10, 'file_old', 27, '')"
         ))
         .bind(storage_id)
         .bind(row::path_hash("files/A/file.txt"))
-        .execute(pool)
+        .execute(test_pool(pool))
         .await
         .expect("insert files/A/file.txt");
     }
@@ -597,7 +671,7 @@ mod tests {
         );
 
         // Create the filecache table matching 0003_filecache.sql.
-        sqlx::query(
+        sqlx::query::<Sqlite>(
             "CREATE TABLE oc_filecache (
                 fileid           INTEGER NOT NULL PRIMARY KEY,
                 storage          BIGINT  NOT NULL DEFAULT 0,
@@ -615,7 +689,7 @@ mod tests {
                 checksum         VARCHAR(255)
             )",
         )
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .expect("create table");
 
@@ -638,10 +712,10 @@ mod tests {
             "SELECT size, etag, mtime, storage_mtime FROM {prefix}filecache \
              WHERE storage = $1 AND path_hash = $2"
         );
-        let r = sqlx::query(&sql)
+        let r = sqlx::query::<Sqlite>(&sql)
             .bind(storage_id)
             .bind(&hash)
-            .fetch_one(pool)
+            .fetch_one(test_pool(pool))
             .await
             .expect("row not found");
         let size: i64 = r.get("size");
@@ -743,12 +817,12 @@ mod tests {
         let prop = Propagator::new(pool.clone(), prefix.clone(), storage_id);
 
         // Mark "files/A" as unscanned (size = -1).
-        sqlx::query(&format!(
+        sqlx::query::<Sqlite>(&format!(
             "UPDATE {prefix}filecache SET size = -1 WHERE path_hash = $1",
             prefix = prefix
         ))
         .bind(row::path_hash("files/A"))
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .expect("set size=-1");
 
@@ -816,12 +890,12 @@ mod tests {
         let prop = Propagator::new(pool.clone(), prefix.clone(), storage_id);
 
         // Replace the size of "files/A" with a wrong value.
-        sqlx::query(&format!(
+        sqlx::query::<Sqlite>(&format!(
             "UPDATE {prefix}filecache SET size = 999 WHERE path_hash = $1",
             prefix = prefix
         ))
         .bind(row::path_hash("files/A"))
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .expect("set wrong size");
 
@@ -841,12 +915,12 @@ mod tests {
         let prop = Propagator::new(pool.clone(), prefix.clone(), storage_id);
 
         // Artificially set "files/A" to a wrong smaller size, then correct it.
-        sqlx::query(&format!(
+        sqlx::query::<Sqlite>(&format!(
             "UPDATE {prefix}filecache SET size = 10 WHERE path_hash = $1",
             prefix = prefix
         ))
         .bind(row::path_hash("files/A"))
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .expect("set wrong size");
 
@@ -936,13 +1010,13 @@ mod tests {
 
         // Insert a new file (size 30) under files/A — simulates the row a fresh
         // PUT commits before the size chain runs.
-        sqlx::query(&format!(
+        sqlx::query::<Sqlite>(&format!(
             "INSERT INTO {prefix}filecache (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, size, mtime, storage_mtime, etag, permissions, checksum) \
              VALUES (5, $1, 'files/A/new.txt', $2, 3, 'new.txt', 0, 0, 30, 20, 20, 'new_old', 27, '')"
         ))
         .bind(storage_id)
         .bind(row::path_hash("files/A/new.txt"))
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .expect("insert new file");
 
@@ -964,12 +1038,12 @@ mod tests {
         let prop = Propagator::new(pool.clone(), prefix.clone(), storage_id);
 
         // Mark files/A/file.txt unscanned (size = -1).
-        sqlx::query(&format!(
+        sqlx::query::<Sqlite>(&format!(
             "UPDATE {prefix}filecache SET size = -1 WHERE path_hash = $1",
             prefix = prefix
         ))
         .bind(row::path_hash("files/A/file.txt"))
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .expect("set size=-1");
 

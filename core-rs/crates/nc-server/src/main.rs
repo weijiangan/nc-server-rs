@@ -123,14 +123,26 @@ async fn main() -> anyhow::Result<()> {
     // capability cache so the `/ocs/.../cloud/capabilities` response is
     // complete before the first client request arrives.
     if let Some(ref fpm) = fastcgi {
-        let admin_uid: Option<String> = sqlx::query_scalar(&format!(
-            "SELECT uid FROM {prefix}group_user WHERE gid = 'admin' LIMIT 1",
-            prefix = &table_prefix
-        ))
-        .fetch_optional(&pool)
-        .await
-        .ok()
-        .flatten();
+        let admin_uid: Option<String> = match &pool {
+            nc_db::pool::DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, String>(&format!(
+                "SELECT uid FROM {prefix}group_user WHERE gid = 'admin' LIMIT 1",
+                prefix = &table_prefix
+            ))
+            .fetch_optional(p)
+            .await
+            .ok()
+            .flatten(),
+            nc_db::pool::DbPool::Sqlite(p) => {
+                sqlx::query_scalar::<sqlx::Sqlite, String>(&format!(
+                    "SELECT uid FROM {prefix}group_user WHERE gid = 'admin' LIMIT 1",
+                    prefix = &table_prefix
+                ))
+                .fetch_optional(p)
+                .await
+                .ok()
+                .flatten()
+            }
+        };
 
         match admin_uid {
             Some(ref uid) => {
@@ -327,14 +339,28 @@ fn spawn_capability_refresh_task(
             // 3. If PHP-FPM is available, re-fetch the PHP-app capability block.
             if let Some(ref fpm) = fastcgi {
                 // Re-query admin UID in case group membership changed since startup.
-                let admin_uid: Option<String> = sqlx::query_scalar(&format!(
-                    "SELECT uid FROM {p}group_user WHERE gid = 'admin' LIMIT 1",
-                    p = &table_prefix
-                ))
-                .fetch_optional(&pool)
-                .await
-                .ok()
-                .flatten();
+                let admin_uid: Option<String> = match &pool {
+                    nc_db::pool::DbPool::Pg(p) => {
+                        sqlx::query_scalar::<sqlx::Postgres, String>(&format!(
+                            "SELECT uid FROM {p}group_user WHERE gid = 'admin' LIMIT 1",
+                            p = &table_prefix
+                        ))
+                        .fetch_optional(p)
+                        .await
+                        .ok()
+                        .flatten()
+                    }
+                    nc_db::pool::DbPool::Sqlite(p) => {
+                        sqlx::query_scalar::<sqlx::Sqlite, String>(&format!(
+                            "SELECT uid FROM {p}group_user WHERE gid = 'admin' LIMIT 1",
+                            p = &table_prefix
+                        ))
+                        .fetch_optional(p)
+                        .await
+                        .ok()
+                        .flatten()
+                    }
+                };
 
                 match admin_uid {
                     Some(ref uid) => {

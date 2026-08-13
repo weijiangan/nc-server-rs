@@ -35,13 +35,23 @@ pub(crate) async fn queue_preview_generation(
          )",
         prefix = prefix
     );
-    if let Err(e) = sqlx::query(&sql)
-        .bind(uid)
-        .bind(file_id)
-        .bind(queued_at)
-        .execute(pool)
-        .await
-    {
+    let result = match pool {
+        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+            .bind(uid)
+            .bind(file_id)
+            .bind(queued_at)
+            .execute(p)
+            .await
+            .map(|_| ()),
+        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
+            .bind(uid)
+            .bind(file_id)
+            .bind(queued_at)
+            .execute(p)
+            .await
+            .map(|_| ()),
+    };
+    if let Err(e) = result {
         warn!(uid, file_id, error = %e, "Failed to queue preview generation");
     }
 }
@@ -62,25 +72,52 @@ mod tests {
                 .await
                 .expect("in-memory SQLite"),
         );
-        sqlx::query(
-            "CREATE TABLE oc_preview_generation (
-                id        INTEGER NOT NULL PRIMARY KEY,
-                uid       VARCHAR(256) NOT NULL,
-                file_id   BIGINT NOT NULL,
-                queued_at BIGINT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create table");
+        match &pool {
+            DbPool::Pg(p) => {
+                sqlx::query::<sqlx::Postgres>(
+                    "CREATE TABLE oc_preview_generation (
+                        id        INTEGER NOT NULL PRIMARY KEY,
+                        uid       VARCHAR(256) NOT NULL,
+                        file_id   BIGINT NOT NULL,
+                        queued_at BIGINT NOT NULL
+                    )",
+                )
+                .execute(p)
+                .await
+                .expect("create table");
+            }
+            DbPool::Sqlite(p) => {
+                sqlx::query::<sqlx::Sqlite>(
+                    "CREATE TABLE oc_preview_generation (
+                        id        INTEGER NOT NULL PRIMARY KEY,
+                        uid       VARCHAR(256) NOT NULL,
+                        file_id   BIGINT NOT NULL,
+                        queued_at BIGINT NOT NULL
+                    )",
+                )
+                .execute(p)
+                .await
+                .expect("create table");
+            }
+        }
         pool
     }
 
     async fn count(pool: &DbPool) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM oc_preview_generation")
-            .fetch_one(pool)
+        match pool {
+            DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(
+                "SELECT COUNT(*) FROM oc_preview_generation",
+            )
+            .fetch_one(p)
             .await
-            .expect("count")
+            .expect("count"),
+            DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(
+                "SELECT COUNT(*) FROM oc_preview_generation",
+            )
+            .fetch_one(p)
+            .await
+            .expect("count"),
+        }
     }
 
     #[tokio::test]

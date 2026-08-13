@@ -64,13 +64,19 @@ pub async fn verify_basic(
     // to a blocking thread pool to avoid stalling the async runtime.
     let table = format!("{prefix}users");
 
-    let row: Option<(String, String)> = match sqlx::query_as(&format!(
-        "SELECT uid, password FROM {table} WHERE uid_lower = $1"
-    ))
-    .bind(login.to_lowercase())
-    .fetch_optional(pool)
-    .await
-    {
+    let sql = format!("SELECT uid, password FROM {table} WHERE uid_lower = $1");
+    let login_lower = login.to_lowercase();
+    let fetched: Result<Option<(String, String)>, sqlx::Error> = match pool {
+        DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (String, String)>(&sql)
+            .bind(&login_lower)
+            .fetch_optional(p)
+            .await,
+        DbPool::Sqlite(p) => sqlx::query_as::<sqlx::Sqlite, (String, String)>(&sql)
+            .bind(&login_lower)
+            .fetch_optional(p)
+            .await,
+    };
+    let row: Option<(String, String)> = match fetched {
         Ok(row) => row,
         Err(e) => {
             tracing::warn!(
@@ -125,15 +131,26 @@ async fn try_app_token(
     // which filters `WHERE token = $hash AND version = $version` — no `login_name` in the
     // WHERE clause).  The `login_name` validation happens below, matching PHP's
     // `validateTokenLoginName()` case-insensitive comparison.
-    let row: Option<(i64, String, i16, Option<i64>, String)> = match sqlx::query_as(&format!(
+    let sql = format!(
         "SELECT id, uid, type, expires, login_name \
          FROM {table} \
          WHERE token = $1"
-    ))
-    .bind(&hash_hex)
-    .fetch_optional(pool)
-    .await
-    {
+    );
+    let fetched: Result<Option<(i64, String, i16, Option<i64>, String)>, sqlx::Error> = match pool {
+        DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (i64, String, i16, Option<i64>, String)>(
+            &sql,
+        )
+        .bind(&hash_hex)
+        .fetch_optional(p)
+        .await,
+        DbPool::Sqlite(p) => {
+            sqlx::query_as::<sqlx::Sqlite, (i64, String, i16, Option<i64>, String)>(&sql)
+                .bind(&hash_hex)
+                .fetch_optional(p)
+                .await
+        }
+    };
+    let row: Option<(i64, String, i16, Option<i64>, String)> = match fetched {
         Ok(row) => row,
         Err(e) => {
             tracing::warn!(

@@ -365,23 +365,42 @@ async fn ensure_version_parents(
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
              RETURNING fileid"
         );
-        let _fid: i64 = sqlx::query_scalar(&sql)
-            .bind(storage_id)
-            .bind(&built)
-            .bind(&hash)
-            .bind(parent_fileid)
-            .bind(&name)
-            .bind(dir_mime_id)
-            .bind(dir_mimepart_id)
-            .bind(0i64)
-            .bind(now)
-            .bind(now)
-            .bind(&etag)
-            .bind(31i32)
-            .bind("")
-            .fetch_one(pool)
-            .await
-            .map_err(|e| format!("insert ancestor {built}: {e}"))?;
+        let _fid: i64 = match pool {
+            DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
+                .bind(storage_id)
+                .bind(&built)
+                .bind(&hash)
+                .bind(parent_fileid)
+                .bind(&name)
+                .bind(dir_mime_id)
+                .bind(dir_mimepart_id)
+                .bind(0i64)
+                .bind(now)
+                .bind(now)
+                .bind(&etag)
+                .bind(31i32)
+                .bind("")
+                .fetch_one(p)
+                .await
+                .map_err(|e| format!("insert ancestor {built}: {e}"))?,
+            DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
+                .bind(storage_id)
+                .bind(&built)
+                .bind(&hash)
+                .bind(parent_fileid)
+                .bind(&name)
+                .bind(dir_mime_id)
+                .bind(dir_mimepart_id)
+                .bind(0i64)
+                .bind(now)
+                .bind(now)
+                .bind(&etag)
+                .bind(31i32)
+                .bind("")
+                .fetch_one(p)
+                .await
+                .map_err(|e| format!("insert ancestor {built}: {e}"))?,
+        };
 
         // No oc_filecache_extended row — PHP's `View::mkdir` → `Cache::insert`
         // never writes extension fields for directories (same class as finding
@@ -491,22 +510,39 @@ async fn insert_version_row(
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
          RETURNING fileid"
     );
-    let fid: i64 = match sqlx::query_scalar(&sql)
-        .bind(storage_id)
-        .bind(version_fc)
-        .bind(&hash)
-        .bind(parent_id)
-        .bind(&name)
-        .bind(mimetype)
-        .bind(mimepart_id)
-        .bind(size)
-        .bind(mtime)
-        .bind(storage_mtime)
-        .bind(etag)
-        .bind(permissions)
-        .fetch_one(pool)
-        .await
-    {
+    let fetched: Result<i64, sqlx::Error> = match pool {
+        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
+            .bind(storage_id)
+            .bind(version_fc)
+            .bind(&hash)
+            .bind(parent_id)
+            .bind(&name)
+            .bind(mimetype)
+            .bind(mimepart_id)
+            .bind(size)
+            .bind(mtime)
+            .bind(storage_mtime)
+            .bind(etag)
+            .bind(permissions)
+            .fetch_one(p)
+            .await,
+        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
+            .bind(storage_id)
+            .bind(version_fc)
+            .bind(&hash)
+            .bind(parent_id)
+            .bind(&name)
+            .bind(mimetype)
+            .bind(mimepart_id)
+            .bind(size)
+            .bind(mtime)
+            .bind(storage_mtime)
+            .bind(etag)
+            .bind(permissions)
+            .fetch_one(p)
+            .await,
+    };
+    let fid: i64 = match fetched {
         Ok(id) => id,
         Err(e) => {
             warn!("insert_version_row: INSERT failed for {version_fc}: {e}");
@@ -521,12 +557,22 @@ async fn insert_version_row(
          VALUES ($1, '', $2, $3) \
          ON CONFLICT(fileid) DO NOTHING"
     );
-    let _ = sqlx::query(&sql_ext)
-        .bind(fid)
-        .bind(creation_time)
-        .bind(upload_time)
-        .execute(pool)
-        .await;
+    let _ = match pool {
+        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql_ext)
+            .bind(fid)
+            .bind(creation_time)
+            .bind(upload_time)
+            .execute(p)
+            .await
+            .map(|_| ()),
+        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql_ext)
+            .bind(fid)
+            .bind(creation_time)
+            .bind(upload_time)
+            .execute(p)
+            .await
+            .map(|_| ()),
+    };
 }
 
 /// Insert a row into `oc_files_versions` so PHP-FPM's version PROPFIND can
@@ -564,16 +610,28 @@ pub(crate) async fn insert_version_entity(
             "INSERT INTO {prefix}files_versions (file_id, \"timestamp\", size, mimetype, metadata) \
              VALUES ($1, $2, $3, $4, $5::json)"
         );
-        match sqlx::query(&insert_sql)
-            .bind(source_fileid)
-            .bind(ts)
-            .bind(size)
-            .bind(mimetype)
-            .bind(&metadata_json)
-            .execute(pool)
-            .await
-        {
-            Ok(_) => return,
+        let result = match pool {
+            DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&insert_sql)
+                .bind(source_fileid)
+                .bind(ts)
+                .bind(size)
+                .bind(mimetype)
+                .bind(&metadata_json)
+                .execute(p)
+                .await
+                .map(|_| ()),
+            DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&insert_sql)
+                .bind(source_fileid)
+                .bind(ts)
+                .bind(size)
+                .bind(mimetype)
+                .bind(&metadata_json)
+                .execute(p)
+                .await
+                .map(|_| ()),
+        };
+        match result {
+            Ok(()) => return,
             Err(e) => {
                 let msg = e.to_string();
                 if attempt + 1 >= 5 {
@@ -624,6 +682,15 @@ mod tests {
 
     use nc_db::mime::MimeCache;
 
+    /// The in-memory test DB is always SQLite; unwrap the variant for the
+    /// native queries below (tests never construct a Pg pool).
+    fn test_pool(pool: &DbPool) -> &sqlx::SqlitePool {
+        match pool {
+            DbPool::Sqlite(p) => p,
+            DbPool::Pg(_) => panic!("test pools are sqlite"),
+        }
+    }
+
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     fn fresh_data_dir() -> PathBuf {
@@ -651,7 +718,7 @@ mod tests {
                 .expect("in-memory SQLite"),
         );
 
-        sqlx::query(
+        sqlx::query::<sqlx::Sqlite>(
             "CREATE TABLE oc_filecache (
                 fileid           INTEGER NOT NULL PRIMARY KEY,
                 storage          BIGINT  NOT NULL DEFAULT 0,
@@ -669,10 +736,10 @@ mod tests {
                 checksum         VARCHAR(255)
             )",
         )
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .expect("create filecache");
-        sqlx::query(
+        sqlx::query::<sqlx::Sqlite>(
             "CREATE TABLE oc_filecache_extended (
                 fileid         INTEGER NOT NULL PRIMARY KEY,
                 metadata_etag  VARCHAR(40) NOT NULL DEFAULT '',
@@ -680,12 +747,12 @@ mod tests {
                 upload_time    BIGINT NOT NULL DEFAULT 0
             )",
         )
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .expect("create filecache_extended");
         // The unique (file_id, timestamp) key mirrors the production schema —
         // the same-second overwrite conflict exercises the retry loop.
-        sqlx::query(
+        sqlx::query::<sqlx::Sqlite>(
             "CREATE TABLE oc_files_versions (
                 id         INTEGER NOT NULL PRIMARY KEY,
                 file_id    BIGINT NOT NULL,
@@ -696,16 +763,16 @@ mod tests {
                 UNIQUE (file_id, \"timestamp\")
             )",
         )
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .expect("create files_versions");
-        sqlx::query(
+        sqlx::query::<sqlx::Sqlite>(
             "CREATE TABLE oc_mimetypes (
                 id       BIGINT NOT NULL PRIMARY KEY,
                 mimetype VARCHAR(255) NOT NULL
             )",
         )
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .expect("create mimetypes");
 
@@ -716,7 +783,7 @@ mod tests {
             (2, "files", 1, 100, "files", "files-etag"),
             (4, "files/hello.txt", 2, 26, "hello.txt", "old-etag"),
         ] {
-            sqlx::query(&format!(
+            sqlx::query::<sqlx::Sqlite>(&format!(
                 "INSERT INTO {prefix}filecache \
                  (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
                   size, mtime, storage_mtime, etag, permissions, checksum) \
@@ -730,7 +797,7 @@ mod tests {
             .bind(name)
             .bind(size)
             .bind(etag)
-            .execute(&pool)
+            .execute(test_pool(&pool))
             .await
             .expect("seed filecache");
         }
@@ -802,11 +869,11 @@ mod tests {
             "storage_mtime {} should be the copy time (now), not the old mtime",
             v.storage_mtime
         );
-        let checksum: Option<String> = sqlx::query_scalar(&format!(
+        let checksum: Option<String> = sqlx::query_scalar::<sqlx::Sqlite, _>(&format!(
             "SELECT checksum FROM {prefix}filecache WHERE fileid = $1"
         ))
         .bind(v.fileid)
-        .fetch_one(&pool)
+        .fetch_one(test_pool(&pool))
         .await
         .unwrap();
         assert_eq!(checksum, None, "version row checksum must be NULL");
@@ -826,9 +893,9 @@ mod tests {
             dir.mtime
         );
         let dir_ext: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM oc_filecache_extended WHERE fileid = $1")
+            sqlx::query_scalar::<sqlx::Sqlite, _>("SELECT COUNT(*) FROM oc_filecache_extended WHERE fileid = $1")
                 .bind(dir.fileid)
-                .fetch_one(&pool)
+                .fetch_one(test_pool(&pool))
                 .await
                 .unwrap();
         assert_eq!(dir_ext, 0, "version dirs must have no extended rows");
@@ -841,21 +908,22 @@ mod tests {
     #[tokio::test]
     async fn insert_version_entity_bumps_timestamp_on_conflict() {
         let (pool, prefix, _) = fresh_db().await;
-        sqlx::query(
+        sqlx::query::<sqlx::Sqlite>(
             "INSERT INTO oc_files_versions (file_id, \"timestamp\", size, mimetype, metadata) \
              VALUES (4, 100, 26, 0, '{\"author\":\"admin\"}')",
         )
-        .execute(&pool)
+        .execute(test_pool(&pool))
         .await
         .unwrap();
 
         insert_version_entity(&pool, &prefix, 4, 100, 31, 0, "admin").await;
 
-        let rows: Vec<(i64, i64)> =
-            sqlx::query_as("SELECT \"timestamp\", size FROM oc_files_versions WHERE file_id = 4")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let rows: Vec<(i64, i64)> = sqlx::query_as::<sqlx::Sqlite, (i64, i64)>(
+            "SELECT \"timestamp\", size FROM oc_files_versions WHERE file_id = 4",
+        )
+        .fetch_all(test_pool(&pool))
+        .await
+        .unwrap();
         assert_eq!(rows.len(), 2, "the retried insert must land a second row");
         let (ts, size) = rows.iter().max().copied().unwrap();
         assert!(ts > 100, "the new entity must carry a bumped timestamp");

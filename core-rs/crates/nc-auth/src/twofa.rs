@@ -38,12 +38,17 @@ pub async fn requires_2fa(
     }
 
     let table = format!("{prefix}twofactor_providers");
-    let count: i64 = sqlx::query_scalar(&format!(
-        "SELECT COUNT(*) FROM {table} WHERE uid = $1 AND enabled = 1"
-    ))
-    .bind(uid)
-    .fetch_one(pool)
-    .await?;
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE uid = $1 AND enabled = 1");
+    let count: i64 = match pool {
+        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
+            .bind(uid)
+            .fetch_one(p)
+            .await?,
+        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
+            .bind(uid)
+            .fetch_one(p)
+            .await?,
+    };
 
     Ok(count > 0)
 }

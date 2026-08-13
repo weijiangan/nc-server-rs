@@ -13,9 +13,9 @@ sqlite = ["sqlx/sqlite"]
 [dependencies]
 sqlx.workspace = true
 # Internal sqlx modules the umbrella crate does not re-export: the native
-# postgres/sqlite argument + row + statement types (for the T3 executor
-# delegation) and AnyColumn/UStr (any side).  Feature unification with
-# `sqlx` provides the any/postgres/sqlite capabilities.
+# postgres/sqlite argument + row + statement types (per-variant queries,
+# PHASE-22 T3.3 — the `any` driver is gone).  Feature unification with
+# `sqlx` provides the postgres/sqlite capabilities.
 sqlx-core = { version = "0.8", default-features = false }
 sqlx-postgres = { version = "0.8", default-features = false }
 sqlx-sqlite = { version = "0.8", default-features = false }

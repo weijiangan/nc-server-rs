@@ -143,13 +143,22 @@ async fn lookup_quota_preference(pool: &DbPool, prefix: &str, uid: &str) -> Opti
         "SELECT configvalue FROM {prefix}preferences \
          WHERE userid = $1 AND appid = 'files' AND configkey = 'quota'"
     );
-    sqlx::query_scalar::<_, Option<String>>(&sql)
-        .bind(uid)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-        .flatten()
+    match pool {
+        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, Option<String>>(&sql)
+            .bind(uid)
+            .fetch_optional(p)
+            .await
+            .ok()
+            .flatten()
+            .flatten(),
+        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, Option<String>>(&sql)
+            .bind(uid)
+            .fetch_optional(p)
+            .await
+            .ok()
+            .flatten()
+            .flatten(),
+    }
 }
 
 /// Look up the number of bytes already used by the home storage.
@@ -159,15 +168,26 @@ async fn lookup_quota_preference(pool: &DbPool, prefix: &str, uid: &str) -> Opti
 async fn lookup_used_bytes(pool: &DbPool, prefix: &str, storage_id: i64) -> i64 {
     let path_hash = crate::row::path_hash("files");
     let sql = format!("SELECT size FROM {prefix}filecache WHERE storage = $1 AND path_hash = $2");
-    sqlx::query_scalar::<_, Option<i64>>(&sql)
-        .bind(storage_id)
-        .bind(&path_hash)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-        .flatten()
-        .filter(|&s| s >= 0)
+    match pool {
+        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, Option<i64>>(&sql)
+            .bind(storage_id)
+            .bind(&path_hash)
+            .fetch_optional(p)
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+            .filter(|&s| s >= 0),
+        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, Option<i64>>(&sql)
+            .bind(storage_id)
+            .bind(&path_hash)
+            .fetch_optional(p)
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+            .filter(|&s| s >= 0),
+    }
         .unwrap_or(0)
 }
 

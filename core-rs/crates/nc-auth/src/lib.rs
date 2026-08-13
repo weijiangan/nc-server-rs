@@ -50,13 +50,18 @@ pub struct AuthInfo {
 /// operations will be denied rather than the entire request crashing.
 pub async fn is_admin_user(uid: &str, pool: &nc_db::pool::DbPool, prefix: &str) -> bool {
     let table = format!("{prefix}group_user");
-    let row: Option<(String,)> = match sqlx::query_as(&format!(
-        "SELECT uid FROM {table} WHERE gid = 'admin' AND uid = $1"
-    ))
-    .bind(uid)
-    .fetch_optional(pool)
-    .await
-    {
+    let sql = format!("SELECT uid FROM {table} WHERE gid = 'admin' AND uid = $1");
+    let fetched: Result<Option<(String,)>, sqlx::Error> = match pool {
+        DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (String,)>(&sql)
+            .bind(uid)
+            .fetch_optional(p)
+            .await,
+        DbPool::Sqlite(p) => sqlx::query_as::<sqlx::Sqlite, (String,)>(&sql)
+            .bind(uid)
+            .fetch_optional(p)
+            .await,
+    };
+    let row: Option<(String,)> = match fetched {
         Ok(row) => row,
         Err(e) => {
             tracing::warn!(
@@ -147,12 +152,18 @@ async fn sharing_disabled_for_user(pool: &DbPool, prefix: &str, uid: &str) -> bo
     let sql = format!(
         "SELECT configvalue FROM {prefix}appconfig WHERE appid = 'core' AND configkey = $1"
     );
-    let exclude_groups: Option<String> = sqlx::query_scalar(&sql)
-        .bind(key)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+    let exclude_groups: Option<String> = match pool {
+        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
+            .bind(key)
+            .fetch_optional(p)
+            .await,
+        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
+            .bind(key)
+            .fetch_optional(p)
+            .await,
+    }
+    .ok()
+    .flatten();
 
     match exclude_groups.as_deref() {
         None | Some("no") | Some("") => {
@@ -164,11 +175,16 @@ async fn sharing_disabled_for_user(pool: &DbPool, prefix: &str, uid: &str) -> bo
             let list_sql = format!(
                 "SELECT configvalue FROM {prefix}appconfig WHERE appid = 'core' AND configkey = 'shareapi_exclude_groups_list'"
             );
-            let list_val: Option<String> = sqlx::query_scalar(&list_sql)
-                .fetch_optional(pool)
-                .await
-                .ok()
-                .flatten();
+            let list_val: Option<String> = match pool {
+                DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&list_sql)
+                    .fetch_optional(p)
+                    .await,
+                DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&list_sql)
+                    .fetch_optional(p)
+                    .await,
+            }
+            .ok()
+            .flatten();
 
             let excluded_groups: Vec<String> = match list_val.as_deref() {
                 Some(s) if !s.is_empty() => {
@@ -185,11 +201,17 @@ async fn sharing_disabled_for_user(pool: &DbPool, prefix: &str, uid: &str) -> bo
 
             // Query the user's group memberships.
             let groups_sql = format!("SELECT gid FROM {prefix}group_user WHERE uid = $1");
-            let user_groups: Vec<String> = match sqlx::query_scalar::<_, String>(&groups_sql)
-                .bind(uid)
-                .fetch_all(pool)
-                .await
-            {
+            let user_groups = match pool {
+                DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, String>(&groups_sql)
+                    .bind(uid)
+                    .fetch_all(p)
+                    .await,
+                DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, String>(&groups_sql)
+                    .bind(uid)
+                    .fetch_all(p)
+                    .await,
+            };
+            let user_groups = match user_groups {
                 Ok(g) => g,
                 Err(_) => return false,
             };
@@ -229,10 +251,17 @@ async fn sharing_disabled_for_user(pool: &DbPool, prefix: &str, uid: &str) -> bo
 /// syncs it from the backend but it can lag, hence users-first ordering.
 async fn lookup_user_display_name(pool: &DbPool, prefix: &str, uid: &str) -> String {
     let users_sql = format!("SELECT displayname FROM {prefix}users WHERE uid = $1");
-    if let Ok(Some(dn)) = sqlx::query_scalar::<_, Option<String>>(&users_sql)
-        .bind(uid)
-        .fetch_optional(pool)
-        .await
+    let users_dn = match pool {
+        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, Option<String>>(&users_sql)
+            .bind(uid)
+            .fetch_optional(p)
+            .await,
+        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, Option<String>>(&users_sql)
+            .bind(uid)
+            .fetch_optional(p)
+            .await,
+    };
+    if let Ok(Some(dn)) = users_dn
     {
         if let Some(dn) = dn {
             if !dn.is_empty() {
@@ -242,12 +271,18 @@ async fn lookup_user_display_name(pool: &DbPool, prefix: &str, uid: &str) -> Str
     }
 
     let accounts_sql = format!("SELECT data FROM {prefix}accounts WHERE uid = $1");
-    let accounts_data: Option<String> = sqlx::query_scalar(&accounts_sql)
-        .bind(uid)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+    let accounts_data: Option<String> = match pool {
+        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&accounts_sql)
+            .bind(uid)
+            .fetch_optional(p)
+            .await,
+        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&accounts_sql)
+            .bind(uid)
+            .fetch_optional(p)
+            .await,
+    }
+    .ok()
+    .flatten();
     if let Some(ref data) = accounts_data {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
             if let Some(dn) = parsed
@@ -297,6 +332,24 @@ pub enum AuthMethod {
 mod tests {
     use super::*;
 
+    /// Run a DDL/DML statement against the test pool (native per-variant).
+    async fn exec(pool: &DbPool, sql: &str) {
+        match pool {
+            DbPool::Pg(p) => {
+                sqlx::query::<sqlx::Postgres>(sql)
+                    .execute(p)
+                    .await
+                    .expect("test statement");
+            }
+            DbPool::Sqlite(p) => {
+                sqlx::query::<sqlx::Sqlite>(sql)
+                    .execute(p)
+                    .await
+                    .expect("test statement");
+            }
+        }
+    }
+
     /// In-memory SQLite with the two tables `cached_user_state` reads.
     async fn fresh_db() -> DbPool {
         let pool = DbPool::Sqlite(
@@ -306,39 +359,34 @@ mod tests {
                 .await
                 .expect("in-memory SQLite"),
         );
-        sqlx::query(
+        exec(
+            &pool,
             "CREATE TABLE oc_twofactor_providers (
                 provider_id VARCHAR(255) NOT NULL, uid VARCHAR(64) NOT NULL,
                 enabled SMALLINT NOT NULL DEFAULT 0
             )",
         )
-        .execute(&pool)
-        .await
-        .expect("twofactor");
-        sqlx::query(
+        .await;
+        exec(
+            &pool,
             "CREATE TABLE oc_group_user (gid VARCHAR(64) NOT NULL, uid VARCHAR(64) NOT NULL)",
         )
-        .execute(&pool)
-        .await
-        .expect("group_user");
-        sqlx::query(
+        .await;
+        exec(
+            &pool,
             "CREATE TABLE oc_users (uid VARCHAR(64) NOT NULL PRIMARY KEY, displayname VARCHAR(64))",
         )
-        .execute(&pool)
-        .await
-        .expect("users");
-        sqlx::query(
+        .await;
+        exec(
+            &pool,
             "CREATE TABLE oc_accounts (uid VARCHAR(64) NOT NULL PRIMARY KEY, data TEXT NOT NULL DEFAULT '{}')",
         )
-        .execute(&pool)
-        .await
-        .expect("accounts");
-        sqlx::query(
+        .await;
+        exec(
+            &pool,
             "CREATE TABLE oc_appconfig (appid VARCHAR(32) NOT NULL DEFAULT '', configkey VARCHAR(64) NOT NULL DEFAULT '', configvalue TEXT NOT NULL DEFAULT '')",
         )
-        .execute(&pool)
-        .await
-        .expect("appconfig");
+        .await;
         pool
     }
 
@@ -346,30 +394,30 @@ mod tests {
     async fn cached_user_state_serves_fresh_then_cached() {
         let pool = fresh_db().await;
         let prefix = "oc_";
-        sqlx::query("INSERT INTO oc_group_user (gid, uid) VALUES ('admin', 'alice')")
-            .execute(&pool)
-            .await
-            .expect("admin");
-        sqlx::query(
+        exec(
+            &pool,
+            "INSERT INTO oc_group_user (gid, uid) VALUES ('admin', 'alice')",
+        )
+        .await;
+        exec(
+            &pool,
             "INSERT INTO oc_twofactor_providers (provider_id, uid, enabled) VALUES ('totp', 'alice', 1)",
         )
-        .execute(&pool)
-        .await
-        .expect("2fa");
-        sqlx::query("INSERT INTO oc_users (uid, displayname) VALUES ('alice', 'Alice Example')")
-            .execute(&pool)
-            .await
-            .expect("user");
+        .await;
+        exec(
+            &pool,
+            "INSERT INTO oc_users (uid, displayname) VALUES ('alice', 'Alice Example')",
+        )
+        .await;
         // Sharing allow-listed to a group alice is NOT in ('staff'), so
         // sharing is disabled for her (allow mode: in_allowed == false).
-        sqlx::query(
+        exec(
+            &pool,
             "INSERT INTO oc_appconfig (appid, configkey, configvalue) VALUES \
              ('core', 'shareapi_exclude_groups', 'allow'), \
              ('core', 'shareapi_exclude_groups_list', '[\"staff\"]')",
         )
-        .execute(&pool)
-        .await
-        .expect("appconfig");
+        .await;
 
         let s = cached_user_state("alice", &pool, prefix)
             .await
@@ -384,18 +432,9 @@ mod tests {
 
         // Cache serves: flip the tables in the DB and the next call must
         // return the cached values (60 s TTL).
-        sqlx::query("DELETE FROM oc_group_user")
-            .execute(&pool)
-            .await
-            .expect("del");
-        sqlx::query("UPDATE oc_twofactor_providers SET enabled = 0")
-            .execute(&pool)
-            .await
-            .expect("disable");
-        sqlx::query("DELETE FROM oc_users")
-            .execute(&pool)
-            .await
-            .expect("del users");
+        exec(&pool, "DELETE FROM oc_group_user").await;
+        exec(&pool, "UPDATE oc_twofactor_providers SET enabled = 0").await;
+        exec(&pool, "DELETE FROM oc_users").await;
         let s2 = cached_user_state("alice", &pool, prefix)
             .await
             .expect("cached");
@@ -418,12 +457,11 @@ mod tests {
         let pool = fresh_db().await;
         let prefix = "oc_";
         // No oc_users row; oc_accounts.data carries the displayname JSON.
-        sqlx::query(
+        exec(
+            &pool,
             "INSERT INTO oc_accounts (uid, data) VALUES ('carol', '{\"displayname\":{\"value\":\"Carol Chen\",\"scope\":\"v2-local\",\"verified\":\"0\"}}')",
         )
-        .execute(&pool)
-        .await
-        .expect("accounts");
+        .await;
         let s = cached_user_state("carol", &pool, prefix)
             .await
             .expect("resolve");

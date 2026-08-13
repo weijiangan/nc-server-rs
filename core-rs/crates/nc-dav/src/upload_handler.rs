@@ -17,6 +17,7 @@ use axum::{
 };
 use http::{HeaderName, HeaderValue, StatusCode};
 use nc_auth::AuthInfo;
+use nc_db::pool::DbPool;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -614,17 +615,31 @@ async fn handle_move(
             WHERE fileid=$7",
             prefix = state.table_prefix
         );
-        if let Err(e) = sqlx::query(&sql)
-            .bind(total_size as i64)
-            .bind(mtime)
-            .bind(mtime)
-            .bind(&etag)
-            .bind(mime_type_id)
-            .bind(mimepart_id)
-            .bind(existing.fileid)
-            .execute(&state.pool)
-            .await
-        {
+        let result = match &state.pool {
+            DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+                .bind(total_size as i64)
+                .bind(mtime)
+                .bind(mtime)
+                .bind(&etag)
+                .bind(mime_type_id)
+                .bind(mimepart_id)
+                .bind(existing.fileid)
+                .execute(p)
+                .await
+                .map(|_| ()),
+            DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
+                .bind(total_size as i64)
+                .bind(mtime)
+                .bind(mtime)
+                .bind(&etag)
+                .bind(mime_type_id)
+                .bind(mimepart_id)
+                .bind(existing.fileid)
+                .execute(p)
+                .await
+                .map(|_| ()),
+        };
+        if let Err(e) = result {
             tracing::error!(error = %e, "Failed to update filecache");
         }
     } else {
@@ -637,23 +652,41 @@ async fn handle_move(
             RETURNING fileid",
             prefix = state.table_prefix
         );
-        fid = match sqlx::query_scalar(&sql)
-            .bind(storage_id)
-            .bind(&fc_path_full)
-            .bind(&hash)
-            .bind(parent_row.fileid)
-            .bind(&file_name)
-            .bind(mime_type_id)
-            .bind(mimepart_id)
-            .bind(total_size as i64)
-            .bind(mtime)
-            .bind(mtime)
-            .bind(&etag)
-            .bind(27i32) // CRUDS permissions (READ|UPDATE|DELETE|SHARE)
-            .bind("")
-            .fetch_one(&state.pool)
-            .await
-        {
+        let fetched: Result<i64, sqlx::Error> = match &state.pool {
+            DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
+                .bind(storage_id)
+                .bind(&fc_path_full)
+                .bind(&hash)
+                .bind(parent_row.fileid)
+                .bind(&file_name)
+                .bind(mime_type_id)
+                .bind(mimepart_id)
+                .bind(total_size as i64)
+                .bind(mtime)
+                .bind(mtime)
+                .bind(&etag)
+                .bind(27i32) // CRUDS permissions (READ|UPDATE|DELETE|SHARE)
+                .bind("")
+                .fetch_one(p)
+                .await,
+            DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
+                .bind(storage_id)
+                .bind(&fc_path_full)
+                .bind(&hash)
+                .bind(parent_row.fileid)
+                .bind(&file_name)
+                .bind(mime_type_id)
+                .bind(mimepart_id)
+                .bind(total_size as i64)
+                .bind(mtime)
+                .bind(mtime)
+                .bind(&etag)
+                .bind(27i32) // CRUDS permissions (READ|UPDATE|DELETE|SHARE)
+                .bind("")
+                .fetch_one(p)
+                .await,
+        };
+        fid = match fetched {
             Ok(id) => id,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to insert filecache");
@@ -679,14 +712,25 @@ async fn handle_move(
         // client sent X-OC-CTime (PHP writes it only when dictated).
         let creation_time_val = ctime.unwrap_or(0);
         let upload_time_val = now; // always set upload_time for new/uploads
-        if let Err(e) = sqlx::query(&sql)
-            .bind(fid)
-            .bind("") // metadata_etag
-            .bind(creation_time_val)
-            .bind(upload_time_val)
-            .execute(&state.pool)
-            .await
-        {
+        let result = match &state.pool {
+            DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+                .bind(fid)
+                .bind("") // metadata_etag
+                .bind(creation_time_val)
+                .bind(upload_time_val)
+                .execute(p)
+                .await
+                .map(|_| ()),
+            DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
+                .bind(fid)
+                .bind("") // metadata_etag
+                .bind(creation_time_val)
+                .bind(upload_time_val)
+                .execute(p)
+                .await
+                .map(|_| ()),
+        };
+        if let Err(e) = result {
             tracing::warn!(fileid = fid, error = %e, "Chunked upload: failed to upsert oc_filecache_extended");
         }
     }
@@ -759,7 +803,19 @@ async fn handle_move(
             "DELETE FROM {prefix}previews WHERE file_id = $1",
             prefix = state.table_prefix
         );
-        if let Err(e) = sqlx::query(&sql).bind(fid).execute(&state.pool).await {
+        let result = match &state.pool {
+            DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+                .bind(fid)
+                .execute(p)
+                .await
+                .map(|_| ()),
+            DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
+                .bind(fid)
+                .execute(p)
+                .await
+                .map(|_| ()),
+        };
+        if let Err(e) = result {
             tracing::warn!(fileid = fid, error = %e, "Chunked upload: failed to delete stale oc_previews rows");
         }
 

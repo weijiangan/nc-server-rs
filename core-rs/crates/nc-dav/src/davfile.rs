@@ -494,16 +494,29 @@ impl DavFile for NcDavFile {
                      SET size=$1, mtime=$2, storage_mtime=$3, etag=$4, checksum=$5 \
                      WHERE fileid=$6"
                 );
-                if let Err(e) = sqlx::query(&sql)
-                    .bind(size as i64)
-                    .bind(use_mtime)
-                    .bind(use_mtime)
-                    .bind(&etag_value)
-                    .bind(checksum)
-                    .bind(fid)
-                    .execute(pool)
-                    .await
-                {
+                let result = match pool {
+                    DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+                        .bind(size as i64)
+                        .bind(use_mtime)
+                        .bind(use_mtime)
+                        .bind(&etag_value)
+                        .bind(checksum)
+                        .bind(fid)
+                        .execute(p)
+                        .await
+                        .map(|_| ()),
+                    DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
+                        .bind(size as i64)
+                        .bind(use_mtime)
+                        .bind(use_mtime)
+                        .bind(&etag_value)
+                        .bind(checksum)
+                        .bind(fid)
+                        .execute(p)
+                        .await
+                        .map(|_| ()),
+                };
+                if let Err(e) = result {
                     tracing::error!(error = %e, fileid = fid, "PUT: failed to update oc_filecache row");
                     return Err(FsError::GeneralFailure);
                 }
@@ -521,23 +534,41 @@ impl DavFile for NcDavFile {
                 // The database allocates the fileid atomically (sequence on
                 // PostgreSQL, INTEGER PRIMARY KEY auto-increment on SQLite).
                 // No retry loop needed — no MAX+1 race possible.
-                let fid: i64 = match sqlx::query_scalar(&sql)
-                    .bind(ctx.storage_id)
-                    .bind(&ctx.fc_path)
-                    .bind(&hash)
-                    .bind(ctx.parent_id)
-                    .bind(&name)
-                    .bind(ctx.mime_type_id)
-                    .bind(ctx.mimepart_id)
-                    .bind(size as i64)
-                    .bind(use_mtime)
-                    .bind(use_mtime)
-                    .bind(&new_etag)
-                    .bind(27i32)
-                    .bind(checksum)
-                    .fetch_one(pool)
-                    .await
-                {
+                let fetched: Result<i64, sqlx::Error> = match pool {
+                    DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
+                        .bind(ctx.storage_id)
+                        .bind(&ctx.fc_path)
+                        .bind(&hash)
+                        .bind(ctx.parent_id)
+                        .bind(&name)
+                        .bind(ctx.mime_type_id)
+                        .bind(ctx.mimepart_id)
+                        .bind(size as i64)
+                        .bind(use_mtime)
+                        .bind(use_mtime)
+                        .bind(&new_etag)
+                        .bind(27i32)
+                        .bind(checksum)
+                        .fetch_one(p)
+                        .await,
+                    DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
+                        .bind(ctx.storage_id)
+                        .bind(&ctx.fc_path)
+                        .bind(&hash)
+                        .bind(ctx.parent_id)
+                        .bind(&name)
+                        .bind(ctx.mime_type_id)
+                        .bind(ctx.mimepart_id)
+                        .bind(size as i64)
+                        .bind(use_mtime)
+                        .bind(use_mtime)
+                        .bind(&new_etag)
+                        .bind(27i32)
+                        .bind(checksum)
+                        .fetch_one(p)
+                        .await,
+                };
+                let fid: i64 = match fetched {
                     Ok(id) => id,
                     Err(e) => {
                         tracing::error!(error = %e, fc_path = %ctx.fc_path, "PUT: failed to insert oc_filecache row");
@@ -581,13 +612,23 @@ impl DavFile for NcDavFile {
                  ON CONFLICT(fileid) DO UPDATE SET upload_time = excluded.upload_time",
                 prefix = prefix
             );
-            if let Err(e) = sqlx::query(&extended_sql)
-                .bind(fileid)
-                .bind(use_creation_time)
-                .bind(now)
-                .execute(pool)
-                .await
-            {
+            let result = match pool {
+                DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&extended_sql)
+                    .bind(fileid)
+                    .bind(use_creation_time)
+                    .bind(now)
+                    .execute(p)
+                    .await
+                    .map(|_| ()),
+                DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&extended_sql)
+                    .bind(fileid)
+                    .bind(use_creation_time)
+                    .bind(now)
+                    .execute(p)
+                    .await
+                    .map(|_| ()),
+            };
+            if let Err(e) = result {
                 tracing::warn!(fileid = fileid, error = %e, "PUT: failed to upsert oc_filecache_extended");
             }
 
@@ -655,7 +696,19 @@ impl DavFile for NcDavFile {
                 "DELETE FROM {prefix}previews WHERE file_id = $1",
                 prefix = prefix
             );
-            if let Err(e) = sqlx::query(&sql).bind(fileid).execute(pool).await {
+            let result = match pool {
+                DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+                    .bind(fileid)
+                    .execute(p)
+                    .await
+                    .map(|_| ()),
+                DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
+                    .bind(fileid)
+                    .execute(p)
+                    .await
+                    .map(|_| ()),
+            };
+            if let Err(e) = result {
                 tracing::warn!(fileid = fileid, error = %e, "PUT: failed to delete stale oc_previews rows");
             }
 

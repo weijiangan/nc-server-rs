@@ -85,14 +85,26 @@ pub async fn lookup_bearer(
     let hash_hex = hex::encode(hash);
     let table = format!("{prefix}authtoken");
 
-    let row: Option<(i64, String, i16, String, Option<i64>, i64)> = match sqlx::query_as(&format!(
+    let sql = format!(
         "SELECT id, uid, type, scope, expires, last_activity \
                  FROM {table} WHERE token = $1"
-    ))
-    .bind(&hash_hex)
-    .fetch_optional(pool)
-    .await
-    {
+    );
+    let fetched: Result<Option<(i64, String, i16, String, Option<i64>, i64)>, sqlx::Error> =
+        match pool {
+            DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (i64, String, i16, String, Option<i64>, i64)>(
+                &sql,
+            )
+            .bind(&hash_hex)
+            .fetch_optional(p)
+            .await,
+            DbPool::Sqlite(p) => {
+                sqlx::query_as::<sqlx::Sqlite, (i64, String, i16, String, Option<i64>, i64)>(&sql)
+                    .bind(&hash_hex)
+                    .fetch_optional(p)
+                    .await
+            }
+        };
+    let row: Option<(i64, String, i16, String, Option<i64>, i64)> = match fetched {
         Ok(row) => row,
         Err(e) => {
             tracing::warn!(
@@ -174,14 +186,22 @@ pub async fn update_last_activity(token_id: i64, pool: &DbPool, prefix: &str) {
         .unwrap_or_default()
         .as_secs() as i64;
     let table = format!("{prefix}authtoken");
-    if let Err(e) = sqlx::query(&format!(
-        "UPDATE {table} SET last_activity = $1 WHERE id = $2"
-    ))
-    .bind(now)
-    .bind(token_id)
-    .execute(pool)
-    .await
-    {
+    let sql = format!("UPDATE {table} SET last_activity = $1 WHERE id = $2");
+    let result = match pool {
+        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+            .bind(now)
+            .bind(token_id)
+            .execute(p)
+            .await
+            .map(|_| ()),
+        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
+            .bind(now)
+            .bind(token_id)
+            .execute(p)
+            .await
+            .map(|_| ()),
+    };
+    if let Err(e) = result {
         tracing::warn!(
             token_id,
             error = %e,
