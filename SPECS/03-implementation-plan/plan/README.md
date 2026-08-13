@@ -27,5 +27,6 @@ Split from the original `IMPL_PLAN.md` (Rust Nextcloud Core+Files Implementation
 - [`19-performance-improvements.md`](19-performance-improvements.md) — Performance improvements from the Phase 17 flamegraphs
 - [`20-performance-budget-gate.md`](20-performance-budget-gate.md) — Performance budget gate (query-count regression guard)
 - [`21-propfind-round-trip-reduction.md`](21-propfind-round-trip-reduction.md) — DAV read-path round-trip reduction
+- [`22-deployment-profile-tuning.md`](22-deployment-profile-tuning.md) — Deployment-profile tuning (2-core, HDD, localhost Postgres)
 
 Back: [`../README.md`](../README.md)
