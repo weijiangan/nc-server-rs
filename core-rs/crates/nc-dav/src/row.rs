@@ -1261,10 +1261,11 @@ pub async fn propfind_batch_cte(
         out.children.push(child);
 
         // Dir counts — only meaningful for directory children (mirrors the
-        // dir-only parent list the batch path uses).
+        // dir-only parent list the batch path uses).  NULL when the
+        // dir-counts gate ($5) is off — decode Option (22.2-C).
         if r.get::<i64, _>("mimetype") == dir_mime_id {
-            if let Ok(serde_json::Value::Object(v)) =
-                serde_json::from_value::<serde_json::Value>(r.get("dir_counts"))
+            if let Ok(Some(serde_json::Value::Object(v))) =
+                r.try_get::<Option<serde_json::Value>, _>("dir_counts")
             {
                 let dirs = v
                     .get("dirs")
@@ -1278,9 +1279,10 @@ pub async fn propfind_batch_cte(
             }
         }
 
-        // Comments (count, unread) — the sub-select always yields one row.
-        if let Ok(serde_json::Value::Object(v)) =
-            serde_json::from_value::<serde_json::Value>(r.get("comments"))
+        // Comments (count, unread) — NULL when the comments gate ($7) is off
+        // (22.2-C) — decode Option.
+        if let Ok(Some(serde_json::Value::Object(v))) =
+            r.try_get::<Option<serde_json::Value>, _>("comments")
         {
             let n = v.get("n").and_then(|x| x.as_i64()).unwrap_or(0);
             let unread = v.get("unread").and_then(|x| x.as_i64()).unwrap_or(0);
