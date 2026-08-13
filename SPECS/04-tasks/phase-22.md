@@ -193,6 +193,26 @@ Goal: fold `prefetch_tags`'s `oc_vcategory` / `oc_vcategory_to_object` scan into
 
 ---
 
+## 22.3 — CTE gating probe in the harness
+
+Goal: make the S2 gate's EXPLAIN assertion permanent — a harness probe that proves, on the deployed stack, that a narrow-prop depth-1 PROPFIND leaves the skipped CTE families unexecuted. Closes the blind spot the 22.2-C work exposed: any future edit to the CTE SQL (or any other PG-only statement) is currently validated only by the live stack by hand — SQLite tests and compilation are blind to it by construction (the vcategory `bigint` type bug was caught only by a manual `EXPLAIN`).
+
+**Decisions (grounded):**
+
+- **Black-box, like the rest of the harness** (plan 20: `nc-bench` links no `nc-*` server crate). The probe must **not** import the CTE SQL from source — it must test the *deployed* statement (a source-derived probe would drift and could pass while the deployed SQL is broken). Design: enable `log_statement='all'` (the perf-gate's existing plumbing), fire a depth-1 PROPFIND with the desktop client's narrow prop body, harvest the CTE statement text from the PG log, then `EXPLAIN (ANALYZE)` it with the flag binds set to the narrow request's values (all false except tags) and assert the skipped SubPlans are absent or `never executed` while the tags SubPlan executes. Run a second EXPLAIN with all flags true as the sanity direction.
+- **Also covers the runtime-type-bug class**: a wrong cast in the CTE (the `::text`-vs-bigint class) makes the EXPLAIN fail outright — the probe is the permanent tripwire for it.
+- The narrow body is the desktop client's fixed set (`d:getetag`/`getlastmodified`/`getcontentlength` + `oc:id`/`permissions`/`size`/`favorite` — no share-types, comments, system-tags, contained-*-count, custom props); a fixed replay, not a recorded capture.
+- The harness already owns the superuser DSN and the `log_statement` toggle (budget.rs) — the probe reuses both.
+
+| Stop | Tasks | Gate |
+|---|---|---|
+| S0 | 22.3.1, 22.3.2 | Probe passes on the current stack (narrow PROPFIND → skipped SubPlans unexecuted); non-zero exit on any violation; milestone procedure runs it. |
+
+- [ ] **22.3.1** The probe in `nc-bench` (a `gates` subcommand or equivalent): narrow-prop PROPFIND → harvest the CTE text from the PG log → `EXPLAIN (ANALYZE)` with the narrow flag binds → assert no skipped-family SubPlan executes and the tags SubPlan does; second EXPLAIN all-true as sanity. Non-zero exit on violation.
+- [ ] **22.3.2** Expose it as a make target (`make gate-probe` or fold into `make perf-gate` — decide in the task) and add it to the milestone procedure; verify it passes against the current stack.
+
+---
+
 ## Deviations from the task descriptions
 
 - **T7.2** — `custom_properties_batch` is NOT folded into the CTE (it stays a separate gated statement). The `>250`-char property-path hash (`format_property_path`) is Rust-side, and the children's names — needed to build those paths — only exist after the query returns, so a CTE sub-select would need pgcrypto (not guaranteed) or an `unnest` indirection over paths built from a second query. One statement either way; the CTE still collapses 5 families → 1.
