@@ -1563,6 +1563,42 @@ impl DavFileSystem for NcFileSystem {
             // Resolved once at startup (phase-21 S3) — the read path never
             // re-looks it up.
             let dir_mime_id = self.state.dir_mime_id;
+            // ── T6.6: which families did the client ask for? ──────────────
+            // Computed before the CTE so its sub-selects can be gated with
+            // `CASE WHEN $N` bind flags (22.2-C — a skipped family's SubPlan
+            // is never executed); the out-of-CTE statements gate on the same
+            // values below.
+            let oc_ns = "http://owncloud.org/ns";
+            let nc_ns = "http://nextcloud.org/ns";
+            let want_dir_counts = self.prop_requested(nc_ns, "contained-folder-count")
+                || self.prop_requested(nc_ns, "contained-file-count");
+            // T6.1 merged the share scan, so share-types/sharees/note share
+            // one gate; T6.3 merged the comments query (count + unread).
+            let want_shares = self.prop_requested(oc_ns, "share-types")
+                || self.prop_requested(oc_ns, "sharees")
+                || self.prop_requested(nc_ns, "note");
+            let want_comments = self.prop_requested(oc_ns, "comments-count")
+                || self.prop_requested(oc_ns, "comments-unread");
+            let want_system_tags = self.prop_requested(nc_ns, "system-tags");
+            // §9.5 prefetch — gated in `get_props` too (same predicate), or
+            // skipping the prefetch would re-introduce one query per child.
+            let want_tags = self.prop_requested(oc_ns, "favorite")
+                || self.prop_requested(oc_ns, "tags");
+            // Custom props serve any prop outside the known server namespaces
+            // (the same list `get_props`' custom-prop emission uses).
+            let want_custom_props = match &self.requested_props {
+                None => true,
+                Some(list) => list.iter().any(|(n, _)| {
+                    !matches!(
+                        n.as_deref(),
+                        Some("DAV:")
+                            | Some("http://owncloud.org/ns")
+                            | Some("http://nextcloud.org/ns")
+                            | Some("http://open-collaboration-services.org/ns")
+                    )
+                }),
+            };
+
             // PHASE-22 T7: on Postgres the whole child fan-out (listing +
             // dir counts + shares/notes + comments + system tags) is ONE
             // statement — the CTE's `kids` rows are exactly these children +
@@ -1576,6 +1612,13 @@ impl DavFileSystem for NcFileSystem {
                     self.storage_id,
                     dir_mime_id,
                     &self.uid,
+                    &row::PropfindGates {
+                        dir_counts: want_dir_counts,
+                        shares: want_shares,
+                        comments: want_comments,
+                        system_tags: want_system_tags,
+                        tags: want_tags,
+                    },
                 )
                 .await;
                 let row::PropfindCte {
@@ -1699,36 +1742,6 @@ impl DavFileSystem for NcFileSystem {
             // queries), and PropWriter's 12.1 filter drops the props from the
             // response anyway — identical bytes, less work.
             let child_paths: Vec<String> = metas.iter().map(|(k, _)| k.clone()).collect();
-            let oc_ns = "http://owncloud.org/ns";
-            let nc_ns = "http://nextcloud.org/ns";
-            let want_dir_counts = self.prop_requested(nc_ns, "contained-folder-count")
-                || self.prop_requested(nc_ns, "contained-file-count");
-            // T6.1 merged the share scan, so share-types/sharees/note share
-            // one gate; T6.3 merged the comments query (count + unread).
-            let want_shares = self.prop_requested(oc_ns, "share-types")
-                || self.prop_requested(oc_ns, "sharees")
-                || self.prop_requested(nc_ns, "note");
-            let want_comments = self.prop_requested(oc_ns, "comments-count")
-                || self.prop_requested(oc_ns, "comments-unread");
-            let want_system_tags = self.prop_requested(nc_ns, "system-tags");
-            // §9.5 prefetch — gated in `get_props` too (same predicate), or
-            // skipping the prefetch would re-introduce one query per child.
-            let want_tags = self.prop_requested(oc_ns, "favorite")
-                || self.prop_requested(oc_ns, "tags");
-            // Custom props serve any prop outside the known server namespaces
-            // (the same list `get_props`' custom-prop emission uses).
-            let want_custom_props = match &self.requested_props {
-                None => true,
-                Some(list) => list.iter().any(|(n, _)| {
-                    !matches!(
-                        n.as_deref(),
-                        Some("DAV:")
-                            | Some("http://owncloud.org/ns")
-                            | Some("http://nextcloud.org/ns")
-                            | Some("http://open-collaboration-services.org/ns")
-                    )
-                }),
-            };
             // PHASE-22 T7: on Postgres the CTE already carried dir counts,
             // shares/notes, comments and system tags — fill the batch maps
             // directly (the per-family statements do not exist on this path).

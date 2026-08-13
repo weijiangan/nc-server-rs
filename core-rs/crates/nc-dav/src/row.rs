@@ -1090,6 +1090,17 @@ fn cached_sql(prefix: &str, build: fn(&str) -> String) -> &'static str {
     s
 }
 
+/// Which CTE-resident families the client requested (T6.6).  The sub-selects
+/// are gated with `CASE WHEN $N THEN …` on these (22.2-C) so a skipped family
+/// costs nothing server-side — the SubPlan is not executed.
+pub struct PropfindGates {
+    pub dir_counts: bool,
+    pub shares: bool,
+    pub comments: bool,
+    pub system_tags: bool,
+    pub tags: bool,
+}
+
 pub async fn propfind_batch_cte(
     pool: &DbPool,
     prefix: &str,
@@ -1097,6 +1108,7 @@ pub async fn propfind_batch_cte(
     storage: i64,
     dir_mime_id: i64,
     uid: &str,
+    gates: &PropfindGates,
 ) -> PropfindCte {
     let sql = cached_sql(prefix, |prefix| {
         format!(
@@ -1113,41 +1125,41 @@ pub async fn propfind_batch_cte(
                 k.mimetype, k.mimepart, k.size, k.mtime, k.storage_mtime, \
                 k.etag, k.permissions, k.checksum, k.metadata_etag, \
                 k.creation_time, k.upload_time, \
-                (SELECT json_build_object( \
+                (CASE WHEN $5 AND k.mimetype = $3 THEN (SELECT json_build_object( \
                     'dirs', count(*) FILTER (WHERE c.mimetype = $3), \
                     'files', count(*) FILTER (WHERE c.mimetype != $3)) \
-                 FROM {prefix}filecache c WHERE c.parent = k.fileid AND c.storage = $2) AS dir_counts, \
-                (SELECT json_agg(json_build_object( \
+                 FROM {prefix}filecache c WHERE c.parent = k.fileid AND c.storage = $2)  END) AS dir_counts, \
+                (CASE WHEN $6 THEN (SELECT json_agg(json_build_object( \
                     'file_source', s.file_source, 'share_type', s.share_type, \
                     'share_with', s.share_with, 'uid_owner', s.uid_owner, \
                     'uid_initiator', s.uid_initiator, 'note', s.note, 'stime', s.stime)) \
-                 FROM {prefix}share s WHERE s.file_source = k.fileid) AS shares, \
-                (SELECT json_build_object( \
+                 FROM {prefix}share s WHERE s.file_source = k.fileid)  END) AS shares, \
+                (CASE WHEN $7 THEN (SELECT json_build_object( \
                     'n', count(*), \
                     'unread', count(*) FILTER (WHERE c.actor_type = 'users' AND c.actor_id != $4 \
                         AND c.creation_timestamp > COALESCE(m.marker_datetime, '1970-01-01 00:00:00'))) \
                  FROM {prefix}comments c \
                  LEFT JOIN {prefix}comments_read_markers m \
                    ON m.user_id = $4 AND m.object_type = 'files' AND m.object_id = c.object_id \
-                 WHERE c.object_type = 'files' AND c.object_id = k.fileid::text) AS comments, \
-                (SELECT json_agg(json_build_object( \
+                 WHERE c.object_type = 'files' AND c.object_id = k.fileid::text)  END) AS comments, \
+                (CASE WHEN $8 THEN (SELECT json_agg(json_build_object( \
                     'id', t.id, 'name', t.name, 'visibility', t.visibility, \
                     'editable', t.editable, 'color', t.color) \
                     ORDER BY LOWER(t.name)) \
                  FROM {prefix}systemtag t \
                  JOIN {prefix}systemtag_object_mapping m ON m.systemtagid = t.id \
                  WHERE m.objectid = k.fileid::text AND m.objecttype = 'files' \
-                   AND t.visibility = 1) AS system_tags, \
-                (SELECT json_agg(vc.category) \
+                   AND t.visibility = 1)  END) AS system_tags, \
+                (CASE WHEN $9 THEN (SELECT json_agg(vc.category) \
                  FROM {prefix}vcategory_to_object vco \
                  JOIN {prefix}vcategory vc ON vc.id = vco.categoryid \
-                 WHERE vco.objid = k.fileid::text AND vco.type = 'files' \
-                   AND vc.uid = $4 AND vc.type = 'files') AS tags, \
-                (SELECT json_agg(vc.category) \
+                 WHERE vco.objid = k.fileid AND vco.type = 'files' \
+                   AND vc.uid = $4 AND vc.type = 'files')  END) AS tags, \
+                (CASE WHEN $9 THEN (SELECT json_agg(vc.category) \
                  FROM {prefix}vcategory_to_object vco \
                  JOIN {prefix}vcategory vc ON vc.id = vco.categoryid \
-                 WHERE vco.objid = $1::text AND vco.type = 'files' \
-                   AND vc.uid = $4 AND vc.type = 'files') AS dir_tags \
+                 WHERE vco.objid = $1 AND vco.type = 'files' \
+                   AND vc.uid = $4 AND vc.type = 'files')  END) AS dir_tags \
          FROM kids k",
         prefix = prefix,
     )
@@ -1159,6 +1171,11 @@ pub async fn propfind_batch_cte(
             .bind(storage)
             .bind(dir_mime_id)
             .bind(uid)
+            .bind(gates.dir_counts)
+            .bind(gates.shares)
+            .bind(gates.comments)
+            .bind(gates.system_tags)
+            .bind(gates.tags)
             .fetch_all(p)
             .await
         {
