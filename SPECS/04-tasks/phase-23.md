@@ -81,9 +81,16 @@ Full plan: [`SPECS/03-implementation-plan/plan/22-deployment-profile-tuning.md`]
 
 ### 23.8 Bound preview generation (plan P7, `nc-preview`)
 
-- [ ] Bound the generator to 1 concurrent job; run the drainer under `nice`/`ionice` so interactive requests win.
+- [x] Bound the generator to 1 concurrent job; run the drainer under `nice`/`ionice` so interactive requests win.
 
 **Verify:** write-path scenarios unchanged; CPU shares sane under concurrent writes + previews.
+
+Note: the bound already exists — `preview_concurrency_new` (config) sizes the
+generation semaphore (`nc-preview/src/concurrency.rs:65`, held per generation
+in `nc-server/src/preview_gen.rs`), and there is no separate Rust drainer
+process to `nice` (the drainer is PHP's cron `PreviewJob` — an ops concern).
+No code change needed; the deployment doc (23.9) recommends
+`preview_concurrency_new = 1` for this profile.
 
 ## Deployment documentation
 
@@ -107,6 +114,12 @@ Execution history only: what was tried, reverted, and why; root causes and
 verification results not already stated in the task text. Nothing that merely
 restates a task or the code.
 
+- 2026-08-14: **23.8 resolved without code — the bound already existed.** The
+  `preview_concurrency_new` config key sizes the generation semaphore
+  (phase 11.3), held per generation in `preview_gen.rs`; there is no Rust
+  drainer process to run under `nice`/`ionice` (PHP's cron `PreviewJob` is
+  the drainer). Operator-confirmed.  The deployment doc now recommends
+  `preview_concurrency_new = 1` for this profile.
 - 2026-08-14: **23.7 verified + patched — `handle_get` opened the file before
   resolving conditional headers.**  The vendored handler opened at
   `fs.open()` and only then ran `conditional::if_match`, so a 304 request
