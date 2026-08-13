@@ -104,6 +104,12 @@ s-zip = "0.11"
 # File time manipulation (Phase 5.x — chunked upload mtime/ctime)
 filetime = "0.2"
 
+# `posix_fadvise` cache hints (Phase 23.6 — HDD seek overlap + page-cache
+# discipline).  rustix's `fs::fadvise` is unusable from outside rustix (its
+# `Advice` parameter type lives in a private module), so nc-dav carries a
+# contained 10-line shim — see `crates/nc-dav/src/fadvise.rs`.
+libc = "0.2"
+
 # FastCGI client (async, Tokio-native) — used by nc-fastcgi (Phase 7.1)
 # No explicit registry: resolved via crates-io → artifactory-remote replacement.
 fastcgi-client = { version = "0.11", features = ["runtime-tokio"] }

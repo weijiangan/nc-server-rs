@@ -65,7 +65,7 @@ Full plan: [`SPECS/03-implementation-plan/plan/22-deployment-profile-tuning.md`]
 
 ### 23.6 Overlap the seek with the DB work (plan P5, `open()` ~:1700-1712)
 
-- [ ] `posix_fadvise(POSIX_FADV_WILLNEED)` on the file as soon as the path is known — before `load_meta` — so the platter seek overlaps the DB query; `POSIX_FADV_SEQUENTIAL` on GET; `POSIX_FADV_DONTNEED` after streaming a large file.
+- [x] `posix_fadvise(POSIX_FADV_WILLNEED)` on the file as soon as the path is known — before `load_meta` — so the platter seek overlaps the DB query; `POSIX_FADV_SEQUENTIAL` on GET; `POSIX_FADV_DONTNEED` after streaming a large file.
 
 **Verify:** bench p50 on the target; repeat-read cache behavior sanity-checked (a large download does not evict Postgres's page cache).
 
@@ -107,6 +107,18 @@ Execution history only: what was tried, reverted, and why; root causes and
 verification results not already stated in the task text. Nothing that merely
 restates a task or the code.
 
+- 2026-08-14: **23.6 implemented — seek overlap + page-cache discipline.**
+  Read-only `open()` now opens the file, issues `WILLNEED` + `SEQUENTIAL`,
+  and only then runs `load_meta`, so the platter seek overlaps the DB query.
+  `DONTNEED` fires on the last chunk of any ≥32 MiB stream — keyed on
+  `streamed >= meta.size`, because `handle_get` reads exactly `len` bytes and
+  `read` never returns 0 on a completed GET (an EOF hook would never fire).
+  One dependency wrinkle: rustix's `fs::fadvise` is unusable from outside
+  rustix — its `Advice` parameter type lives in a private module (still true
+  on rustix main), so nc-dav carries a 10-line `libc::posix_fadvise` shim and
+  the crate root was relaxed `forbid(unsafe_code)` → `deny(unsafe_code)`,
+  the single documented block in `fadvise.rs` (user-approved).  Bench p50 +
+  repeat-read cache sanity on the target pending.
 - 2026-08-14: **23.2-23.5 implemented (Wave 1).** Pool floor 16 → 4 (2-core
   → 8 backends); bounded runtime (2 workers / 8 blocking threads) with the
   davfile/filesystem blocking helpers on `spawn_blocking` and a shared

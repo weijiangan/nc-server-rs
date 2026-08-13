@@ -31,6 +31,7 @@ use tracing::warn;
 
 use crate::{
     davfile::{NcDavFile, WriteCtx},
+    fadvise::Advice,
     metadata::{NcDirEntry, NcMetaData},
     propagator::Propagator,
     row::{self, dav_to_fc_path, disk_path},
@@ -1920,17 +1921,26 @@ impl DavFileSystem for NcFileSystem {
 
             if options.read && !options.write {
                 // ── Read-only ──────────────────────────────────────────────
-                let meta = self.load_meta(&fc_path).await.ok_or(FsError::NotFound)?;
+                // Task 23.6: the 10 ms HDD seek overlaps the ~0.05 ms DB
+                // query — open + WILLNEED kick the kernel readahead now, and
+                // `load_meta` runs while the platter moves.  SEQUENTIAL
+                // doubles the kernel readahead for the page-by-page GET
+                // stream.  (A DB-missing file still 404s — the open is
+                // dropped harmlessly.)
                 let disk2 = disk.clone();
                 let file = blocking(move || std::fs::File::open(&disk2))
                     .await
                     .map_err(io_to_fs)?;
+                crate::fadvise::hint(&file, Advice::WillNeed);
+                crate::fadvise::hint(&file, Advice::Sequential);
+                let meta = self.load_meta(&fc_path).await.ok_or(FsError::NotFound)?;
                 Ok(Box::new(NcDavFile {
                     file: Some(file),
                     meta,
                     write: None,
                     file_io: self.state.file_io_permits.clone(),
                     read_buf: bytes::BytesMut::new(),
+                    streamed: 0,
                 }) as Box<dyn DavFile>)
             } else {
                 // ── Write ──────────────────────────────────────────────────
@@ -2113,6 +2123,7 @@ impl DavFileSystem for NcFileSystem {
                     write: Some(write_ctx),
                     file_io: self.state.file_io_permits.clone(),
                     read_buf: bytes::BytesMut::new(),
+                    streamed: 0,
                 }) as Box<dyn DavFile>)
             }
         }

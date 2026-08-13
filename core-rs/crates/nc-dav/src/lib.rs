@@ -1,9 +1,13 @@
-#![forbid(unsafe_code)]
+// `deny` (not `forbid`) since phase-23.6: the `posix_fadvise` shim in
+// `fadvise.rs` is the single, documented `unsafe` — everything else must
+// stay unsafe-free (enforced by `deny`).
+#![deny(unsafe_code)]
 
 pub mod archive;
 pub(crate) mod archive_stream;
 pub mod bulk_handler;
 pub mod davfile;
+pub(crate) mod fadvise;
 pub mod filesystem;
 pub mod handler;
 pub mod locksystem;

@@ -1844,6 +1844,7 @@ dependencies = [
  "hex",
  "http 1.4.0",
  "httpdate",
+ "libc",
  "md-5",
  "mime_guess",
  "nc-auth",

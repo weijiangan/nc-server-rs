@@ -23,6 +23,7 @@ use dav_server::fs::{DavFile, DavMetaData, FsError, FsFuture};
 use futures::{future, FutureExt};
 use tokio::task;
 
+use crate::fadvise::Advice;
 use crate::metadata::NcMetaData;
 use crate::propagator::Propagator;
 use nc_db::mime::SharedMimeCache;
@@ -220,6 +221,22 @@ pub struct NcDavFile {
     /// `spare_capacity_mut`/`set_len`, and this crate is
     /// `#![forbid(unsafe_code)]`.
     pub read_buf: BytesMut,
+    /// Bytes streamed so far (task 23.6).  When a streamed file reaches its
+    /// full size, its pages are dropped from the page cache so one big
+    /// download cannot evict Postgres's cache.
+    pub streamed: u64,
+}
+
+/// Files at or above this size are evicted from the page cache once fully
+/// streamed (task 23.6).  Smaller files stay cached — they are cheap and
+/// likely to be re-requested; anything bigger would crowd out the Postgres
+/// working set on the low-RAM target.
+const LARGE_STREAM_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Whether a completed stream of `streamed` bytes of a `size`-byte file
+/// should drop its pages from the page cache.
+fn should_evict(streamed: u64, size: u64) -> bool {
+    size >= LARGE_STREAM_BYTES && streamed >= size
 }
 
 // ─── Blocking helper ──────────────────────────────────────────────────────────
@@ -277,6 +294,17 @@ impl DavFile for NcDavFile {
             self.file = Some(f);
             let n = res.map_err(io_to_fs)?;
             buf.truncate(n);
+            self.streamed += n as u64;
+            // Task 23.6: once a large file has been fully streamed, drop its
+            // pages so the download can't evict Postgres's page cache (on the
+            // low-RAM target that cache is what keeps index reads off the
+            // platter).  Fires on the last chunk — handle_get reads exactly
+            // `len` bytes, so `read` never returns EOF on a completed GET.
+            if should_evict(self.streamed, self.meta.size) {
+                if let Some(f) = &self.file {
+                    crate::fadvise::hint(f, Advice::DontNeed);
+                }
+            }
             let bytes = buf.split().freeze();
             self.read_buf = buf;
             Ok(bytes)
@@ -858,5 +886,23 @@ mod tests {
     fn running_hash_no_header_is_none() {
         let h = RunningHash::from_checksum_header(None);
         assert!(h.finalize_hex().is_none());
+    }
+
+    #[test]
+    fn should_evict_only_fully_streamed_large_files() {
+        // Small file: never evict, even when fully streamed.
+        assert!(!should_evict(1_048_576, 1_048_576));
+        // Large file, not yet fully streamed (mid-download / truncated):
+        // keep the pages — the reader may still need them.
+        assert!(!should_evict(31 * 1024 * 1024, 64 * 1024 * 1024));
+        // Large file, exactly fully streamed: evict.
+        assert!(should_evict(64 * 1024 * 1024, 64 * 1024 * 1024));
+        // Large file, streamed past the recorded size (file shrank on disk
+        // after open — the client already got its bytes): evict.
+        assert!(should_evict(64 * 1024 * 1024 + 4096, 64 * 1024 * 1024));
+        // Boundary: exactly 32 MiB.
+        assert!(should_evict(32 * 1024 * 1024, 32 * 1024 * 1024));
+        // Empty file: never evict (nothing to drop).
+        assert!(!should_evict(0, 0));
     }
 }
