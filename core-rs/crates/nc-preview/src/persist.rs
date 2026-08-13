@@ -303,7 +303,7 @@ pub async fn invalidate_previews(
                     row.height,
                     row.cropped,
                     row.max,
-                    out_mime,
+                    &out_mime,
                 );
                 Some(store::preview_byte_path(
                     datadir, instanceid, file_id, &name,

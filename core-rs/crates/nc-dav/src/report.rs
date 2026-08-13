@@ -161,8 +161,7 @@ pub async fn handle_report(
 
         let mime_type = mime_guard
             .get_name(fc_row.mimetype)
-            .unwrap_or("application/octet-stream")
-            .to_string();
+            .unwrap_or_else(|| std::sync::Arc::from("application/octet-stream"));
 
         let mut meta = NcMetaData::from_row(fc_row, mime_type, None);
         if let Some(ext) = extended_map.get(&fid) {

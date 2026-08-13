@@ -145,7 +145,8 @@ pub(crate) struct PropfindBatchInner {
     pub(crate) child_paths: std::collections::HashSet<String>,
     /// `fc_path` → metadata, keyed trailing-slash-normalized.  Serves
     /// `load_meta` so `get_props` never re-fetches a row `read_dir` holds.
-    pub(crate) meta: HashMap<String, NcMetaData>,
+    /// Arc-shared (task 23.4) — read_dir deep-clones each meta once.
+    pub(crate) meta: HashMap<String, Arc<NcMetaData>>,
     /// fileid → (dir_count, file_count) for `{nc:}contained-*-count`.
     pub(crate) dir_counts: HashMap<i64, (i64, i64)>,
     /// fileid → share rows for `{oc:}share-types` / `{nc:}sharees`.
@@ -1428,7 +1429,7 @@ impl NcFileSystem {
         // so an entry cannot go stale within a request.
         let key = fc_path.trim_end_matches('/');
         if let Some(meta) = { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.meta, key) } {
-            return Some(meta);
+            return Some((*meta).clone());
         }
         let found = row::lookup_by_path_with_ext(
             &self.state.pool,
@@ -1449,19 +1450,19 @@ impl NcFileSystem {
             let cache = self.state.mime_cache.read().expect("mime cache lock");
             cache
                 .get_name(row.mimetype)
-                .unwrap_or("application/octet-stream")
-                .to_string()
+                .unwrap_or_else(|| Arc::from("application/octet-stream"))
         };
 
         let mut meta = NcMetaData::from_row(&row, mime_type, ext.metadata_etag.clone());
         meta.apply_extended(ext.creation_time, ext.upload_time, ext.metadata_etag);
+        let arc = Arc::new(meta);
         self.propfind_batch
             .inner
             .lock()
             .expect("propfind batch lock")
             .meta
-            .insert(key.to_string(), meta.clone());
-        Some(meta)
+            .insert(key.to_string(), arc.clone());
+        Some((*arc).clone())
     }
 }
 
@@ -1675,7 +1676,7 @@ impl DavFileSystem for NcFileSystem {
                 .map(|c| c.fileid)
                 .collect();
             let (metas, entries): (
-                Vec<(String, NcMetaData)>,
+                Vec<(String, Arc<NcMetaData>)>,
                 Vec<Result<Box<dyn DavDirEntry>, FsError>>,
             ) = {
                 let cache = self.state.mime_cache.read().expect("mime cache lock");
@@ -1684,12 +1685,14 @@ impl DavFileSystem for NcFileSystem {
                 for child in &children {
                     let mime = cache
                         .get_name(child.mimetype)
-                        .unwrap_or("application/octet-stream")
-                        .to_string();
-                    let mut meta = NcMetaData::from_row(child, mime, None);
-                    // Apply extended times from the batch map.
+                        .unwrap_or_else(|| Arc::from("application/octet-stream"));
+                    // One deep clone per child (task 23.4); metas, the batch
+                    // map and the entries share the Arc.
+                    let mut meta = Arc::new(NcMetaData::from_row(child, mime, None));
+                    // Apply extended times from the batch map (make_mut is
+                    // free here — the Arc is not yet shared).
                     if let Some(ext) = extended_map.get(&child.fileid) {
-                        meta.apply_extended(
+                        Arc::make_mut(&mut meta).apply_extended(
                             ext.creation_time,
                             ext.upload_time,
                             ext.metadata_etag.clone(),
@@ -1997,8 +2000,7 @@ impl DavFileSystem for NcFileSystem {
                             let cache = self.state.mime_cache.read().expect("mime cache lock");
                             cache
                                 .get_name(row.mimetype)
-                                .unwrap_or("application/octet-stream")
-                                .to_string()
+                                .unwrap_or_else(|| Arc::from("application/octet-stream"))
                         };
                         NcMetaData::from_row(row, mime_type, None)
                     }
@@ -2007,7 +2009,7 @@ impl DavFileSystem for NcFileSystem {
                         size: 0,
                         mtime: 0,
                         is_dir_flag: false,
-                        mime_type: mime_str.clone(),
+                        mime_type: Arc::from(mime_str.clone()),
                         etag: None,
                         permissions: 27,
                         creation_time: 0,

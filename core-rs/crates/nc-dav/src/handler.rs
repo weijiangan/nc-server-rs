@@ -404,7 +404,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
                 let cache = state.mime_cache.read().expect("mime cache lock");
                 cache
                     .get_name(fc_row.mimetype)
-                    .map_or(false, |m| m == "httpd/unix-directory")
+                    .map_or(false, |m| m.as_ref() == "httpd/unix-directory")
             };
             if is_dir {
                 let mut resp = http::Response::builder()
@@ -813,8 +813,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
                 let cache = mime_cache_ref.read().expect("mime cache lock");
                 cache
                     .get_name(fc_row.mimetype)
-                    .unwrap_or("application/octet-stream")
-                    .to_string()
+                    .unwrap_or_else(|| std::sync::Arc::from("application/octet-stream"))
             };
             if let Ok(v) = HeaderValue::from_str(&mime_str) {
                 parts.headers.insert(http::header::CONTENT_TYPE, v);
@@ -827,7 +826,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
             // Only applied to files (not directories).  Only set when no
             // Content-Disposition header was already present (dav-server does
             // not set one, so this is always a fresh insert in practice).
-            if mime_str != "httpd/unix-directory" {
+            if mime_str.as_ref() != "httpd/unix-directory" {
                 let file_name = fc_path
                     .rsplit('/')
                     .next()

@@ -1,6 +1,7 @@
 //! `NcMetaData` and `NcDirEntry` — the `DavMetaData` / `DavDirEntry` impls
 //! backed by rows from `oc_filecache`.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dav_server::fs::{DavDirEntry, DavMetaData, FsFuture, FsResult};
@@ -19,7 +20,9 @@ pub struct NcMetaData {
     /// Unix timestamp (seconds since epoch) of the last modification.
     pub mtime: i64,
     pub is_dir_flag: bool,
-    pub mime_type: String,
+    /// Arc-shared mime string (task 23.4) — one allocation per distinct mime
+    /// across a listing's children instead of one to_string per child.
+    pub mime_type: Arc<str>,
     pub etag: Option<String>,
     pub permissions: i32,
     /// Creation time (from `oc_filecache_extended` when available).
@@ -42,8 +45,8 @@ pub struct NcMetaData {
 impl NcMetaData {
     /// Build `NcMetaData` from a filecache row, resolved MIME type string, and
     /// optional extended metadata.
-    pub fn from_row(row: &FileCacheRow, mime_type: String, metadata_etag: Option<String>) -> Self {
-        let is_dir = mime_type == "httpd/unix-directory";
+    pub fn from_row(row: &FileCacheRow, mime_type: Arc<str>, metadata_etag: Option<String>) -> Self {
+        let is_dir = mime_type.as_ref() == "httpd/unix-directory";
         NcMetaData {
             fileid: row.fileid,
             size: row.size.max(0) as u64,
@@ -127,7 +130,9 @@ impl DavMetaData for NcMetaData {
 /// so `DavDirEntry::metadata()` returns immediately without a second query.
 #[derive(Debug, Clone)]
 pub struct NcDirEntry {
-    pub meta: NcMetaData,
+    /// Arc-shared with the batch map (task 23.4) — the deep clone happens
+    /// once in read_dir; metadata() clones on demand.
+    pub meta: Arc<NcMetaData>,
 }
 
 impl DavDirEntry for NcDirEntry {
@@ -136,7 +141,7 @@ impl DavDirEntry for NcDirEntry {
     }
 
     fn metadata(&'_ self) -> FsFuture<'_, Box<dyn DavMetaData>> {
-        let meta: Box<dyn DavMetaData> = Box::new(self.meta.clone());
+        let meta: Box<dyn DavMetaData> = Box::new((*self.meta).clone());
         Box::pin(future::ok(meta))
     }
 

@@ -14,8 +14,9 @@ use crate::pool::DbPool;
 pub struct MimeCache {
     /// mimetype string → numeric id
     by_name: HashMap<String, i64>,
-    /// numeric id → mimetype string
-    by_id: HashMap<i64, String>,
+    /// numeric id → mimetype string (Arc-shared so per-child PROPFIND
+    /// metadata builds share one allocation — task 23.4).
+    by_id: HashMap<i64, Arc<str>>,
 }
 
 pub type SharedMimeCache = Arc<RwLock<MimeCache>>;
@@ -25,8 +26,8 @@ impl MimeCache {
         self.by_name.get(mime).copied()
     }
 
-    pub fn get_name(&self, id: i64) -> Option<&str> {
-        self.by_id.get(&id).map(String::as_str)
+    pub fn get_name(&self, id: i64) -> Option<Arc<str>> {
+        self.by_id.get(&id).cloned()
     }
 
     /// Insert a mimetype → ID mapping into the in‑memory cache.
@@ -35,7 +36,7 @@ impl MimeCache {
     /// the cache without a DB round‑trip.
     pub(crate) fn insert(&mut self, id: i64, mime: String) {
         self.by_name.insert(mime.clone(), id);
-        self.by_id.insert(id, mime);
+        self.by_id.insert(id, Arc::from(mime));
     }
 }
 
@@ -127,7 +128,7 @@ pub async fn load_mime_cache(pool: &DbPool, table_prefix: &str) -> anyhow::Resul
     let mut cache = MimeCache::default();
     for (id, mime) in rows {
         cache.by_name.insert(mime.clone(), id);
-        cache.by_id.insert(id, mime);
+        cache.by_id.insert(id, Arc::from(mime));
     }
 
     tracing::info!(count = cache.by_name.len(), "Mime-type cache loaded");
@@ -164,7 +165,7 @@ mod tests {
         let mut c = MimeCache::default();
         for (id, mime) in pairs {
             c.by_name.insert(mime.to_string(), *id);
-            c.by_id.insert(*id, mime.to_string());
+            c.by_id.insert(*id, Arc::from(*mime));
         }
         Arc::new(RwLock::new(c))
     }
@@ -185,7 +186,7 @@ mod tests {
     fn lookup_by_id() {
         let cache = make_cache(&[(1, "application/octet-stream"), (2, "image/jpeg")]);
         let guard = cache.read().unwrap();
-        assert_eq!(guard.get_name(1), Some("application/octet-stream"));
+        assert_eq!(guard.get_name(1).as_deref(), Some("application/octet-stream"));
         assert_eq!(guard.get_name(99), None);
     }
 

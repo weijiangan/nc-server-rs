@@ -10,6 +10,7 @@
 //! - `apps/files_versions/lib/Listener/FileEventsListener.php` (rename/copy hooks)
 
 use std::path::Path;
+use std::sync::Arc;
 
 use nc_db::mime::SharedMimeCache;
 use nc_db::pool::DbPool;
@@ -59,7 +60,7 @@ pub async fn store_version(
     // Check if the old file is a directory.
     {
         let cache = mime_cache.read().expect("mime cache lock");
-        if cache.get_name(old_mimetype) == Some("httpd/unix-directory") {
+        if cache.get_name(old_mimetype).as_deref() == Some("httpd/unix-directory") {
             return;
         }
         // Guard dropped here — safe since we return early or continue without holding it.
@@ -480,9 +481,10 @@ async fn insert_version_row(
     let mimepart_id = {
         let part_str = {
             let cache = mime_cache.read().expect("mime cache lock");
-            let mime_str = cache
+            let mime_arc = cache
                 .get_name(mimetype)
-                .unwrap_or("application/octet-stream");
+                .unwrap_or_else(|| Arc::from("application/octet-stream"));
+            let mime_str = mime_arc.as_ref();
             mime_str
                 .split('/')
                 .next()

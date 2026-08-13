@@ -51,7 +51,7 @@ Full plan: [`SPECS/03-implementation-plan/plan/22-deployment-profile-tuning.md`]
 
 ### 23.4 `read_dir` allocations (plan P2, `nc-dav/src/filesystem.rs:~1460-1510`)
 
-- [ ] `Arc<NcMetaData>` in the batch map; `Arc<str>` for mime names and paths; kill the per-child triple clone (mime `to_string` included). `NcDirEntry` keeps the owned meta.
+- [x] `Arc<NcMetaData>` in the batch map; `Arc<str>` for mime names and paths; kill the per-child triple clone (mime `to_string` included). `NcDirEntry` keeps the owned meta.
 
 **Verify:** unit tests; diff-test byte parity; bench flat-or-better.
 
