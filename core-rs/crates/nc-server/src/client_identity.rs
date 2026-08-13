@@ -14,7 +14,7 @@
 //! PHP as `REMOTE_ADDR`; PHP runs the identical algorithm under the same
 //! config and converges (the chained-proxy coherence argument).
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 use axum::http::{HeaderMap, Response, StatusCode};
 use nc_db::config::NcConfig;
@@ -306,23 +306,6 @@ pub fn is_trusted_domain(cfg: &NcConfig, domain_with_port: &str) -> bool {
     false
 }
 
-/// `Request::getServerHost` — the host used for URL generation: overwritehost
-/// → insecure host if trusted → the first trusted domain.
-pub fn server_host_for_url(peer: IpAddr, headers: &HeaderMap, cfg: &NcConfig) -> String {
-    if let Some(host) = get_overwrite_host(peer, cfg) {
-        return host;
-    }
-    let host = insecure_server_host(peer, headers, cfg);
-    if is_trusted_domain(cfg, &host) {
-        return host;
-    }
-    cfg.trusted_domains
-        .as_deref()
-        .and_then(|list| list.first())
-        .cloned()
-        .unwrap_or(host)
-}
-
 /// `lib/base.php:872-912` — trusted-domain enforcement, run once per request
 /// after identity resolution (assets served by `try_static_files` bypass it,
 /// matching the webserver-vs-PHP split of the canonical stack).
@@ -604,17 +587,6 @@ mod tests {
         c.installed = false;
         let h = headers(&[("host", "evil.example.com")]);
         assert!(trusted_domains_response(&c, PEER, &h, "/index.php", "").is_none());
-    }
-
-    #[test]
-    fn url_generation_uses_first_trusted_domain_fallback() {
-        let mut c = cfg(&["10.0.0.1"]);
-        c.trusted_domains = Some(vec![
-            "localhost".to_string(),
-            "nextcloud.example.com".to_string(),
-        ]);
-        let h = headers(&[("x-forwarded-host", "evil.example.com")]);
-        assert_eq!(server_host_for_url(PEER, &h, &c), "localhost");
     }
 
     #[test]

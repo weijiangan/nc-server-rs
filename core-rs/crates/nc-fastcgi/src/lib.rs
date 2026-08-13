@@ -651,23 +651,6 @@ pub(crate) fn derive_script_info(uri_path: &str) -> (&str, &str) {
     }
 }
 
-/// Split a `Host` header value into `(server_name, server_port)`.
-///
-/// `host:port` → `("host", port)`.  Bare hostname → `("host", 80)`.
-fn split_host_port(host: &str) -> (&str, u16) {
-    match host.rsplit_once(':') {
-        Some((name, port_str)) => {
-            if let Ok(port) = port_str.parse::<u16>() {
-                (name, port)
-            } else {
-                // Trailing colon segment isn't a port (e.g. IPv6 without brackets).
-                (host, 80)
-            }
-        }
-        None => (host, 80),
-    }
-}
-
 /// Extract a header value as an owned `String`, returning `""` if absent.
 fn header_str(headers: &axum::http::HeaderMap, name: axum::http::HeaderName) -> String {
     headers
