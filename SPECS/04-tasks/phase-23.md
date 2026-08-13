@@ -39,7 +39,7 @@ Full plan: [`SPECS/03-implementation-plan/plan/22-deployment-profile-tuning.md`]
 
 ### 23.2 Pool floor (plan P1, `nc-db/src/pool.rs:148-149`)
 
-- [ ] Lower the `max_connections` clamp floor so 2 physical cores → 8 (or make the ceiling configurable); `min_connections(5)` stays.
+- [x] Lower the `max_connections` clamp floor so 2 physical cores → 8 (or make the ceiling configurable); `min_connections(5)` stays.
 
 **Verify:** perf-gate + diff-test unchanged (no statement-count change); the pool reports 4-8 backends on the target.
 

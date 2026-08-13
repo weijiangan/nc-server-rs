@@ -144,9 +144,13 @@ pub async fn build_pool(config: &NcConfig) -> anyhow::Result<DbPool> {
     // plus concurrent traffic never queues on the pool, capped at 64 so big
     // hosts don't thrash Postgres backends.  A Rust server actually
     // saturates its DB — 50 fixed backends was arbitrary.
-    // 2-core prod → 16; 6-core dev → 24; 16-core → 64.
+    // 2-core → 8; 4-core → 16; 6-core → 24; 16-core → 64.  The floor was
+    // lowered from 16 (task 23.2): on a 2-core box 16 backends are
+    // ~5-10 MB RSS each contending for the same CPU — ~4-8 lets the pool
+    // queue instead of thrashing (the depth-0 join's ~9 concurrent queries
+    // queue briefly; that is the point).
     let cores = physical_cores() as u32;
-    let max = (cores * 4).clamp(16, 64);
+    let max = (cores * 4).clamp(4, 64);
 
     // No ping on acquire: with ~9 sequential fetch_*(pool) calls per
     // PROPFIND that is ~9 pure-overhead RTTs (sqlx pings every idle
