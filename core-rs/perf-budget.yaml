@@ -33,11 +33,19 @@ classes:
     method: PROPFIND
     path: /remote.php/webdav/
     depth: 1
-    budget: 12
+    # 13 = depth-0's 11 + the CTE + the custom-props batch.  The previous 12
+    # was measured on the T8.1 desync-buggy binary (2026-08-14 milestone): a
+    # depth-1 request killed by the accounts-fallback panic produced truncated
+    # execute counts, and the gate's probe does not validate the status.  The
+    # fixed binary executes the full set — [13,13,13] steady across windows.
+    budget: 13
   - name: put_new
     method: PUT
     path: /remote.php/webdav/q-budget-<ts>.txt
     unique_path: true
     budget: 15
 
-scaling_delta_budget: 1
+# depth-1's extra cost over depth-0 = the CTE + the custom-props batch = 2.
+# (Same buggy-binary provenance as propfind_depth1's 13 above; the previous 1
+# was a truncated-count artifact.)
+scaling_delta_budget: 2

@@ -114,6 +114,7 @@ Execution history only: what was tried, reverted, and why; root causes and
 verification results not already stated in the task text. Nothing that merely
 restates a task or the code.
 
+- 2026-08-14: **Milestone gate: propfind_depth1 budget corrected 12 → 13 (delta 1 → 2).** The perf-gate re-run on the fixed binary breached the 22.2-C budget with a steady [13,13,13] across two independent runs — and the 13th statement is real, not a regression: zero PROPFIND-path code changed between the T8.1 fix (ea1dcd5) and HEAD (verified by git diff), and the depth-1 set is exactly depth-0's 11 + CTE + custom-props batch. The 12 budget was set during the 2026-08-14 milestone on the T8.1 desync-buggy binary — a depth-1 request killed by the accounts-fallback panic produced truncated execute counts, and the gate's probe does not validate the response status (budget.rs). Corrected in perf-budget.yaml per the no-headroom policy; gate green.
 - 2026-08-14: **23.8 resolved without code — the bound already existed.** The
   `preview_concurrency_new` config key sizes the generation semaphore
   (phase 11.3), held per generation in `preview_gen.rs`; there is no Rust
