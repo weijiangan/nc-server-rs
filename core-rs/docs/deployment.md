@@ -163,6 +163,92 @@ sufficient; keep the nginx rules only if other vhosts share the webroot.
 
 ---
 
+## Target-profile tuning (2-core, HDD, localhost Postgres)
+
+Tuning for the deployment this build is designed around: 2 physical cores,
+an HDD data disk, and Postgres on the same box.  Every value below is
+measured against that profile; do not transplant SSD-era settings into it.
+
+### PostgreSQL (`postgresql.conf`)
+
+```ini
+# HDD-correct planner cost — random page access is ~4x the sequential cost
+# on a platter.  This is the single most important line for this profile;
+# keep SSD configurations (random_page_cost = 1.1) out of shared configs.
+random_page_cost = 4.0
+
+# Size to real RAM, not the box's name.  This is what the planner believes
+# is available for index scans + the query working set.
+effective_cache_size = 4GB        # 50-70% of physical RAM
+
+# Modest: on low-RAM the OS page cache does the real work (see the page-cache
+# discipline note below) — Postgres only needs to buffer what it actively
+# writes and re-reads.  128MB is a sane floor, 512MB the ceiling here.
+shared_buffers = 256MB
+
+# Group commit: batches concurrent commits into one fsync.  Safe on HDD
+# (unlike synchronous_commit = off, which trades durability for speed).
+commit_delay = 100000             # 0.1 ms, nanoseconds
+commit_siblings = 5
+
+# Autovacuum must not compete with interactive requests on 2 cores: throttle
+# its cost and keep it off the busiest hours is not enough — cap the workers.
+autovacuum_max_workers = 3
+autovacuum_vacuum_cost_delay = 50ms
+autovacuum_vacuum_cost_limit = 400
+
+# Aligned with the nc-server pool floor (see below): 8 backends on a 2-core
+# box, not the 100-connection default — each backend is a process competing
+# for the same cores and the same platter.
+max_connections = 40
+```
+
+### nc-server (`config.php`)
+
+```php
+// The connection pool clamps to 4-8 backends on a 2-core box (floor 4,
+// ceiling 8).  Nothing to configure — just don't raise PG's
+// max_connections to match the old 100-backend expectations.
+//
+// Preview generation is CPU- and read-heavy; on 2 cores it must not starve
+// request handling.  The generator is semaphore-gated; cap it at 1 job
+// (the default is hardware concurrency = 2 here).
+'preview_concurrency_new' => 1,
+```
+
+### Page-cache discipline
+
+This profile runs on RAM where a single large download can evict
+Postgres's working set — the very cache that keeps index reads off the
+platter.  nc-server drops the pages of any file ≥32 MiB once it has been
+fully streamed (`posix_fadvise(DONTNEED)`), and issues `WILLNEED` +
+`SEQUENTIAL` when a GET opens a file so the platter seek overlaps the
+metadata query.  The rules to respect:
+
+- Give the OS page cache room: do **not** let `shared_buffers` +
+  `effective_cache_size` exceed ~70% of RAM, and do not run other
+  page-cache-hungry services (build agents, bulk transfers) on the same box.
+- Do not drop caches in a cron job; the kernel's own eviction under
+  `random_page_cost = 4.0` is the discipline the tunings assume.
+
+### Compression
+
+Probed on the current server: nc-server sends no `Content-Encoding` today
+(no middleware compression; the only deflate is inside ZIP folder-download
+archives, unchanged).  PHP's own HTML/JS routes gzip only if the reverse
+proxy is configured to.
+
+- **LAN-local clients: no compression.**  Gzip buys nothing at 1 Gbit
+  loopback/lan speeds on a CPU-starved box — it would cost more than it
+  saves.
+- **Remote clients:** enable compression on the reverse proxy for
+  HTML/JS/CSS only — never on DAV GET streams (user files are already
+  large/compressed; on-the-fly compression of a video file wastes the same
+  2 cores).  Use **zstd level 1** (or gzip level 1 — not 6): the goal is
+  cheap text savings, not maximal ratio.
+
+---
+
 ## PHP-FPM configuration
 
 ### Unix socket (hard requirement)

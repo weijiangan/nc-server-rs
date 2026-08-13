@@ -96,9 +96,9 @@ No code change needed; the deployment doc (23.9) recommends
 
 ### 23.9 Deployment doc (plans P8, P9 + the pipelining record)
 
-- [ ] Postgres tunables section: `random_page_cost = 4.0` (HDD-correct — keep SSD configs out), `effective_cache_size` to real RAM, modest `shared_buffers`, `commit_delay`/`commit_siblings` group commit, autovacuum cost throttling, `max_connections` aligned with 23.2.
-- [ ] Compression decision: probe what the server compresses today; skip for LAN-local clients; zstd level 1 (or gzip level 1 — not 6) if remote.
-- [ ] One phase-22 Changes line: pipelining is definitively dead for this profile — it optimizes the abundant resource (round trips), alongside the supersession argument.
+- [x] Postgres tunables section: `random_page_cost = 4.0` (HDD-correct — keep SSD configs out), `effective_cache_size` to real RAM, modest `shared_buffers`, `commit_delay`/`commit_siblings` group commit, autovacuum cost throttling, `max_connections` aligned with 23.2.
+- [x] Compression decision: probe what the server compresses today; skip for LAN-local clients; zstd level 1 (or gzip level 1 — not 6) if remote.
+- [x] One phase-22 Changes line: pipelining is definitively dead for this profile — it optimizes the abundant resource (round trips), alongside the supersession argument.
 
 **Verify:** the doc sections; the phase-22 entry.
 
@@ -120,6 +120,16 @@ restates a task or the code.
   drainer process to run under `nice`/`ionice` (PHP's cron `PreviewJob` is
   the drainer). Operator-confirmed.  The deployment doc now recommends
   `preview_concurrency_new = 1` for this profile.
+- 2026-08-14: **23.9 done — deployment doc section + phase-22 record.** New
+  "Target-profile tuning" section in `core-rs/docs/deployment.md`: PG
+  tunables (random_page_cost 4.0, effective_cache_size to real RAM, modest
+  shared_buffers, commit_delay/siblings group commit, autovacuum throttling,
+  max_connections 40 — aligned with the 23.2 pool clamp `(cores*4).clamp(4,64)`,
+  verified in `pool.rs`), the page-cache discipline rules that the 23.6
+  fadvise hints assume, and the compression decision (probed: nc-server sends
+  no Content-Encoding today — no middleware compression; skip for LAN, zstd
+  level 1 / gzip level 1 on the reverse proxy for HTML/JS only if remote).
+  One phase-22 Changes line records the pipelining verdict for this profile.
 - 2026-08-14: **23.7 verified + patched — `handle_get` opened the file before
   resolving conditional headers.**  The vendored handler opened at
   `fs.open()` and only then ran `conditional::if_match`, so a 304 request
