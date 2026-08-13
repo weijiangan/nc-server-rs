@@ -57,7 +57,7 @@ Full plan: [`SPECS/03-implementation-plan/plan/22-deployment-profile-tuning.md`]
 
 ### 23.5 GET streaming buffer (plan P3, `nc-dav/src/davfile.rs:251`)
 
-- [ ] A reusable buffer on `NcDavFile` (`BytesMut` with uninit capacity), reading into it; batch chunks per `spawn_blocking` hop.
+- [x] A reusable buffer on `NcDavFile` (`BytesMut` with uninit capacity), reading into it; batch chunks per `spawn_blocking` hop.
 
 **Verify:** GET/read scenarios byte-identical; buffer memory bounded across chunks.
 
@@ -107,6 +107,17 @@ Execution history only: what was tried, reverted, and why; root causes and
 verification results not already stated in the task text. Nothing that merely
 restates a task or the code.
 
+- 2026-08-14: **23.2-23.5 implemented (Wave 1).** Pool floor 16 → 4 (2-core
+  → 8 backends); bounded runtime (2 workers / 8 blocking threads) with the
+  davfile/filesystem blocking helpers on `spawn_blocking` and a shared
+  4-permit file-I/O semaphore; read_dir allocations collapsed to one
+  `Arc<NcMetaData>` per child with `Arc<str>` mime strings from the cache;
+  the GET read buffer is a reused `BytesMut` (capacity persists across
+  chunks — the zero-fill stays, `forbid(unsafe_code)`). One 23.3-introduced
+  bug fixed en route: a duplicated `file.take()` in `read_bytes` that would
+  have failed every read (no unit test covered it). Verified: 546 lib tests
+  green; `cargo test --lib`; the profile gates (bench-load on the target,
+  diff-test) pending the milestone run.
 - 2026-08-14: **23.1 measured — decision B (keep the CTE).** The 200-child
   allprop A/B on the fixed binary: CTE 126.2 ms/req combined CPU
   (nc-server 123.1 + postgres 3.10) vs batch families 119.9

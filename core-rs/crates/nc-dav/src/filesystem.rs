@@ -1930,6 +1930,7 @@ impl DavFileSystem for NcFileSystem {
                     meta,
                     write: None,
                     file_io: self.state.file_io_permits.clone(),
+                    read_buf: bytes::BytesMut::new(),
                 }) as Box<dyn DavFile>)
             } else {
                 // ── Write ──────────────────────────────────────────────────
@@ -2111,6 +2112,7 @@ impl DavFileSystem for NcFileSystem {
                     meta,
                     write: Some(write_ctx),
                     file_io: self.state.file_io_permits.clone(),
+                    read_buf: bytes::BytesMut::new(),
                 }) as Box<dyn DavFile>)
             }
         }

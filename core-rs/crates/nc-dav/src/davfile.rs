@@ -18,7 +18,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use dav_server::fs::{DavFile, DavMetaData, FsError, FsFuture};
 use futures::{future, FutureExt};
 use tokio::task;
@@ -214,6 +214,12 @@ pub struct NcDavFile {
     /// every blocking file op so HDD queue depth stays sane under concurrent
     /// clients.
     pub file_io: Arc<tokio::sync::Semaphore>,
+    /// Reusable read buffer (task 23.5): the per-chunk `vec![0u8; count]`
+    /// allocation is avoided by reusing the capacity across `read_bytes`
+    /// calls.  The zero-fill on `resize` stays — eliminating it would need
+    /// `spare_capacity_mut`/`set_len`, and this crate is
+    /// `#![forbid(unsafe_code)]`.
+    pub read_buf: BytesMut,
 }
 
 // ─── Blocking helper ──────────────────────────────────────────────────────────
@@ -259,18 +265,21 @@ impl DavFile for NcDavFile {
                 .await
                 .map_err(|_| FsError::GeneralFailure)?;
             let mut file = self.file.take().ok_or(FsError::GeneralFailure)?;
-            let mut file = self.file.take().ok_or(FsError::GeneralFailure)?;
-            let (res, f) = blocking(move || {
-                let mut buf = vec![0u8; count];
-                let r = file.read(&mut buf).map(|n| {
-                    buf.truncate(n);
-                    Bytes::from(buf)
-                });
-                (r, file)
+            // Take the buffer out (spawn_blocking needs owned values) and
+            // return it afterwards; the capacity persists across chunks.
+            let mut buf = std::mem::take(&mut self.read_buf);
+            buf.resize(count, 0);
+            let (res, mut buf, f) = blocking(move || {
+                let r = file.read(&mut buf);
+                (r, buf, file)
             })
             .await;
             self.file = Some(f);
-            res.map_err(io_to_fs)
+            let n = res.map_err(io_to_fs)?;
+            buf.truncate(n);
+            let bytes = buf.split().freeze();
+            self.read_buf = buf;
+            Ok(bytes)
         }
         .boxed()
     }
