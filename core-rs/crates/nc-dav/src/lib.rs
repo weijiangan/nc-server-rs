@@ -72,6 +72,10 @@ pub type SharedPutError = Arc<std::sync::Mutex<Option<PutErrorKind>>>;
 #[derive(Clone)]
 pub struct NcDavState {
     pub pool: DbPool,
+    /// Shared cap on concurrent disk file I/O (task 23.3): on HDD,
+    /// unbounded concurrent seeks destroy elevator/NCQ ordering — the DAV
+    /// file ops acquire a permit before touching the platter.
+    pub file_io_permits: Arc<tokio::sync::Semaphore>,
     pub mime_cache: SharedMimeCache,
     /// App config cache — used for `{oc:}data-fingerprint` and future config reads.
     pub appconfig_cache: SharedAppConfigCache,

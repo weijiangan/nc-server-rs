@@ -16,6 +16,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
 use dav_server::fs::{DavFile, DavMetaData, FsError, FsFuture};
@@ -209,6 +210,10 @@ pub struct NcDavFile {
     pub meta: NcMetaData,
     /// Non-`None` only while in write mode.
     pub write: Option<WriteCtx>,
+    /// Shared cap on concurrent disk I/O (task 23.3): acquired around
+    /// every blocking file op so HDD queue depth stays sane under concurrent
+    /// clients.
+    pub file_io: Arc<tokio::sync::Semaphore>,
 }
 
 // ─── Blocking helper ──────────────────────────────────────────────────────────
@@ -218,10 +223,11 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    match tokio::runtime::Handle::current().runtime_flavor() {
-        tokio::runtime::RuntimeFlavor::MultiThread => task::block_in_place(func),
-        _ => task::spawn_blocking(func).await.unwrap(),
-    }
+    // Always the blocking pool (task 23.3): `block_in_place` would
+    // freeze one of the 2 runtime workers for the duration of the disk op.
+    // All closures are 'static-safe (the file handle is taken out and moved
+    // in, then returned).
+    task::spawn_blocking(func).await.unwrap()
 }
 
 fn io_to_fs(e: io::Error) -> FsError {
@@ -246,6 +252,13 @@ impl DavFile for NcDavFile {
 
     fn read_bytes(&'_ mut self, count: usize) -> FsFuture<'_, Bytes> {
         async move {
+            let _permit = self
+                .file_io
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| FsError::GeneralFailure)?;
+            let mut file = self.file.take().ok_or(FsError::GeneralFailure)?;
             let mut file = self.file.take().ok_or(FsError::GeneralFailure)?;
             let (res, f) = blocking(move || {
                 let mut buf = vec![0u8; count];
@@ -284,6 +297,12 @@ impl DavFile for NcDavFile {
             if let Some(ref mut ctx) = self.write {
                 ctx.running_hash.update(&buf);
             }
+            let _permit = self
+                .file_io
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| FsError::GeneralFailure)?;
             let mut file = self.file.take().ok_or(FsError::GeneralFailure)?;
             let (res, f) = blocking(move || {
                 let r = file.write_all(&buf);
@@ -310,6 +329,12 @@ impl DavFile for NcDavFile {
             if let Some(ref mut ctx) = self.write {
                 ctx.running_hash.update(&data);
             }
+            let _permit = self
+                .file_io
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| FsError::GeneralFailure)?;
             let mut file = self.file.take().ok_or(FsError::GeneralFailure)?;
             let (res, f) = blocking(move || {
                 let r = file.write_all(&data);
@@ -326,6 +351,12 @@ impl DavFile for NcDavFile {
 
     fn flush(&'_ mut self) -> FsFuture<'_, ()> {
         async move {
+            let _permit = self
+                .file_io
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| FsError::GeneralFailure)?;
             let file = self.file.take().ok_or(FsError::GeneralFailure)?;
 
             let mut ctx = match self.write.take() {

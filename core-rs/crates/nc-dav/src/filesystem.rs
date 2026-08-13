@@ -1472,10 +1472,8 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    match tokio::runtime::Handle::current().runtime_flavor() {
-        tokio::runtime::RuntimeFlavor::MultiThread => task::block_in_place(func),
-        _ => task::spawn_blocking(func).await.unwrap(),
-    }
+    // Always the blocking pool (task 23.3) — see davfile.rs.
+    task::spawn_blocking(func).await.unwrap()
 }
 
 fn io_to_fs(e: io::Error) -> FsError {
@@ -1928,6 +1926,7 @@ impl DavFileSystem for NcFileSystem {
                     file: Some(file),
                     meta,
                     write: None,
+                    file_io: self.state.file_io_permits.clone(),
                 }) as Box<dyn DavFile>)
             } else {
                 // ── Write ──────────────────────────────────────────────────
@@ -2109,6 +2108,7 @@ impl DavFileSystem for NcFileSystem {
                     file: Some(file),
                     meta,
                     write: Some(write_ctx),
+                    file_io: self.state.file_io_permits.clone(),
                 }) as Box<dyn DavFile>)
             }
         }
@@ -4717,6 +4717,7 @@ mod tests {
         let cfg = NcConfig::from_php_config("<?php\n$CONFIG = ['dbtype' => 'sqlite3'];").unwrap();
         let state = crate::NcDavState {
             pool,
+            file_io_permits: Arc::new(tokio::sync::Semaphore::new(4)),
             mime_cache: Arc::new(RwLock::new(MimeCache::default())),
             appconfig_cache: Arc::new(RwLock::new(AppConfigCache::default())),
             table_prefix: prefix,

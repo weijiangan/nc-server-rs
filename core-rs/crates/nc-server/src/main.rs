@@ -28,8 +28,21 @@ struct Args {
     listen: String,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+// task 23.3: bounded runtime — 2 workers (the target box's cores) and
+// a small blocking pool.  `block_in_place`-style file I/O would freeze the
+// workers; the davfile blocking helpers now use `spawn_blocking`, and the
+// shared file-I/O semaphore (state.file_io_permits) caps actual disk queue
+// depth under concurrent clients (HDD elevator/NCQ ordering).
+fn main() -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(8)
+        .enable_all()
+        .build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // ── Tracing ──────────────────────────────────────────────────────────────
     tracing_subscriber::fmt()
         .with_env_filter(

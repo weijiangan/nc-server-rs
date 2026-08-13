@@ -106,6 +106,9 @@ impl FromRef<AppState> for nc_dav::NcDavState {
 
         nc_dav::NcDavState {
             pool: state.pool.clone(),
+            // 4 permits — the cap for concurrent file I/O on rotational
+            // media (task 23.3).
+            file_io_permits: Arc::new(tokio::sync::Semaphore::new(4)),
             mime_cache: state.mime_cache.clone(),
             appconfig_cache: state.appconfig_cache.clone(),
             table_prefix: state.table_prefix.clone(),

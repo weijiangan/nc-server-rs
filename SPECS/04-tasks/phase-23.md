@@ -45,7 +45,7 @@ Full plan: [`SPECS/03-implementation-plan/plan/22-deployment-profile-tuning.md`]
 
 ### 23.3 Bound concurrent disk I/O (plan P4, `nc-server/src/main.rs:31`)
 
-- [ ] Replace `#[tokio::main]` with `Builder::new_multi_thread().worker_threads(2).max_blocking_threads(8)`; add a `Semaphore` (permits ≈ 2-4) around actual file I/O so queue depth stays sane under concurrent clients.
+- [x] Replace `#[tokio::main]` with `Builder::new_multi_thread().worker_threads(2).max_blocking_threads(8)`; add a `Semaphore` (permits ≈ 2-4) around actual file I/O so queue depth stays sane under concurrent clients.
 
 **Verify:** `make bench-load` on the target — throughput up, p99 down.
 
