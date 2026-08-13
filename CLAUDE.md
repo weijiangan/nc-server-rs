@@ -40,17 +40,28 @@
 **Applies to every document:**
 
 - **The gate is the definition of done — never a result.** A change is done only when its gate passes; reporting "green", "unchanged counts", or "no regression" states the bar, not the outcome. Report what changed: numbers, deltas, findings.
-- **One commit per doc change — amend, don't pile.** When a doc edit needs revising, fold it into the original commit instead of stacking a new one.
 - **Each document owns one thing.** Benchmarks = measurements; task docs = execution history; specs = PHP behavior. Don't copy another document's content into yours.
+- **Use the edit tools for ordinary edits**; scripts only for bulk mechanical transformations.
+
+**Commit discipline:**
+
+- **One commit per task or bug fix.** Never sweep unrelated edits (comment rewrites, renames, follow-ups) into another commit with `git add -A`.
+- **Bug fixes get their own commit** naming the fix. Small follow-ups fold into the commit that introduced them when it is within reach (a few commits back, `--fixup` + autosquash); deep history is never rewritten.
+- **Amend revisions into the original commit** rather than stacking new ones.
 
 **Phase task docs (`SPECS/04-tasks/phase-*.md`):**
 
 1. **Never modify original task descriptions.** The PHP/Rust-gap/Verify text is written as a best-effort spec up front and stays verbatim — even when it later proves wrong (a stale capture, a misidentified call site). Correct it with a note *below* the task, never by editing the task body.
-2. **Mark done / not done via the checkboxes only.** That is the status signal; don't rewrite a task to reflect its outcome.
+2. **Mark done / not done via the checkboxes only.** That is the status signal; don't rewrite a task to reflect its outcome. Flip checkboxes as tasks land, in the implementing commit.
 3. **A deviation = a departure from the original task description** (what it claimed or expected), *not* a divergence from PHP. If a fix simply makes Rust match PHP, there is no deviation — don't write one.
 4. **No redundant notes.** A note that just repeats what the task already asks for is dead weight — remove it. Keep a deviation only where it genuinely departs from the task text.
-5. **History lives in the per-phase `## Changes` log at the bottom**, not in the task body: what was tried, what was reverted and why, root causes, superseded analyses.
+5. **History lives in the per-phase `## Changes` log at the bottom**, not in the task body: what was tried, what was reverted and why, root causes, superseded analyses. **A Changes entry never restates the task text or the code** — keep only what a reader cannot recover from them (root causes, decisions, verification results).
 6. **Ground claims before writing them.** Verify against the PHP source and/or the live A/B harness; do not carry a handover doc's assertions forward unverified — and never present an unconfirmed finding as a confirmed requirement.
+
+**Plans (`SPECS/03-implementation-plan/plan/`):**
+
+- Plans are design documents — purpose, ground truth, decisions, sequencing, exit criteria (model: sections 14/15) — **not task lists**; the task breakdown belongs in the phase docs.
+- No "T(N)" shorthand. Tasks are "Task N" in plans and `NN.x` in phases; code comments reference `task NN.x`.
 
 **Specifications (`SPECS/01-requirements/`):**
 
