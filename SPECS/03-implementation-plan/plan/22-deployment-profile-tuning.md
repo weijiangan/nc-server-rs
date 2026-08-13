@@ -1,7 +1,9 @@
 # 22) Deployment-Profile Tuning — 2-Core, HDD, Localhost Postgres
 
-Status: proposed. Source: deployment-profile review (2026-08-14), grounded in
-the current source; line refs verified against it.
+Status: design complete, not started · **Execution tracking:**
+[`../../04-tasks/phase-23.md`](../../04-tasks/phase-23.md). Source:
+deployment-profile review (2026-08-14), grounded in the current source; line
+refs verified against it.
 
 ---
 
