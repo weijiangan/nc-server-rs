@@ -73,7 +73,7 @@ Full plan: [`SPECS/03-implementation-plan/plan/22-deployment-profile-tuning.md`]
 
 ### 23.7 Verify `If-None-Match` on GET (plan P6, vendored `dav-server` `handle_get`)
 
-- [ ] Verify the vendored handler short-circuits on `If-None-Match` before opening the file; patch it if it opens first (previews already 304 correctly, `response.rs:63-124`).
+- [x] Verify the vendored handler short-circuits on `If-None-Match` before opening the file; patch it if it opens first (previews already 304 correctly, `response.rs:63-124`).
 
 **Verify:** a 304 scenario (`If-None-Match` with the current etag) issues zero file reads.
 
@@ -107,6 +107,17 @@ Execution history only: what was tried, reverted, and why; root causes and
 verification results not already stated in the task text. Nothing that merely
 restates a task or the code.
 
+- 2026-08-14: **23.7 verified + patched — `handle_get` opened the file before
+  resolving conditional headers.**  The vendored handler opened at
+  `fs.open()` and only then ran `conditional::if_match`, so a 304 request
+  paid a disk open + `load_meta`.  The check now runs against the pre-open
+  `fs.metadata()` result — the same cache row the opened file reports, so the
+  etag/last-modified comparison is identical — and the early return
+  replicates the old 304/412 header set (ETag, Last-Modified, Accept-Ranges,
+  Content-Type, Content-Length: full size for 304, 0 for 412).  The 416
+  `no_body` path is untouched; `redirect_url` defaults to `None` in nc-dav,
+  so the redirect-before-conditional ordering is a non-issue.  Zero file
+  reads on 304 (metadata DB query only) — live probe pending.
 - 2026-08-14: **23.6 implemented — seek overlap + page-cache discipline.**
   Read-only `open()` now opens the file, issues `WILLNEED` + `SEQUENTIAL`,
   and only then runs `load_meta`, so the platter seek overlaps the DB query.
