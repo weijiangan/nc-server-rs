@@ -51,6 +51,12 @@ diff-test:
 diff-one:
 	cd core-rs && cargo test -p nc-difftest --release -- --ignored $(S)
 
+# The real suite: `difftest run <scenario.yaml>` per YAML (diff-test only runs
+# preconditions_pass).  Loops all scenarios, fails non-zero on any divergence.
+# Milestone procedure: diff-up → diff-suite → perf-gate.
+diff-suite:
+	./scripts/run-difftest-suite.sh
+
 # ── Performance budget gate (Phase 20) ───────────────────────────────────────
 # Fails when any request class exceeds its query-count budget
 # (core-rs/perf-budget.yaml).  Needs a live stack (`make diff-up`).
