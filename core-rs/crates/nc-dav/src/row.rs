@@ -1061,6 +1061,14 @@ pub struct PropfindCte {
     pub share_notes: std::collections::HashMap<i64, String>,
     pub comments: std::collections::HashMap<i64, (i64, i64)>,
     pub system_tags: std::collections::HashMap<i64, Vec<SystemTagRow>>,
+    /// Per-child `oc_vcategory` category strings (favorite sentinel included)
+    /// — the tag prefetch folded into the CTE (22.2).  Missing = no tags.
+    pub tags: std::collections::HashMap<i64, Vec<String>>,
+    /// The directory's own tags (the prefetch covered the dir fileid too).
+    /// Only populated when the dir has children (the uncorrelated sub-select
+    /// rides on the kid rows); an empty dir falls back to get_props's
+    /// cache-miss query — statement-neutral.
+    pub dir_tags: Vec<String>,
 }
 
 /// PHASE-22 T8.1: the read_dir hot-path statement texts, built once per
@@ -1129,7 +1137,18 @@ pub async fn propfind_batch_cte(
                  FROM {prefix}systemtag t \
                  JOIN {prefix}systemtag_object_mapping m ON m.systemtagid = t.id \
                  WHERE m.objectid = k.fileid::text AND m.objecttype = 'files' \
-                   AND t.visibility = 1) AS system_tags         FROM kids k",
+                   AND t.visibility = 1) AS system_tags, \
+                (SELECT json_agg(vc.category) \
+                 FROM {prefix}vcategory_to_object vco \
+                 JOIN {prefix}vcategory vc ON vc.id = vco.categoryid \
+                 WHERE vco.objid = k.fileid::text AND vco.type = 'files' \
+                   AND vc.uid = $4 AND vc.type = 'files') AS tags, \
+                (SELECT json_agg(vc.category) \
+                 FROM {prefix}vcategory_to_object vco \
+                 JOIN {prefix}vcategory vc ON vc.id = vco.categoryid \
+                 WHERE vco.objid = $1::text AND vco.type = 'files' \
+                   AND vc.uid = $4 AND vc.type = 'files') AS dir_tags \
+         FROM kids k",
         prefix = prefix,
     )
     });
@@ -1154,6 +1173,8 @@ pub async fn propfind_batch_cte(
                     share_notes: std::collections::HashMap::new(),
                     comments: std::collections::HashMap::new(),
                     system_tags: std::collections::HashMap::new(),
+                    tags: std::collections::HashMap::new(),
+                    dir_tags: Vec::new(),
                 };
             }
         },
@@ -1167,6 +1188,8 @@ pub async fn propfind_batch_cte(
                 share_notes: std::collections::HashMap::new(),
                 comments: std::collections::HashMap::new(),
                 system_tags: std::collections::HashMap::new(),
+                tags: std::collections::HashMap::new(),
+                dir_tags: Vec::new(),
             };
         }
     };
@@ -1179,6 +1202,8 @@ pub async fn propfind_batch_cte(
         share_notes: std::collections::HashMap::new(),
         comments: std::collections::HashMap::new(),
         system_tags: std::collections::HashMap::new(),
+        tags: std::collections::HashMap::new(),
+        dir_tags: Vec::new(),
     };
 
     // Shares across all kids: the notes + details split needs every row
@@ -1261,6 +1286,17 @@ pub async fn propfind_batch_cte(
             out.system_tags.insert(fileid, rows);
         }
 
+        // Tags (22.2) — the prefetch folded into the CTE: the category
+        // strings per child, favorite sentinel included, exactly what
+        // `get_tags_batch` produced for `prefetch_tags`.
+        let tags: Option<Vec<String>> = match r.get::<Option<serde_json::Value>, _>("tags") {
+            Some(v) => serde_json::from_value(v).ok().flatten(),
+            None => None,
+        };
+        if let Some(tags) = tags {
+            out.tags.insert(fileid, tags);
+        }
+
         // Shares — collect for the split below (needs the whole set for the
         // display-name batch).
         let shares: Option<Vec<ShareJson>> = match r.get::<Option<serde_json::Value>, _>("shares") {
@@ -1270,6 +1306,17 @@ pub async fn propfind_batch_cte(
         if let Some(shares) = shares {
             for s in shares {
                 all_shares.push((fileid, s));
+            }
+        }
+    }
+
+    // The directory's own tags (22.2): the uncorrelated sub-select repeats
+    // the same value on every row — take it from the first (absent when the
+    // directory has no children; get_props's cache-miss query covers that).
+    if let Some(first) = rows.first() {
+        if let Some(v) = first.get::<Option<serde_json::Value>, _>("dir_tags") {
+            if let Ok(tags) = serde_json::from_value::<Vec<String>>(v) {
+                out.dir_tags = tags;
             }
         }
     }

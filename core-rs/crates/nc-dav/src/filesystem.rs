@@ -1586,6 +1586,8 @@ impl DavFileSystem for NcFileSystem {
                     share_notes,
                     comments,
                     system_tags,
+                    tags,
+                    dir_tags,
                 } = cte;
                 let cte = Some((
                     dir_counts,
@@ -1593,6 +1595,8 @@ impl DavFileSystem for NcFileSystem {
                     share_notes,
                     comments,
                     system_tags,
+                    tags,
+                    dir_tags,
                 ));
                 (children, extended, cte)
             } else {
@@ -1728,7 +1732,32 @@ impl DavFileSystem for NcFileSystem {
             // PHASE-22 T7: on Postgres the CTE already carried dir counts,
             // shares/notes, comments and system tags — fill the batch maps
             // directly (the per-family statements do not exist on this path).
-            if let Some((dir_counts, share_details, share_notes, comments, system_tags)) = cte {
+            // 22.2: the tag prefetch folded into the CTE too — fill the tag
+            // cache exactly as `prefetch_tags` did (empty vec for tagless
+            // children; the dir's own tags included).
+            if let Some((
+                dir_counts,
+                share_details,
+                share_notes,
+                comments,
+                system_tags,
+                tags,
+                dir_tags,
+            )) = cte
+            {
+                {
+                    let mut cache_guard = self.tag_cache.lock().expect("tag cache lock");
+                    for id in &child_ids {
+                        cache_guard.insert(*id, tags.get(id).cloned().unwrap_or_default());
+                    }
+                    // Only when the CTE had rows: an empty directory's tags
+                    // were already cached by the target's `get_props` (which
+                    // runs before `read_dir`) — an empty `dir_tags` here
+                    // would wrongly overwrite them.
+                    if !child_ids.is_empty() {
+                        cache_guard.insert(dir_fileid, dir_tags);
+                    }
+                }
                 if !child_ids.is_empty() {
                     let mut batch_inner = batch.inner.lock().expect("propfind batch lock");
                     batch_inner.dir_counts.extend(dir_counts);
@@ -1813,10 +1842,11 @@ impl DavFileSystem for NcFileSystem {
                     batch_inner.system_tags.extend(tags);
                 }
             }
-            // Custom props + the tag prefetch — both paths, gated (T6.6).
-            // Custom props cannot fold into the CTE (the property-path hash
-            // is Rust-side and the children's names only exist after the
-            // query); the prefetch covers oc_vcategory, a different shape.
+            // Custom props + the tag prefetch — gated (T6.6).  Custom props
+            // cannot fold into the CTE (the property-path hash is Rust-side
+            // and the children's names only exist after the query); the tag
+            // prefetch is folded into the CTE on Postgres (22.2 — the cache
+            // was filled above), so SQLite alone keeps the batch call.
             let (props, _) = tokio::join!(
                 async {
                     if want_custom_props {
@@ -1832,10 +1862,10 @@ impl DavFileSystem for NcFileSystem {
                     }
                 },
                 async {
-                    if want_tags {
-                        // §9.5: prefetch tags for the directory + all
-                        // children so {oc:}favorite/{oc:}tags are ready
-                        // without N+1 DB queries.  Include the directory.
+                    // §9.5: prefetch tags for the directory + all children
+                    // so {oc:}favorite/{oc:}tags are ready without N+1 DB
+                    // queries.  Include the directory.
+                    if !self.state.pool.is_postgres() && want_tags {
                         let mut prefetch_ids = child_ids.clone();
                         prefetch_ids.push(dir_fileid);
                         crate::tags::prefetch_tags(
