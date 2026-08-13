@@ -2852,35 +2852,37 @@ impl DavFileSystem for NcFileSystem {
                     .unwrap_or_default()
             };
 
-            // Count direct children for directories (REQ §6.5 contained-*-count).
-            // Phase 18.1: read_dir pre-computed every child's counts with one
-            // GROUP BY; an in-batch miss means an empty directory (0, 0), and
-            // only nodes outside the batch (depth-0 root) run the single query.
-            let (child_dirs, child_files) = if meta.is_dir_flag && do_content {
-                if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
-                    { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.dir_counts, &meta.fileid) }.unwrap_or((0, 0))
-                } else {
-                    // Resolved once at startup (phase-21 S3).
-                    let dir_mime_id = self.state.dir_mime_id;
-                    row::count_children(
+            // ── 22.1: one join for the single-row fallbacks ──────────────────────
+            // The depth-0 root (any node outside the batch) used to pay ~10
+            // statements strictly sequentially — every one of them depends
+            // only on the fileid/path known after load_meta (or on nothing),
+            // so one `tokio::join!` collapses the serial chain into ~1 RTT.
+            // Same statements, same results, same bytes — only scheduling
+            // changes (the A/B harness is the parity gate).  In-batch nodes
+            // (read_dir children) keep their batch-map hits inside each
+            // future, so they still issue no statements.
+            let (
+                user_state,
+                (child_dirs, child_files),
+                storage_string,
+                note,
+                tag_info,
+                share_details,
+                (comments_count, comments_unread),
+                system_tags,
+                custom_props,
+            ) = tokio::join!(
+                // Resolve {oc:}owner-display-name and the sharing mask from
+                // the per-uid user-state cache (round-4 Task 12): the auth
+                // middleware resolved the entry earlier in the request, so
+                // this is a cache hit; joined so a cold request pays the
+                // queries once instead of serially.
+                async {
+                    nc_auth::cached_user_state(
+                        &self.uid,
                         &self.state.pool,
                         &self.state.table_prefix,
-                        meta.fileid,
-                        self.storage_id,
-                        dir_mime_id,
                     )
-                    .await
-                }
-            } else {
-                (0, 0)
-            };
-
-            // Resolve {oc:}owner-display-name and the sharing mask from the
-            // per-uid user-state cache (round-4 Task 12): the auth middleware
-            // resolved the entry earlier in the request, so this is a cache
-            // hit; on failure default to uid / sharing-enabled with a warning.
-            let user_state =
-                nc_auth::cached_user_state(&self.uid, &self.state.pool, &self.state.table_prefix)
                     .await
                     .unwrap_or_else(|e| {
                         tracing::warn!(
@@ -2894,29 +2896,168 @@ impl DavFileSystem for NcFileSystem {
                             sharing_disabled: false,
                             display_name: self.uid.clone(),
                         }
-                    });
+                    })
+                },
+                // Count direct children for directories (REQ §6.5
+                // contained-*-count).  Phase 18.1: read_dir pre-computed every
+                // child's counts with one GROUP BY; an in-batch miss means an
+                // empty directory (0, 0), and only nodes outside the batch
+                // (depth-0 root) run the single query.
+                async {
+                    if meta.is_dir_flag && do_content {
+                        if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
+                            { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.dir_counts, &meta.fileid) }.unwrap_or((0, 0))
+                        } else {
+                            // Resolved once at startup (phase-21 S3).
+                            row::count_children(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                meta.fileid,
+                                self.storage_id,
+                                self.state.dir_mime_id,
+                            )
+                            .await
+                        }
+                    } else {
+                        (0, 0)
+                    }
+                },
+                // ── Phase 7.6: is_mounted ──────────────────────────────────
+                // `is_mounted`: true when the file lives on a non-home
+                // storage.  Optimisation: if meta.storage == self.storage_id
+                // the FS was already constructed from a home:: storage lookup,
+                // so skip DB.  Phase-21 S3: process-wide cache (negative
+                // entries) — the table is tiny and near-static.
+                async {
+                    if meta.storage == self.storage_id {
+                        None
+                    } else {
+                        row::get_storage_string_id_cached(
+                            &self.state.pool,
+                            &self.state.table_prefix,
+                            &self.state.storage_cache,
+                            meta.storage,
+                        )
+                        .await
+                    }
+                },
+                // `note`: most-recent non-empty share note for this file.
+                // Phase 18.1: batched by read_dir; an in-batch miss means no
+                // note, and only nodes outside the batch run the single query.
+                async {
+                    if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
+                        { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.share_notes, &meta.fileid) }.unwrap_or_default()
+                    } else {
+                        row::get_share_note(&self.state.pool, &self.state.table_prefix, meta.fileid).await
+                    }
+                },
+                // §9.5: resolve tags / favorite from oc_vcategory /
+                // oc_vcategory_to_object.  PHASE-22 T6.6: gate on the
+                // requested props like read_dir's prefetch — an ungated
+                // lookup here would re-introduce one query per child whenever
+                // the prefetch was skipped.
+                async {
+                    if self.prop_requested("http://owncloud.org/ns", "favorite")
+                        || self.prop_requested("http://owncloud.org/ns", "tags")
+                    {
+                        crate::tags::get_tag_info(
+                            &self.state.pool,
+                            &self.state.table_prefix,
+                            &self.uid,
+                            meta.fileid,
+                            &self.tag_cache,
+                        )
+                        .await
+                    } else {
+                        crate::tags::TagInfo {
+                            tags: Vec::new(),
+                            is_favorite: false,
+                        }
+                    }
+                },
+                // ── PHASE-12.5: share-types / sharees ──────────────────────
+                // Phase 18.1: batched by read_dir; single query for nodes
+                // outside the batch (the display-name batch runs inside).
+                async {
+                    if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
+                        { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.share_details, &meta.fileid) }.unwrap_or_default()
+                    } else {
+                        row::get_share_details(
+                            &self.state.pool,
+                            &self.state.table_prefix,
+                            &self.uid,
+                            meta.fileid,
+                        )
+                        .await
+                    }
+                },
+                // ── PHASE-12.6: comments count + unread (the pair joined
+                // internally — both depend only on the fileid; in-batch miss
+                // means zero comments).
+                async {
+                    if do_content {
+                        if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
+                            { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.comments, &meta.fileid) }.unwrap_or((0, 0))
+                        } else {
+                            let count = row::get_comments_count(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                meta.fileid,
+                            )
+                            .await;
+                            let unread = row::get_comments_unread(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                meta.fileid,
+                                &self.uid,
+                            )
+                            .await;
+                            (count, unread)
+                        }
+                    } else {
+                        (0, 0)
+                    }
+                },
+                // ── PHASE-12.7: system tags ────────────────────────────────
+                async {
+                    if do_content {
+                        if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
+                            { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.system_tags, &meta.fileid) }.unwrap_or_default()
+                        } else {
+                            row::get_system_tags_for_file(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                meta.fileid,
+                            )
+                            .await
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                },
+                // ── Custom properties from oc_properties (task §10.11) ────
+                // Needs only the fc path + uid (not the fileid); keyed by
+                // path in the batch (Phase 18.1).
+                async {
+                    if do_content {
+                        if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.child_paths, fc_path.as_str()) } {
+                            { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.custom_props, fc_path.as_str()) }
+                                .unwrap_or_default()
+                        } else {
+                            crate::row::list_custom_properties(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                &self.uid,
+                                &fc_path,
+                            )
+                            .await
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                },
+            );
             let owner_display_name = user_state.display_name.clone();
-
-            // ── Phase 7.6: is_mounted, share_permissions, download_url, note ──
-            //
-            // `is_mounted`: true when the file lives on a non-home storage.
-            // Optimisation: if meta.storage == self.storage_id the FS was
-            // already constructed from a home:: storage lookup, so skip DB.
-            let is_mounted = if meta.storage == self.storage_id {
-                false
-            } else {
-                // Phase-21 S3: process-wide cache (negative entries) — the
-                // table is tiny and near-static.
-                row::get_storage_string_id_cached(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &self.state.storage_cache,
-                    meta.storage,
-                )
-                .await
-                .map(|id| !id.starts_with("home::"))
-                .unwrap_or(false)
-            };
 
             // is_shared: false for home-storage nodes — the file is the user's own.
             // Shared nodes (from oc_share) are detected via is_mounted/share_permissions.
@@ -2992,14 +3133,11 @@ impl DavFileSystem for NcFileSystem {
             // ── Phase 12.4: OCM share-permissions JSON ─────────────────────
             let ocm_share_permissions = row::permissions_to_ocm_json(share_permissions);
 
-            // `note`: most-recent non-empty share note for this file.
-            // Phase 18.1: batched by read_dir; an in-batch miss means no
-            // note, and only nodes outside the batch run the single query.
-            let note = if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
-                { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.share_notes, &meta.fileid) }.unwrap_or_default()
-            } else {
-                row::get_share_note(&self.state.pool, &self.state.table_prefix, meta.fileid).await
-            };
+            // Phase 7.6: is_mounted from the joined storage lookup (the
+            // lookup itself only runs for non-home storages).
+            let is_mounted = storage_string
+                .map(|id| !id.starts_with("home::"))
+                .unwrap_or(false);
 
             // `download_url`: direct WebDAV URL for home-storage files.
             // Format: {overwrite.cli.url}/remote.php/webdav/{path-without-files-prefix}
@@ -3030,42 +3168,7 @@ impl DavFileSystem for NcFileSystem {
                 .preview_registry
                 .is_available(&meta.mime_type, is_mounted);
 
-            // §9.5: resolve tags / favorite from oc_vcategory / oc_vcategory_to_object.
-            // PHASE-22 T6.6: gate on the requested props like read_dir's
-            // prefetch — an ungated lookup here would re-introduce one query
-            // per child whenever the prefetch was skipped.
-            let tag_info = if self.prop_requested("http://owncloud.org/ns", "favorite")
-                || self.prop_requested("http://owncloud.org/ns", "tags")
-            {
-                crate::tags::get_tag_info(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &self.uid,
-                    meta.fileid,
-                    &self.tag_cache,
-                )
-                .await
-            } else {
-                crate::tags::TagInfo {
-                    tags: Vec::new(),
-                    is_favorite: false,
-                }
-            };
-
-            // ── PHASE-12.5: share-types / sharees ──────────────────────────
-            // Phase 18.1: batched by read_dir; single query for nodes
-            // outside the batch.
-            let share_details = if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
-                { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.share_details, &meta.fileid) }.unwrap_or_default()
-            } else {
-                row::get_share_details(
-                    &self.state.pool,
-                    &self.state.table_prefix,
-                    &self.uid,
-                    meta.fileid,
-                )
-                .await
-            };
+            // ── PHASE-12.5: share-types / sharees XML from the joined rows ─
             let mut share_types: Vec<i32> = share_details
                 .iter()
                 .map(|d| d.share_type as i32)
@@ -3076,58 +3179,15 @@ impl DavFileSystem for NcFileSystem {
             let share_types_xml = row::format_share_types_xml(&share_types);
             let sharees_xml = row::format_sharees_xml(&share_details);
 
-            // ── PHASE-12.6: comments properties ────────────────────────────
-            // Phase 18.1: read_dir batches both counts per child; single
-            // queries for nodes outside the batch.
-            let (comments_count, comments_unread, comments_href) = if do_content {
-                // Phase 18.1: read_dir batches both counts per child; an
-                // in-batch miss means zero comments, and only nodes outside
-                // the batch run the single queries.
-                let (count, unread) = if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) }
-                {
-                    { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.comments, &meta.fileid) }.unwrap_or((0, 0))
-                } else {
-                    let count = row::get_comments_count(
-                        &self.state.pool,
-                        &self.state.table_prefix,
-                        meta.fileid,
-                    )
-                    .await;
-                    let unread = row::get_comments_unread(
-                        &self.state.pool,
-                        &self.state.table_prefix,
-                        meta.fileid,
-                        &self.uid,
-                    )
-                    .await;
-                    (count, unread)
-                };
-                let href = if !self.state.base_url.is_empty() {
-                    row::build_comments_href(&self.state.base_url, meta.fileid)
-                } else {
-                    String::new()
-                };
-                (count, unread, href)
-            } else {
-                (0, 0, String::new())
-            };
-
-            // ── PHASE-12.7: system tags ────────────────────────────────────
-            let system_tags_xml = if do_content {
-                let tags = if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
-                    { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.system_tags, &meta.fileid) }.unwrap_or_default()
-                } else {
-                    row::get_system_tags_for_file(
-                        &self.state.pool,
-                        &self.state.table_prefix,
-                        meta.fileid,
-                    )
-                    .await
-                };
-                row::format_system_tags_xml(&tags, true)
+            // ── PHASE-12.6: comments href ──────────────────────────────────
+            let comments_href = if do_content && !self.state.base_url.is_empty() {
+                row::build_comments_href(&self.state.base_url, meta.fileid)
             } else {
                 String::new()
             };
+
+            // ── PHASE-12.7: system-tags XML from the joined rows ───────────
+            let system_tags_xml = row::format_system_tags_xml(&system_tags, true);
 
             let mut props = crate::props::build_props(
                 &meta,
@@ -3165,23 +3225,9 @@ impl DavFileSystem for NcFileSystem {
             }
 
             // ── Append custom properties from oc_properties (task §10.11) ─────
-            // Phase 18.1: batched by read_dir (keyed by fc path); an in-batch
-            // miss means no properties, and only nodes outside the batch run
-            // the single query.
+            // Resolved in the 22.1 join above (batch-hit or single query);
+            // only the push loop remains here.
             if do_content {
-                let custom_props =
-                    if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.child_paths, fc_path.as_str()) } {
-                        { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.custom_props, fc_path.as_str()) }
-                            .unwrap_or_default()
-                    } else {
-                        crate::row::list_custom_properties(
-                            &self.state.pool,
-                            &self.state.table_prefix,
-                            &self.uid,
-                            &fc_path,
-                        )
-                        .await
-                    };
                 for (propname, propvalue, _valuetype) in custom_props {
                     if let Some((ns, name)) = crate::row::parse_clark_notation(&propname) {
                         // Skip known-namespace props — they are handled above or

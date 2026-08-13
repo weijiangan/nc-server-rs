@@ -156,6 +156,43 @@ Goal: verify the index claims against the live DB — verification only. Plan fi
 
 ---
 
+## 22.1 — Depth-0 round-trip join
+
+Goal: collapse the depth-0 root's serial single-row statement chain in `get_props` (~10 statements for a full allprop root PROPFIND) into ~2 rounds with one `tokio::join!` — the same trick T1 applied to `read_dir`'s families. The root is visited by dav-server-rs **before** `read_dir`, so it is never in the batch: every batch miss falls back to a single-row query, and `get_props` awaits them strictly sequentially (`filesystem.rs:2835-3210`). This is the round-trip mass of the current design (item (c) of the T2-strike analysis) — the depth-1 delta is 3 statements, depth-0 is 11.
+
+**Decisions (grounded):**
+
+- **Only `load_meta` gates the rest.** After the lookup yields `meta.fileid`, `count_children`, `get_share_note`, `get_tag_info`, `get_share_details` (+ its internal display-name chain, unchanged), `get_comments_count`/`get_comments_unread` (join the pair), `get_system_tags_for_file`, `list_custom_properties` and `cached_user_state` (cache hit in steady state — joined so cold requests pay once) depend only on the fileid/uid/path known up front. One `tokio::join!` collapses ~10 serial RTTs into ~1; the pool (≥16 connections) holds them concurrently.
+- **Behavior-neutral.** Same statements, same results, same HTTP bytes — only scheduling changes; the A/B harness is the parity gate.
+- **In-batch nodes (depth-1 children) keep the batch-hit path.** Each joined future keeps its `batch_contains`/`batch_get` check, so in-batch `get_props` still issues no statements.
+- **Statement counts are unchanged** → the perf-gate budgets hold (the gate measures counts, not RTTs); the win is latency, verified with `nc-bench` on a depth-0 PROPFIND (SUT vs oracle) before/after.
+
+| Stop | Tasks | Gate |
+|---|---|---|
+| S0 | 22.1 | `cargo test --lib`; `make diff-test`; `make perf-gate` (counts identical); depth-0 bench p50 drops vs baseline. |
+
+- [x] **22.1** Restructure `get_props`'s post-`load_meta` query blocks into one `tokio::join!` (batch-check + single-row fallback per future, pure-Rust computation stays in its existing order; the comments pair joins internally).
+
+## 22.2 — Tag-prefetch fold into the CTE
+
+Goal: fold `prefetch_tags`'s `oc_vcategory` / `oc_vcategory_to_object` scan into the PROPFIND CTE as a `LATERAL` sub-select — same shape as the system-tags sub-select already in it (`objid = fileid`). Depth-1 statement delta 3 → 2 (item (b) of the T2-strike analysis).
+
+**Decisions (grounded):**
+
+- **RTT-neutral, not a latency win.** The prefetch already runs *concurrently* with `custom_properties_batch` in `read_dir`'s second-round join, and `custom_properties_batch` cannot fold (T7.2 — the property-path hash is Rust-side). So the two serial rounds stay; what disappears is one of the two second-round statements: fewer statements (budget drop), one fewer connection slot, one less parse/plan/marshal.
+- **The "a different shape" guard (`filesystem.rs:1819`) does not hold up** — `oc_vcategory_to_object` is keyed on `objid = fileid`, a textbook `LATERAL` sub-select.
+- The prefetch also covers the **directory's own** fileid (the `prefetch_ids` list is `child_ids + dir_fileid`) — the sub-select must include the parent row.
+- SQLite keeps the batch path behind the variant.
+
+| Stop | Tasks | Gate |
+|---|---|---|
+| S0 | 22.2.1 | `cargo test --lib` (SQLite path); `make diff-test`; perf-gate re-measured with `scaling_delta_budget` 3 → 2. |
+
+- [ ] **22.2.1** The `LATERAL` sub-select in `propfind_batch_cte` (Postgres arm) + Rust-side decode into the same tag shape `prefetch_tags` produces; the directory's own tags included.
+- [ ] **22.2.2** Drop the `prefetch_tags` call from `read_dir`'s join on the Postgres path (SQLite keeps it); re-measure and lower the delta budget.
+
+---
+
 ## Deviations from the task descriptions
 
 - **T7.2** — `custom_properties_batch` is NOT folded into the CTE (it stays a separate gated statement). The `>250`-char property-path hash (`format_property_path`) is Rust-side, and the children's names — needed to build those paths — only exist after the query returns, so a CTE sub-select would need pgcrypto (not guaranteed) or an `unnest` indirection over paths built from a second query. One statement either way; the CTE still collapses 5 families → 1.
@@ -164,6 +201,7 @@ Goal: verify the index claims against the live DB — verification only. Plan fi
 
 ## Changes
 
+- 2026-08-14: **22.1 implemented** — verified: workspace compiles, 311 nc-dav + 38 nc-db lib tests green; milestone suite + perf-gate (counts must hold) + a depth-0 bench pending. Found during the restructure: the custom-props tail re-queried (its `let custom_props` shadowed the joined value); it now consumes the joined rows.
 - 2026-08-14: **T3.3 completed** — the deviation's deferred half (migrate the remaining Any-typed call sites, then drop the `any` feature) is done; verified with 0 compile errors on the feature-less tree and 546 lib tests green (Postgres parity = next milestone difftest run). Also deleted (operator decision): the dead `batch_comments_counts`/`batch_comments_unread` helpers — superseded by T6.3's merged query, zero callers.
 - 2026-08-14: **T2 struck — T7 removed its premise** (operator decision; the task body stays verbatim with the checkboxes open — this entry is the record). T2's goal was "all batch families on one connection with no awaits between sends — one RTT, superseding the `join!`". After T7 there are no ~8 independent families left to pipeline — there is **one CTE statement**. The Postgres depth-1 delta is 3 statements (`scaling_delta_budget: 3`, `perf-budget.yaml:43`): (1) `propfind_batch_cte`, (2) `custom_properties_batch`, (3) `prefetch_tags` — where 2 and 3 are **already concurrent** in one `tokio::join!` (`filesystem.rs:1651`). Critically, 2 and 3 are **data-dependent on 1**: `child_paths` comes from `metas`, which comes from the CTE's `children` (`filesystem.rs:1454-1495`); `prefetch_ids` comes from `child_ids`. Pipelining removes *scheduling* serialization, not *data* dependencies — you cannot send a query whose parameters do not exist yet — so T2's ceiling on the depth-1 path is ~zero. Its only residual win is "two queries on two pooled connections concurrently" vs "pipelined on one connection" — one connection's worth of pool contention at 2 statements, against the plan's largest refactor (the row-API change). Not a trade worth making. T2 would also actively fight the current architecture: swapping the Pg arm to tokio-postgres breaks the `Executor<'_, Any>` delegation every unmigrated call site still depends on (the `PgRow`→`AnyRow` translation at `pool.rs:map_pg_step`), forcing a full migration at once. **Where the residual value moved:**
   - **(a) Finish T3.3 — the real remaining driver cost.** The hot batch queries are native (`sqlx::query::<Postgres>` at `row.rs:415-422` and 9 more sites), but every *unmigrated* call site still runs through the Any delegation and pays the row boxing — that's `propfind_depth0` (11 statements), `put_new` (15), auth, appconfig. **The depth-1 hot path is native; everything else isn't.** Cheaper than T2 and it closes the T3.3 loop (the `any` cargo feature can finally be dropped for real).
