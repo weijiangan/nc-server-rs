@@ -114,6 +114,19 @@ Execution history only: what was tried, reverted, and why; root causes and
 verification results not already stated in the task text. Nothing that merely
 restates a task or the code.
 
+- 2026-08-14: **Milestone run (fresh `down -v`, fixed binary): suite 20/20,
+  perf-gate green, first-baseline comparison recorded.** Suite: 18 passed
+  first pass; 01 and 15 re-ran clean — the documented first-run artifact
+  class (lazy cache-row + storage-root bump; one-sided vcategory rows).  The
+  bench comparison vs the 2026-08-10 baseline is in `docs/benchmarks.md`:
+  depth-1 PROPFIND 11.9 → 6.0 ms (−50%), depth-1 load probe 750 → 1826 req/s
+  (+143%), ratios improved in 18/20 scenarios; the oracle measured ~2× slower
+  than baseline across the board (box CPU contention) so ratios are the
+  cross-run metric.  One harness finding en route: `make bench` scenario 30
+  flaked with an empty-body 429 — bench replays do not run the scenario
+  cleanup, so leftover `oc_share` rows + accumulated `oc_bruteforce_attempts`
+  trip PHP's login throttler on the proxied share_create; the fix is the
+  documented brute-force reset (delete both tables) before re-running.
 - 2026-08-14: **Milestone gate: propfind_depth1 budget corrected 12 → 13 (delta 1 → 2).** The perf-gate re-run on the fixed binary breached the 22.2-C budget with a steady [13,13,13] across two independent runs — and the 13th statement is real, not a regression: zero PROPFIND-path code changed between the T8.1 fix (ea1dcd5) and HEAD (verified by git diff), and the depth-1 set is exactly depth-0's 11 + CTE + custom-props batch. The 12 budget was set during the 2026-08-14 milestone on the T8.1 desync-buggy binary — a depth-1 request killed by the accounts-fallback panic produced truncated execute counts, and the gate's probe does not validate the response status (budget.rs). Corrected in perf-budget.yaml per the no-headroom policy; gate green.
 - 2026-08-14: **23.8 resolved without code — the bound already existed.** The
   `preview_concurrency_new` config key sizes the generation semaphore

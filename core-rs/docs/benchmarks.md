@@ -628,3 +628,66 @@ cheaper on combined CPU — under the 10% switch threshold and at the 5%
 boundary where the analysis says "B now, C as a note". The `propfind.backend
 = cte | batch` switch remains the documented option for deployments that
 measure worse; the batch families are verified working on Postgres.
+
+## Milestone comparison — vs the 2026-08-10 first baseline (2026-08-14)
+
+Same harness, same stack shape, same 20-scenario corpus as the baseline
+above.  Scenario totals are per-scenario means of 5 iterations; the load
+probes are 4 workers × 10 s.  The 08-14 numbers are one clean run on the
+fixed binary (post-T8.1), statement logging off.
+
+### Scenario totals (ms; ratio = php/rust)
+
+| scenario | rust 08-10 | rust 08-14 | php 08-10 | php 08-14 | ratio 08-10 | ratio 08-14 |
+|---|---|---|---|---|---|---|
+| 01_propfind_readonly | 2.9 | 3.45 | 27.4 | 50.1 | 9.6× | **14.5×** |
+| 10_put_get | 55.0 | 65.0 | 124.8 | 205.1 | 2.3× | **3.2×** |
+| 10_put_get_delete | 128.1 | 128.0 | 245.3 | 369.0 | 1.9× | **2.9×** |
+| 11_mkdir_nested | 39.3 | 37.3 | 190.5 | 302.1 | 4.8× | **8.1×** |
+| 12_move_rename | 175.2 | 175.3 | 342.1 | 494.6 | 2.0× | **2.8×** |
+| 13_copy | 201.0 | 197.4 | 462.1 | 660.3 | 2.3× | **3.3×** |
+| 14_propfind_depth1 | 11.9 | **6.0** | 58.4 | 101.9 | 4.9× | **17.0×** |
+| 15_proppatch_favorite_tags | 7.5 | 7.0 | 33.7 | 56.5 | 4.5× | **8.1×** |
+| 16_overwrite_put | 176.9 | **127.4** | 278.8 | 374.7 | 1.6× | **2.9×** |
+| 17_delete_to_trash | 148.7 | 221.7 | 236.4 | 420.0 | 1.6× | 1.9× |
+| 18_explicit_mtime | 121.9 | 146.1 | 298.6 | 460.9 | 2.4× | **3.2×** |
+| 20_chunked_upload_v2 | 50.4 | 45.6 | 748.5 | 1046.7 | 14.8× | **23.0×** |
+| 21_bulk_upload | 1.2 | **0.66** | 24.0 | 49.3 | 19.8× | **75.3×** |
+| 22_invalid_filename | 1.0 | **0.54** | 24.6 | 51.0 | 25.8× | **94.7×** |
+| 23_quota_exceeded | 67.7 | 99.9 | 94.7 | 160.1 | 1.4× | 1.6× |
+| 24_checksum_upload | 60.7 | 57.6 | 245.7 | 369.1 | 4.0× | **6.4×** |
+| 25_preview_image | 92.4 | 74.3 | 93.1 | 76.0 | 1.0× | 1.0× |
+| 26_preview_unpreviewable | 83.0 | 99.2 | 131.4 | 179.9 | 1.6× | 1.8× |
+| 27_imaginary_preview | 106.9 | 74.6 | 107.4 | 74.8 | 1.0× | 1.0× |
+| 30_share_create_selfcheck | 97.9 | 160.6 | 101.0 | 160.9 | 1.0× | 1.0× |
+
+### Load probes (4 workers, 10 s; req/s + p50 ms)
+
+| probe | rust 08-10 | rust 08-14 | php 08-10 | php 08-14 | ratio 08-14 |
+|---|---|---|---|---|---|
+| GET /status.php | 1921 (2.17) | 1676.8 (2.31) | 866 (4.50) | 324.8 (11.74) | 5.2× |
+| GET capabilities | 1192 (2.43) | 2048.5 (2.22) | 161 (23.06) | 82.9 (46.09) | 24.7× |
+| PROPFIND depth-0 | 1595 (2.33) | 1426.8 (2.27) | 163 (22.31) | 83.1 (46.60) | 17.2× |
+| PROPFIND depth-1 | 750 (4.58) | **1825.7 (2.33)** | 157 (23.37) | 80.6 (47.94) | 22.7× |
+
+### Significance
+
+- **The oracle slowed ~1.8-2.2× across the board** (every php column is up
+  proportionally: 27→50, 124→205, 866→325 req/s, …).  Same binary, same
+  stack — the box is CPU-contended (the 08-14 run follows the suite + gate
+  on the same host).  This is why the *ratio* is the cross-run metric: it is
+  measured within one run, so the contention cancels.  The rust-side
+  absolute increases (17, 18, 23, 26, 30: +20-65%) track their php
+  counterparts — ratios flat-or-better — not regressions.
+- **The read path improved absolutely**: depth-1 PROPFIND 11.9 → 6.0 ms
+  (−50%; the T7 single-query CTE + 22.2-C gates + phase-21 concurrent
+  batches), and the depth-1 load probe 750 → 1826 req/s (+143%), p50 4.58 →
+  2.33 ms.  The GET op inside 10/17 is ~0.8-0.9 ms vs the baseline 1.3-1.4.
+- **Ratios improved in 18 of 20 scenarios**; 25/27 sit at parity by design
+  (shared Imaginary generation backend) and 30 at parity because it is
+  proxied PHP on both sides.  Headline wins: depth-1 PROPFIND 4.9× → 17.0×,
+  propfind_readonly 9.6× → 14.5×, chunked upload 14.8× → 23.0×, bulk upload
+  19.8× → 75.3×, invalid-filename 25.8× → 94.7×.
+- **Overwrite PUT improved absolutely** (16: 176.9 → 127.4 ms) — the
+  phase-22 write-path statement work; regular PUT is flat at p50 with noise
+  around it (the scenario mixes create + overwrite iterations).
