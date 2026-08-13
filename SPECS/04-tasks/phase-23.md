@@ -30,7 +30,7 @@ Full plan: [`SPECS/03-implementation-plan/plan/22-deployment-profile-tuning.md`]
 
 ### 23.1 Measure CTE vs batch CPU (plan P0)
 
-- [ ] Measure total CPU-seconds per depth-1 PROPFIND (`nc-server` + `postgres` combined, via `pidstat` or cgroup accounting) on the target profile — CTE path vs the batch-families path run against Postgres; record in `docs/benchmarks.md`.
+- [x] Measure total CPU-seconds per depth-1 PROPFIND (`nc-server` + `postgres` combined, via `pidstat` or cgroup accounting) on the target profile — CTE path vs the batch-families path run against Postgres; record in `docs/benchmarks.md`.
 - [ ] If the CTE loses: the `propfind.backend = cte | batch` config switch (plan 22, Wave 0) selecting the existing batch families on Postgres; the CTE stays the default elsewhere; behavior-neutral (same bytes) — the milestone suite is the parity gate for both profiles.
 
 **Verify:** the measurement table in `docs/benchmarks.md`; the decision (keep CTE / add switch) recorded in the Changes log.
@@ -106,3 +106,18 @@ Full plan: [`SPECS/03-implementation-plan/plan/22-deployment-profile-tuning.md`]
 Execution history only: what was tried, reverted, and why; root causes and
 verification results not already stated in the task text. Nothing that merely
 restates a task or the code.
+
+- 2026-08-14: **23.1 measured — decision B (keep the CTE).** The 200-child
+  allprop A/B on the fixed binary: CTE 126.2 ms/req combined CPU
+  (nc-server 123.1 + postgres 3.10) vs batch families 119.9
+  (117.6 + 2.37) — the CTE's json_agg serialization + serde parse costs
+  ~6.3 ms/req over the seven batch statements, which is ~5%, under the 10%
+  switch threshold. Recorded in `docs/benchmarks.md`; the
+  `propfind.backend = cte | batch` switch stays a documented option.
+  Method notes: the earlier arms were invalidated twice — the first by the
+  pre-fix binary (the cached_sql desync and the NULL-decode panics, which
+  also corrupt the 2026-08-14 milestone's propfind scenarios), the second by
+  Nextcloud's cron `files:cleanup` job sweeping the DB-only test directory
+  (the A/B now seeds real disk files). The NC_FORCE_BATCH instrument was
+  temporary and reverted after the measurement.
+

@@ -599,3 +599,32 @@ statements cost ~0.1-0.2 ms.
 **Correctness**: allprop children etags byte-match PHP on both the root
 and /Media listings; explicit `<prop>` responses unchanged (the gated
 getetag-only request still returns 1093 B).
+
+## CTE vs batch families — CPU (plan 22, Wave 0; 2026-08-14)
+
+Per-request CPU-seconds for a 200-child depth-1 PROPFIND (allprop, all
+22.2-C gates on), measured via `/proc/<pid>/stat` deltas of the SUT's
+nc-server + all postgres processes over 300 sequential requests. Both arms
+served full 201-response listings on the fixed binary (the T8.1
+statement-cache and NULL-decode fixes). Dev stack — same localhost-Postgres
+topology as the plan's 2-core target, so the CPU *ratio* transfers; the
+absolute numbers scale with the box.
+
+| path | nc-server | postgres | combined | wall |
+|---|---|---|---|---|
+| CTE (single statement) | 123.1 ms/req | 3.10 ms/req | **126.2 ms/req** | 130.9 ms/req |
+| batch families (7 statements) | 117.6 ms/req | 2.37 ms/req | **119.9 ms/req** | 123.7 ms/req |
+
+Why the numbers behave as they do: the difference is the CTE's
+`json_agg`/`json_build_object` — ~0.7 ms/req of Postgres-side serialization
+plus ~5.6 ms/req of Rust-side serde parsing — traded against the ~7 batch
+statements, which cost nothing extra because localhost round trips are
+~50 µs. The 22.2-C gates matter here: the numbers above are the all-gates-on
+worst case; the desktop client's narrow prop set skips three of the six
+sub-selects, narrowing the gap toward the gated CTE.
+
+Decision (plan 22, Wave 0): **B — keep the CTE.** The batch path is ~5%
+cheaper on combined CPU — under the 10% switch threshold and at the 5%
+boundary where the analysis says "B now, C as a note". The `propfind.backend
+= cte | batch` switch remains the documented option for deployments that
+measure worse; the batch families are verified working on Postgres.
