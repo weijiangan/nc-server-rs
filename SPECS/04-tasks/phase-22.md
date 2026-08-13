@@ -213,6 +213,56 @@ Goal: make the S2 gate's EXPLAIN assertion permanent — a harness probe that pr
 
 ---
 
+## 22.4 — Pg-backed CTE decode test (gates-off shape)
+
+Goal: pin the CTE decode's NULL handling so the 22.2-C gates can never panic again — the `UnexpectedNullError` class (the production root-PROPFIND panic, 2026-08-14).
+
+**Decisions:** the decode is inline in `propfind_batch_cte` and Postgres-only — no unit test executes it today (the SQLite arm returns early), which is why the `dir_counts`/`comments` panics shipped. Extract the per-row decode into a testable helper that takes the raw column values; unit-test both the gated-off (`None`) and populated shapes for all six sub-selects. Review rule applied at the same time: any column that can be NULL (CASE-gated, LEFT JOIN, optional) decodes via `try_get::<Option<…>>` — `r.get()` panics on NULL.
+
+| Stop | Tasks | Gate |
+|---|---|---|
+| S0 | 22.4.1 | `cargo test --lib` green including the new decode tests; a regression test that fails against the pre-fix non-Option decode |
+
+- [ ] **22.4.1** Extract the per-row decode from `propfind_batch_cte` into a testable function; unit tests for each sub-select's gated-off (NULL) and populated shapes; audit the remaining `r.get()` decode sites.
+
+## 22.5 — Narrow-prop scenarios in the diff suite
+
+Goal: exercise the gates-off path — the desktop client's explicit `<d:prop>` body — which the allprop-only suite never sends, leaving the gated sub-selects (and their NULL decodes) untested end to end.
+
+**Decisions:** new scenarios replaying a narrow prop body (the desktop set: `d:getetag`/`getlastmodified`/`getcontentlength`/`resourcetype` + `oc:id`/`permissions`/`size`/`favorite`/`share-types` + `nc:system-tags` — no `contained-*-count`, no comments). Same body to both sides; the 22.6 cardinality assertion applies. The 22.3 gating probe hooks the same shape.
+
+| Stop | Tasks | Gate |
+|---|---|---|
+| S0 | 22.5.1 | New scenario(s) green on the fixed binary; `make diff-suite` green |
+
+- [ ] **22.5.1** The narrow-prop scenario(s): depth-1 on a directory with shares/tags/comments, plus an allprop control.
+
+## 22.6 — Response-content assertions for propfind scenarios
+
+Goal: the propfind scenarios must fail when the SUT's listing is empty or truncated — delta-comparison alone is blind to response correctness (a panicked SUT request writes no deltas and passes, as the 2026-08-14 milestone demonstrated).
+
+**Decisions:** compare structural invariants between SUT and oracle responses — the `<d:response>` cardinality and the set of `d:href`s — not bytes (the XML shapes differ in known ways). Cheap, and it catches the empty/truncated-listing class.
+
+| Stop | Tasks | Gate |
+|---|---|---|
+| S0 | 22.6.1 | Suite green with the assertion; a forced empty listing fails the scenario |
+
+- [ ] **22.6.1** The cardinality/href-set assertion in the propfind scenarios' replay comparison.
+
+## 22.7 — "No PG ERRORs" milestone assertion
+
+Goal: the milestone procedure must fail if the SUT's Postgres log window contains ERROR lines — the desync class (44 errors during the 2026-08-14 milestone) passed every gate.
+
+**Decisions:** capture the SUT PG error count before/after the suite run (the perf-gate already drives the superuser DSN); a non-zero delta → fail. Fold into `make diff-suite` or `make perf-gate`.
+
+| Stop | Tasks | Gate |
+|---|---|---|
+| S0 | 22.7.1 | Suite green with the assertion; a forced PG error fails the run |
+
+- [ ] **22.7.1** The error-count assertion in the milestone procedure.
+
+---
+
 ## Deviations from the task descriptions
 
 - **T7.2** — `custom_properties_batch` is NOT folded into the CTE (it stays a separate gated statement). The `>250`-char property-path hash (`format_property_path`) is Rust-side, and the children's names — needed to build those paths — only exist after the query returns, so a CTE sub-select would need pgcrypto (not guaranteed) or an `unnest` indirection over paths built from a second query. One statement either way; the CTE still collapses 5 families → 1.
