@@ -15,6 +15,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::Method;
 
 use crate::auth;
+use crate::php;
 use crate::report::{LoadReport, LoadStats, ProbeStat, Stats};
 
 /// One read-only probe request.
@@ -112,9 +113,12 @@ pub async fn bench(
     }
 
     // Clear throttler state, then authenticate with per-instance app tokens
-    // (hot path — see `auth`).
+    // (hot path — see `auth`).  Both instances' php-fpm must also run without
+    // xdebug's develop mode — the ~2× measurement tax — before measuring.
     auth::reset_throttle(&cfg.sut).await;
     auth::reset_throttle(&cfg.oracle).await;
+    php::ensure_xdebug_off(&cfg.sut);
+    php::ensure_xdebug_off(&cfg.oracle);
     let (sut_user, sut_pass) =
         auth::instance_creds(&cfg.sut, &cfg.admin_user, &cfg.admin_pass).await?;
     let (oracle_user, oracle_pass) =

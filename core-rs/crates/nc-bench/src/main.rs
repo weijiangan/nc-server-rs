@@ -16,6 +16,7 @@
 mod auth;
 mod budget;
 mod load;
+mod php;
 mod report;
 mod scenario;
 

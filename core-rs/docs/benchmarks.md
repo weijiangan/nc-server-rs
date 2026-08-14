@@ -48,6 +48,16 @@ pure-PHP oracle on `:9091`.
   silently adds ~200 ms to every measured request for half a day. The harness
   deletes `oc_bruteforce_attempts` on both sides before measuring (dev-stack
   test bookkeeping).
+- **xdebug is forced off before measuring.** The dev image ships xdebug, and
+  a stack brought up without `PHP_XDEBUG_MODE=off` runs it in `develop` mode —
+  develop instruments every function call, ~2.1-2.6× on PHP request handling
+  (status.php 4.9 ms → 13.5 ms on this stack). A drifted stack silently
+  taxes every PHP-side number and inflates the ratios. `nc-bench` writes a
+  `zz-bench-xdebug.ini` override (`xdebug.mode=off`) into each container's
+  ephemeral `/usr/local/etc/php/conf.d` layer and reloads php-fpm before
+  measuring — no persistent config is touched, and the override dies with the
+  container on the next bring-up, so a drifted stack is re-enforced on every
+  run.
 - **One client per side for the whole run.** Per-scenario connection churn
   through the proxy is avoided by reusing one reqwest client per side, like
   a real client. (The proxy's upstream keepalive pool only misbehaves after

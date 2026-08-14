@@ -17,6 +17,7 @@ use nc_difftest::config::Config;
 use nc_difftest::scenario::{self, OpResult, Scenario};
 
 use crate::auth;
+use crate::php;
 use crate::report::{self, OpStat, ScenarioReport, Stats};
 
 /// Directory holding the difftest scenario YAMLs.  Overridable for installed
@@ -42,9 +43,12 @@ pub async fn bench(
     )?;
 
     // Clear throttler state, then authenticate with per-instance app tokens
-    // (hot path — see `auth`).
+    // (hot path — see `auth`).  Both instances' php-fpm must also run without
+    // xdebug's develop mode — the ~2× measurement tax — before measuring.
     auth::reset_throttle(&cfg.sut).await;
     auth::reset_throttle(&cfg.oracle).await;
+    php::ensure_xdebug_off(&cfg.sut);
+    php::ensure_xdebug_off(&cfg.oracle);
     let (sut_user, sut_pass) =
         auth::instance_creds(&cfg.sut, &cfg.admin_user, &cfg.admin_pass).await?;
     let (oracle_user, oracle_pass) =
