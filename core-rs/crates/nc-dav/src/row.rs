@@ -791,8 +791,11 @@ pub async fn get_share_max_permissions(pool: &DbPool, prefix: &str, uid: &str, f
          WHERE (uid_owner = $1 OR uid_initiator = $2) AND file_source = $3 \
          AND share_type IN (0,1,3)"
     );
+    // `oc_share.permissions` is `smallint` (INT2) — `MAX()` preserves the
+    // argument type, so the decode must be i16 (sqlx Postgres is strict;
+    // an i32 read off INT2 throws ColumnDecode and drops the request).
     match pool {
-        DbPool::Pg(p) => sqlx::query_scalar::<Postgres, Option<i32>>(&sql)
+        DbPool::Pg(p) => sqlx::query_scalar::<Postgres, Option<i16>>(&sql)
             .bind(uid)
             .bind(uid)
             .bind(fileid)
@@ -801,6 +804,7 @@ pub async fn get_share_max_permissions(pool: &DbPool, prefix: &str, uid: &str, f
             .ok()
             .flatten()
             .flatten()
+            .map(i32::from)
             .unwrap_or(31),
         DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, Option<i32>>(&sql)
             .bind(uid)
