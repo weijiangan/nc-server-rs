@@ -228,24 +228,11 @@ pub fn build_props(
     // deck apps). PHP answers requested-but-unknown properties with a
     // 404 propstat, which the patched dav-server now produces
     // automatically.
-    // ── DAV quota (unlimited) ─────────────────────────────────────────────
-    //
-    // dav-server emits `{DAV:}quota-available-bytes` only when
-    // `DavFileSystem::get_quota()` returns `Some(total)`.  We return
-    // `None` (unlimited quota) so dav-server suppresses that prop and we
-    // inject the Nextcloud sentinel value `-3` (SPACE_UNLIMITED, REQ §6.5)
-    // here without producing a duplicate.
-    //
-    // `{DAV:}quota-used-bytes` is handled entirely by dav-server using
-    // the `used` first-element from `get_quota()` and does NOT need to
-    // appear here.
-    //
-    // Directories only: PHP's FilesPlugin registers quota-available-bytes
-    // for collections; FILE nodes get a 404 propstat (verified against the
-    // web files app's propfind, 2026-08-14).
-    if meta.is_dir_flag {
-        props.push(make_prop("quota-available-bytes", "d", "DAV:", "-3"));
-    }
+    // {DAV:}quota-available-bytes / quota-used-bytes are emitted by
+    // dav-server from `get_quota()` — the `-3` SPACE_UNLIMITED sentinel
+    // when the total is absent — gated to DIRECTORY nodes by the 2026-08-14
+    // vendored patch (files answer a 404 propstat like PHP's FilesPlugin,
+    // web files app A/B).
     // {DAV:}displayname — PHASE-12.2 (value computed above).
     props.push(make_prop("displayname", "d", "DAV:", displayname_val));
 
@@ -1326,7 +1313,12 @@ mod tests {
     /// sentinel without producing a duplicate.
     #[test]
     fn quota_available_bytes_dir_only() {
-        // FILE node: the prop must not be emitted (→404 propstat, PHP parity).
+        // The quota props are NOT emitted by build_props since 2026-08-14:
+        // dav-server emits them from get_quota() — the -3 SPACE_UNLIMITED
+        // sentinel for the absent total — gated to DIRECTORY nodes by the
+        // vendored handler (PHP's FilesPlugin registers them for collections
+        // only, web files app A/B).  This pins the never-from-build_props
+        // invariant so the emission cannot regress into a duplicate.
         let props = build_props(
             &test_meta(None),
             "inst",
@@ -1348,38 +1340,8 @@ mod tests {
         assert!(
             props
                 .iter()
-                .all(|p| p.name != "quota-available-bytes"),
-            "files must NOT carry {{DAV:}}quota-available-bytes"
-        );
-        // DIRECTORY node: -3 (SPACE_UNLIMITED).
-        let mut dir_meta = test_meta(None);
-        dir_meta.is_dir_flag = true;
-        let props = build_props(
-            &dir_meta,
-            "inst",
-            "u",
-            "U",
-            true,
-            "",
-            0,
-            0,
-            false,
-            false,
-            31,
-            "",
-            "",
-            false,
-            &[],
-            false,
-        );
-        let p = props
-            .iter()
-            .find(|p| p.name == "quota-available-bytes" && p.namespace.as_deref() == Some("DAV:"))
-            .expect("{DAV:}quota-available-bytes must be present on directories");
-        let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
-        assert!(
-            xml.contains("-3"),
-            "quota-available-bytes must be -3 (SPACE_UNLIMITED): {xml}"
+                .all(|p| p.name != "quota-available-bytes" && p.name != "quota-used-bytes"),
+            "quota props must come from dav-server's get_quota emission, not build_props"
         );
     }
 

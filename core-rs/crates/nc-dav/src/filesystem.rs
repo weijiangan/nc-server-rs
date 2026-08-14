@@ -2904,13 +2904,10 @@ impl DavFileSystem for NcFileSystem {
                 None => 0,
             };
 
-            // Return `None` for `total` — unlimited quota.
-            //
-            // dav-server only emits `{DAV:}quota-available-bytes` when the
-            // second tuple element is `Some`; by returning `None` we suppress
-            // its internal emit.  `get_props()` then injects
-            // `quota-available-bytes = -3` (SPACE_UNLIMITED, REQ §6.5) via
-            // `build_props()` without producing a duplicate.
+            // Unlimited quota: return `None` for total — dav-server emits
+            // the Nextcloud SPACE_UNLIMITED sentinel `-3` (REQ §6.5) for
+            // DIRECTORY nodes when the total is absent (2026-08-14 vendored
+            // patch); files answer a 404 propstat like PHP's FilesPlugin.
             //
             // Per-user quota from `oc_preferences` is deferred to a later phase.
             Ok((used, None))
