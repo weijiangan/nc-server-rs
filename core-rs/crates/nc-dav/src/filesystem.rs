@@ -157,6 +157,8 @@ pub(crate) struct PropfindBatchInner {
     /// fileid → (count, unread) for `{oc:}comments-*`.
     pub(crate) comments: HashMap<i64, (i64, i64)>,
     /// fileid → system tags for `{nc:}system-tags`.
+    /// fileid → parsed `oc_files_metadata.json` for `nc:metadata-*`.
+    pub(crate) metadata: HashMap<i64, serde_json::Value>,
     pub(crate) system_tags: HashMap<i64, Vec<row::SystemTagRow>>,
     /// raw `fc_path` → custom properties from `oc_properties`.
     pub(crate) custom_props: HashMap<String, Vec<(String, String, i16)>>,
@@ -203,6 +205,18 @@ impl NcFileSystem {
             Some(list) => list
                 .iter()
                 .any(|(n, nm)| n.as_deref() == Some(ns) && nm == name),
+        }
+    }
+
+    /// Any requested prop in `ns` whose name starts with `prefix` (the
+    /// `nc:metadata-*` family is open-ended — the keys come from the
+    /// per-file metadata row, not a fixed list).
+    pub(crate) fn prop_requested_prefix(&self, ns: &str, prefix: &str) -> bool {
+        match &self.requested_props {
+            None => true,
+            Some(list) => list
+                .iter()
+                .any(|(n, nm)| n.as_deref() == Some(ns) && nm.starts_with(prefix)),
         }
     }
 
@@ -1580,6 +1594,7 @@ impl DavFileSystem for NcFileSystem {
             let want_comments = self.prop_requested(oc_ns, "comments-count")
                 || self.prop_requested(oc_ns, "comments-unread");
             let want_system_tags = self.prop_requested(nc_ns, "system-tags");
+            let want_metadata = self.prop_requested_prefix(nc_ns, "metadata-");
             // §9.5 prefetch — gated in `get_props` too (same predicate), or
             // skipping the prefetch would re-introduce one query per child.
             let want_tags = self.prop_requested(oc_ns, "favorite")
@@ -1618,6 +1633,7 @@ impl DavFileSystem for NcFileSystem {
                         comments: want_comments,
                         system_tags: want_system_tags,
                         tags: want_tags,
+                        metadata: want_metadata,
                     },
                 )
                 .await;
@@ -1631,6 +1647,7 @@ impl DavFileSystem for NcFileSystem {
                     system_tags,
                     tags,
                     dir_tags,
+                    metadata,
                 } = cte;
                 let cte = Some((
                     dir_counts,
@@ -1640,6 +1657,7 @@ impl DavFileSystem for NcFileSystem {
                     system_tags,
                     tags,
                     dir_tags,
+                    metadata,
                 ));
                 (children, extended, cte)
             } else {
@@ -1758,6 +1776,7 @@ impl DavFileSystem for NcFileSystem {
                 system_tags,
                 tags,
                 dir_tags,
+                metadata,
             )) = cte
             {
                 {
@@ -1783,6 +1802,7 @@ impl DavFileSystem for NcFileSystem {
                         batch_inner.comments.insert(*id, (c, u));
                     }
                     batch_inner.system_tags.extend(system_tags);
+                    batch_inner.metadata.extend(metadata);
                 }
             } else {
                 // SQLite: the batched families (T6.1/T6.3 merges), gated per
@@ -2928,6 +2948,7 @@ impl DavFileSystem for NcFileSystem {
                 share_details,
                 (comments_count, comments_unread),
                 system_tags,
+                metadata_json,
                 custom_props,
             ) = tokio::join!(
                 // Resolve {oc:}owner-display-name and the sharing mask from
@@ -3093,7 +3114,26 @@ impl DavFileSystem for NcFileSystem {
                         Vec::new()
                     }
                 },
-                // ── Custom properties from oc_properties (task §10.11) ────
+                // ── files_metadata json (nc:metadata-* family)
+                // One json row per file (files only - dirs have no row; the
+                // in-batch miss means "no metadata", matching PHP).
+                async {
+                    if do_content {
+                        if { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_contains(&inner, |i| &i.children, &meta.fileid) } {
+                            { let inner = self.propfind_batch.inner.lock().expect("propfind batch lock"); batch_get(&inner, |i| &i.metadata, &meta.fileid) }
+                        } else {
+                            row::get_metadata_json(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                meta.fileid,
+                            )
+                            .await
+                        }
+                    } else {
+                        None
+                    }
+                },
+                // Custom properties from oc_properties (task §10.11) ────
                 // Needs only the fc path + uid (not the fileid); keyed by
                 // path in the batch (Phase 18.1).
                 async {
@@ -3268,6 +3308,8 @@ impl DavFileSystem for NcFileSystem {
 
             // ── Append Phase 12 extended properties ──────────────────────────
             if do_content {
+                crate::props::add_metadata_props(&mut props, metadata_json.as_ref());
+
                 crate::props::add_phase12_props(
                     &mut props,
                     &crate::props::Phase12PropCtx {

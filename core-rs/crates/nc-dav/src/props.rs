@@ -221,26 +221,38 @@ pub fn build_props(
         // (FilesPlugin.php:350-352): "[]" when empty, NOT the empty string.
         // TODO(PHASE-12): real per-share attributes.
         make_prop("share-attributes", "nc", NC_NS, "[]"),
-        // {nc:}acl-can-* and {nc:}remind-me-at were removed in PHASE-12.1:
-        // they do not exist in PHP core (they belong to the groupfolders /
-        // deck apps). PHP answers requested-but-unknown properties with a
-        // 404 propstat, which the patched dav-server now produces
-        // automatically.
-        // ── DAV quota (unlimited) ─────────────────────────────────────────
-        //
-        // dav-server emits `{DAV:}quota-available-bytes` only when
-        // `DavFileSystem::get_quota()` returns `Some(total)`.  We return
-        // `None` (unlimited quota) so dav-server suppresses that prop and we
-        // inject the Nextcloud sentinel value `-3` (SPACE_UNLIMITED, REQ §6.5)
-        // here without producing a duplicate.
-        //
-        // `{DAV:}quota-used-bytes` is handled entirely by dav-server using
-        // the `used` first-element from `get_quota()` and does NOT need to
-        // appear here.
-        make_prop("quota-available-bytes", "d", "DAV:", "-3"),
-        // {DAV:}displayname — PHASE-12.2 (value computed above).
-        make_prop("displayname", "d", "DAV:", displayname_val),
+        // {nc:}reminder-due-date — the files_reminders app registers the prop
+        // for EVERY node, empty when no reminder is set (verified against the
+        // web files app's propfind, 2026-08-14 — PHP answers 200 with an
+        // empty value; Rust has no reminders yet, so always empty).
+        make_prop("reminder-due-date", "nc", NC_NS, ""),
     ];
+
+    // {nc:}acl-can-* and {nc:}remind-me-at were removed in PHASE-12.1:
+    // they do not exist in PHP core (they belong to the groupfolders /
+    // deck apps). PHP answers requested-but-unknown properties with a
+    // 404 propstat, which the patched dav-server now produces
+    // automatically.
+    // ── DAV quota (unlimited) ─────────────────────────────────────────────
+    //
+    // dav-server emits `{DAV:}quota-available-bytes` only when
+    // `DavFileSystem::get_quota()` returns `Some(total)`.  We return
+    // `None` (unlimited quota) so dav-server suppresses that prop and we
+    // inject the Nextcloud sentinel value `-3` (SPACE_UNLIMITED, REQ §6.5)
+    // here without producing a duplicate.
+    //
+    // `{DAV:}quota-used-bytes` is handled entirely by dav-server using
+    // the `used` first-element from `get_quota()` and does NOT need to
+    // appear here.
+    //
+    // Directories only: PHP's FilesPlugin registers quota-available-bytes
+    // for collections; FILE nodes get a 404 propstat (verified against the
+    // web files app's propfind, 2026-08-14).
+    if meta.is_dir_flag {
+        props.push(make_prop("quota-available-bytes", "d", "DAV:", "-3"));
+    }
+    // {DAV:}displayname — PHASE-12.2 (value computed above).
+    props.push(make_prop("displayname", "d", "DAV:", displayname_val));
 
     // ── PHASE-12.1 value discipline ────────────────────────────────────────
     // Properties whose PHP handlers return null — or that PHP does not
@@ -508,6 +520,9 @@ fn prop_names() -> Vec<DavProp> {
         name_only("share-attributes", "nc", NC_NS),
         name_only("sharees", "nc", NC_NS),
         name_only("system-tags", "nc", NC_NS),
+        // {nc:}reminder-due-date — files_reminders registers the prop for all
+        // nodes (empty value; emitted unconditionally in build_props).
+        name_only("reminder-due-date", "nc", NC_NS),
         // {nc:}acl-can-* and {nc:}remind-me-at are not PHP-core properties
         // (PHASE-12.1) — removed.
         name_only("displayname", "d", "DAV:"),
@@ -1311,13 +1326,44 @@ mod tests {
 
     // ── DAV quota properties (REQ §6.5 / PHASE-4.7) ──────────────────────────────
 
-    /// `{DAV:}quota-available-bytes` must be present with value "-3" (SPACE_UNLIMITED).
-    /// dav-server suppresses its own emit when `get_quota()` returns `None` for total,
-    /// so we inject it here without producing a duplicate.
+    /// `{DAV:}quota-available-bytes` is directory-only, value "-3"
+    /// (SPACE_UNLIMITED) on dirs, absent (→404 propstat) on files — PHP's
+    /// FilesPlugin registers the prop for collections only (verified against
+    /// the web files app's propfind, 2026-08-14).  dav-server suppresses its
+    /// own emit when `get_quota()` returns `None` for total, so we inject the
+    /// sentinel without producing a duplicate.
     #[test]
-    fn quota_available_bytes_is_minus_three() {
+    fn quota_available_bytes_dir_only() {
+        // FILE node: the prop must not be emitted (→404 propstat, PHP parity).
         let props = build_props(
             &test_meta(None),
+            "inst",
+            "u",
+            "U",
+            true,
+            "",
+            0,
+            0,
+            false,
+            false,
+            31,
+            "",
+            "",
+            false,
+            &[],
+            false,
+        );
+        assert!(
+            props
+                .iter()
+                .all(|p| p.name != "quota-available-bytes"),
+            "files must NOT carry {{DAV:}}quota-available-bytes"
+        );
+        // DIRECTORY node: -3 (SPACE_UNLIMITED).
+        let mut dir_meta = test_meta(None);
+        dir_meta.is_dir_flag = true;
+        let props = build_props(
+            &dir_meta,
             "inst",
             "u",
             "U",
@@ -1337,44 +1383,12 @@ mod tests {
         let p = props
             .iter()
             .find(|p| p.name == "quota-available-bytes" && p.namespace.as_deref() == Some("DAV:"))
-            .expect("{DAV:}quota-available-bytes must be present");
+            .expect("{DAV:}quota-available-bytes must be present on directories");
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
         assert!(
             xml.contains("-3"),
             "quota-available-bytes must be -3 (SPACE_UNLIMITED): {xml}"
         );
-    }
-
-    /// `{DAV:}quota-available-bytes` must NOT appear under the OC or NC namespace.
-    #[test]
-    fn quota_available_bytes_not_in_oc_or_nc_namespace() {
-        let props = build_props(
-            &test_meta(None),
-            "inst",
-            "u",
-            "U",
-            true,
-            "",
-            0,
-            0,
-            false,
-            false,
-            31,
-            "",
-            "",
-            false,
-            &[],
-            false,
-        );
-        for p in &props {
-            if p.name == "quota-available-bytes" {
-                let ns = p.namespace.as_deref().unwrap_or("");
-                assert_eq!(
-                    ns, "DAV:",
-                    "quota-available-bytes must be in DAV: namespace, got {ns}"
-                );
-            }
-        }
     }
 
     // ── make_prop ─────────────────────────────────────────────────────────────
@@ -1385,5 +1399,27 @@ mod tests {
         let xml = std::str::from_utf8(p.xml.as_ref().unwrap()).unwrap();
         assert!(xml.contains("42"), "should contain value: {xml}");
         assert!(xml.contains("fileid"), "should contain name:  {xml}");
+    }
+}
+
+/// Emit the `nc:metadata-*` props from the file's `oc_files_metadata.json`
+/// (2026-08-14).  PHP's FilesPlugin (FilesPlugin.php:454-455) handles
+/// `{nc:}metadata-{key}` for every key of the row; the value is the key's
+/// envelope `.value` field (the blurhash string).  The web files app renders
+/// `metadata-blurhash` as the image preview placeholder — the previous 404
+/// left it blank.  Dirs have no metadata row; the absent json emits nothing
+/// (→404 propstat, matching PHP).
+pub fn add_metadata_props(props: &mut Vec<DavProp>, json: Option<&serde_json::Value>) {
+    let Some(serde_json::Value::Object(map)) = json else { return };
+    for (key, envelope) in map {
+        let value = envelope
+            .get("value")
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default();
+        props.push(make_prop(&format!("metadata-{key}"), "nc", NC_NS, &value));
     }
 }

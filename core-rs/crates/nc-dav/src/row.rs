@@ -820,6 +820,33 @@ pub async fn get_share_max_permissions(pool: &DbPool, prefix: &str, uid: &str, f
 /// Query: `SELECT note FROM oc_share WHERE file_source = ? AND note != ''
 /// ORDER BY stime DESC LIMIT 1`.
 ///
+/// The file's `oc_files_metadata.json` (parsed) — `None` when the file has
+/// no metadata row (directories never do).  PHP's FilesPlugin handles
+/// `{nc:}metadata-{key}` per key of this row (2026-08-14).
+pub async fn get_metadata_json(
+    pool: &DbPool,
+    prefix: &str,
+    fileid: i64,
+) -> Option<serde_json::Value> {
+    let table = format!("{prefix}files_metadata");
+    let sql = format!("SELECT json FROM {table} WHERE file_id = $1");
+    let fetched: Option<String> = match pool {
+        DbPool::Pg(p) => sqlx::query_scalar::<Postgres, String>(&sql)
+            .bind(fileid)
+            .fetch_optional(p)
+            .await
+            .ok()
+            .flatten(),
+        DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, String>(&sql)
+            .bind(fileid)
+            .fetch_optional(p)
+            .await
+            .ok()
+            .flatten(),
+    };
+    fetched.and_then(|j| serde_json::from_str(&j).ok())
+}
+
 /// Returns an empty string when no note exists (REQ §6.5, PHASE-7.6).
 pub async fn get_share_note(pool: &DbPool, prefix: &str, fileid: i64) -> String {
     let sql = format!(
@@ -1064,6 +1091,9 @@ pub struct PropfindCte {
     /// Per-child `oc_vcategory` category strings (favorite sentinel included)
     /// — the tag prefetch folded into the CTE (22.2).  Missing = no tags.
     pub tags: std::collections::HashMap<i64, Vec<String>>,
+    /// Per-child `oc_files_metadata.json` (parsed) — the `nc:metadata-*`
+    /// family.  Missing when gated off or no metadata row.
+    pub metadata: std::collections::HashMap<i64, serde_json::Value>,
     /// The directory's own tags (the prefetch covered the dir fileid too).
     /// Only populated when the dir has children (the uncorrelated sub-select
     /// rides on the kid rows); an empty dir falls back to get_props's
@@ -1102,6 +1132,8 @@ pub struct PropfindGates {
     pub comments: bool,
     pub system_tags: bool,
     pub tags: bool,
+    /// Any requested prop in the `nc:metadata-*` family (files_metadata).
+    pub metadata: bool,
 }
 
 pub async fn propfind_batch_cte(
@@ -1162,7 +1194,9 @@ pub async fn propfind_batch_cte(
                  FROM {prefix}vcategory_to_object vco \
                  JOIN {prefix}vcategory vc ON vc.id = vco.categoryid \
                  WHERE vco.objid = $1 AND vco.type = 'files' \
-                   AND vc.uid = $4 AND vc.type = 'files')  END) AS dir_tags \
+                   AND vc.uid = $4 AND vc.type = 'files')  END) AS dir_tags, \
+                (CASE WHEN $10 THEN (SELECT fm.json FROM {prefix}files_metadata fm \
+                 WHERE fm.file_id = k.fileid)  END) AS metadata \
          FROM kids k",
         prefix = prefix,
     )
@@ -1179,6 +1213,7 @@ pub async fn propfind_batch_cte(
             .bind(gates.comments)
             .bind(gates.system_tags)
             .bind(gates.tags)
+            .bind(gates.metadata)
             .fetch_all(p)
             .await
         {
@@ -1195,6 +1230,7 @@ pub async fn propfind_batch_cte(
                     system_tags: std::collections::HashMap::new(),
                     tags: std::collections::HashMap::new(),
                     dir_tags: Vec::new(),
+                    metadata: std::collections::HashMap::new(),
                 };
             }
         },
@@ -1210,6 +1246,7 @@ pub async fn propfind_batch_cte(
                 system_tags: std::collections::HashMap::new(),
                 tags: std::collections::HashMap::new(),
                 dir_tags: Vec::new(),
+                metadata: std::collections::HashMap::new(),
             };
         }
     };
@@ -1224,6 +1261,7 @@ pub async fn propfind_batch_cte(
         system_tags: std::collections::HashMap::new(),
         tags: std::collections::HashMap::new(),
         dir_tags: Vec::new(),
+        metadata: std::collections::HashMap::new(),
     };
 
     // Shares across all kids: the notes + details split needs every row
@@ -1317,6 +1355,16 @@ pub async fn propfind_batch_cte(
         };
         if let Some(tags) = tags {
             out.tags.insert(fileid, tags);
+        }
+
+        // Metadata (files_metadata) — NULL when the gate is off or the file
+        // has no metadata row.  The column is TEXT on Postgres, so decode as
+        // a string and parse in Rust (sqlx rejects a direct Value decode of
+        // a text column).
+        if let Ok(Some(v)) = r.try_get::<Option<String>, _>("metadata") {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&v) {
+                out.metadata.insert(fileid, parsed);
+            }
         }
 
         // Shares — collect for the split below (needs the whole set for the
