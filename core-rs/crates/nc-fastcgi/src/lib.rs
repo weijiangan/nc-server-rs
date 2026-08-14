@@ -1014,7 +1014,7 @@ pub async fn fetch_php_capabilities(
     };
 
     // Extract ocs.data.capabilities from the OCS v2 envelope.
-    let caps = json
+    let mut caps = json
         .get("ocs")
         .and_then(|ocs| ocs.get("data"))
         .and_then(|data| data.get("capabilities"))
@@ -1035,7 +1035,47 @@ pub async fn fetch_php_capabilities(
         tracing::debug!(?keys, "capabilities-fetch: received PHP-app capabilities");
     }
 
+    // Normalize self-hosted absolute URLs (2026-08-14): PHP's
+    // `getAbsoluteURL()` inside the shim's capabilities fetch has no HTTP
+    // request context, so it derives `http://localhost/...` (or the config
+    // host) — absolute URLs the web app then uses as img srcs (theming
+    // logo/favicon/background), which an https-deployed page's CSP
+    // `img-src 'self'` blocks.  A URL whose path starts with a Nextcloud
+    // route is self-hosted by construction; the scheme+host are stripped so
+    // the browser resolves the relative path against the page origin.
+    if let Some(c) = &mut caps {
+        normalize_capability_urls(c);
+    }
+
     caps
+}
+
+/// Rewrite self-hosted absolute URLs in a capabilities payload to path-only
+/// form (see the call sites above).
+fn normalize_capability_urls(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => {
+            let rest = s
+                .strip_prefix("http://")
+                .or_else(|| s.strip_prefix("https://"));
+            if let Some(rest) = rest {
+                let path_start = rest.find('/').map(|i| i + 1).unwrap_or(rest.len());
+                let path = &rest[path_start..];
+                if path.starts_with("core/")
+                    || path.starts_with("apps/")
+                    || path.starts_with("index.php/")
+                    || path.starts_with("remote.php/")
+                    || path.starts_with("ocs/")
+                    || path.starts_with("themes/")
+                {
+                    *s = format!("/{path}");
+                }
+            }
+        }
+        serde_json::Value::Array(a) => a.iter_mut().for_each(normalize_capability_urls),
+        serde_json::Value::Object(o) => o.values_mut().for_each(normalize_capability_urls),
+        _ => {}
+    }
 }
 
 // ── fetch_php_public_capabilities ─────────────────────────────────────────────
@@ -1168,7 +1208,7 @@ pub async fn fetch_php_public_capabilities(fpm: &FastCgiState) -> Option<serde_j
         }
     };
 
-    let caps = json
+    let mut caps = json
         .get("ocs")
         .and_then(|ocs| ocs.get("data"))
         .and_then(|data| data.get("capabilities"))
@@ -1178,6 +1218,12 @@ pub async fn fetch_php_public_capabilities(fpm: &FastCgiState) -> Option<serde_j
         tracing::warn!("public-caps-fetch: PHP response missing ocs.data.capabilities");
     } else {
         tracing::debug!("public-caps-fetch: received IPublicCapability PHP-app capabilities");
+    }
+
+    // Same self-hosted absolute-URL normalization as the authenticated fetch
+    // (2026-08-14 — the public theming capability carries the same URLs).
+    if let Some(c) = &mut caps {
+        normalize_capability_urls(c);
     }
 
     caps
