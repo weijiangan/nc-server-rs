@@ -644,60 +644,88 @@ measure worse; the batch families are verified working on Postgres.
 Same harness, same stack shape, same 20-scenario corpus as the baseline
 above.  Scenario totals are per-scenario means of 5 iterations; the load
 probes are 4 workers × 10 s.  The 08-14 numbers are one clean run on the
-fixed binary (post-T8.1), statement logging off.
+fixed binary (post-T8.1), statement logging off, with the harness's xdebug
+enforcement active (see Methodology).  The first milestone run measured
+xdebug's `develop` mode on both php-fpms (~2.1-2.6× PHP tax — see the
+phase-23 Changes log); the php columns below are the corrected re-measurement
+and land on the 08-10 baseline, so these ratios are the honest comparison.
 
 ### Scenario totals (ms; ratio = php/rust)
 
 | scenario | rust 08-10 | rust 08-14 | php 08-10 | php 08-14 | ratio 08-10 | ratio 08-14 |
 |---|---|---|---|---|---|---|
-| 01_propfind_readonly | 2.9 | 3.45 | 27.4 | 50.1 | 9.6× | **14.5×** |
-| 10_put_get | 55.0 | 65.0 | 124.8 | 205.1 | 2.3× | **3.2×** |
-| 10_put_get_delete | 128.1 | 128.0 | 245.3 | 369.0 | 1.9× | **2.9×** |
-| 11_mkdir_nested | 39.3 | 37.3 | 190.5 | 302.1 | 4.8× | **8.1×** |
-| 12_move_rename | 175.2 | 175.3 | 342.1 | 494.6 | 2.0× | **2.8×** |
-| 13_copy | 201.0 | 197.4 | 462.1 | 660.3 | 2.3× | **3.3×** |
-| 14_propfind_depth1 | 11.9 | **6.0** | 58.4 | 101.9 | 4.9× | **17.0×** |
-| 15_proppatch_favorite_tags | 7.5 | 7.0 | 33.7 | 56.5 | 4.5× | **8.1×** |
-| 16_overwrite_put | 176.9 | **127.4** | 278.8 | 374.7 | 1.6× | **2.9×** |
-| 17_delete_to_trash | 148.7 | 221.7 | 236.4 | 420.0 | 1.6× | 1.9× |
-| 18_explicit_mtime | 121.9 | 146.1 | 298.6 | 460.9 | 2.4× | **3.2×** |
-| 20_chunked_upload_v2 | 50.4 | 45.6 | 748.5 | 1046.7 | 14.8× | **23.0×** |
-| 21_bulk_upload | 1.2 | **0.66** | 24.0 | 49.3 | 19.8× | **75.3×** |
-| 22_invalid_filename | 1.0 | **0.54** | 24.6 | 51.0 | 25.8× | **94.7×** |
-| 23_quota_exceeded | 67.7 | 99.9 | 94.7 | 160.1 | 1.4× | 1.6× |
-| 24_checksum_upload | 60.7 | 57.6 | 245.7 | 369.1 | 4.0× | **6.4×** |
-| 25_preview_image | 92.4 | 74.3 | 93.1 | 76.0 | 1.0× | 1.0× |
-| 26_preview_unpreviewable | 83.0 | 99.2 | 131.4 | 179.9 | 1.6× | 1.8× |
-| 27_imaginary_preview | 106.9 | 74.6 | 107.4 | 74.8 | 1.0× | 1.0× |
-| 30_share_create_selfcheck | 97.9 | 160.6 | 101.0 | 160.9 | 1.0× | 1.0× |
+| 01_propfind_readonly | 2.9 | 3.22 | 27.4 | 24.45 | 9.6× | 7.59× |
+| 10_put_get | 55.0 | 61.31 | 124.8 | 131.02 | 2.3× | 2.14× |
+| 10_put_get_delete | 128.1 | 129.66 | 245.3 | 242.21 | 1.9× | 1.87× |
+| 11_mkdir_nested | 39.3 | 37.38 | 190.5 | 183.06 | 4.8× | 4.90× |
+| 12_move_rename | 175.2 | 179.48 | 342.1 | 341.21 | 2.0× | 1.90× |
+| 13_copy | 201.0 | 205.56 | 462.1 | 465.52 | 2.3× | 2.26× |
+| 14_propfind_depth1 | 11.9 | **6.07** | 58.4 | 54.16 | 4.9× | **8.92×** |
+| 15_proppatch_favorite_tags | 7.5 | 11.92 | 33.7 | 32.69 | 4.5× | 2.74× |
+| 16_overwrite_put | 176.9 | **138.22** | 278.8 | 247.94 | 1.6× | 1.79× |
+| 17_delete_to_trash | 148.7 | **125.62** | 236.4 | 235.25 | 1.6× | 1.87× |
+| 18_explicit_mtime | 121.9 | 124.97 | 298.6 | 289.79 | 2.4× | 2.32× |
+| 20_chunked_upload_v2 | 50.4 | 49.50 | 748.5 | 745.62 | 14.8× | 15.06× |
+| 21_bulk_upload | 1.2 | **0.64** | 24.0 | 23.90 | 19.8× | **37.36×** |
+| 22_invalid_filename | 1.0 | **0.47** | 24.6 | 23.82 | 25.8× | **50.78×** |
+| 23_quota_exceeded | 67.7 | 65.52 | 94.7 | 91.15 | 1.4× | 1.39× |
+| 24_checksum_upload | 60.7 | 59.73 | 245.7 | 254.58 | 4.0× | 4.26× |
+| 25_preview_image | 92.4 | 75.18 | 93.1 | 78.79 | 1.0× | 1.05× |
+| 26_preview_unpreviewable | 83.0 | 85.55 | 131.4 | 121.06 | 1.6× | 1.42× |
+| 27_imaginary_preview | 106.9 | 74.90 | 107.4 | 75.62 | 1.0× | 1.01× |
+| 30_share_create_selfcheck | 97.9 | 95.67 | 101.0 | 95.73 | 1.0× | 1.00× |
 
 ### Load probes (4 workers, 10 s; req/s + p50 ms)
 
-| probe | rust 08-10 | rust 08-14 | php 08-10 | php 08-14 | ratio 08-14 |
-|---|---|---|---|---|---|
-| GET /status.php | 1921 (2.17) | 1676.8 (2.31) | 866 (4.50) | 324.8 (11.74) | 5.2× |
-| GET capabilities | 1192 (2.43) | 2048.5 (2.22) | 161 (23.06) | 82.9 (46.09) | 24.7× |
-| PROPFIND depth-0 | 1595 (2.33) | 1426.8 (2.27) | 163 (22.31) | 83.1 (46.60) | 17.2× |
-| PROPFIND depth-1 | 750 (4.58) | **1825.7 (2.33)** | 157 (23.37) | 80.6 (47.94) | 22.7× |
+| probe | rust 08-10 | rust 08-14 | php 08-10 | php 08-14 | ratio 08-10 | ratio 08-14 |
+|---|---|---|---|---|---|---|
+| GET /status.php | 1921 (2.17) | 2183.4 (1.84) | 866 (4.50) | 881.8 (4.36) | 2.2× | 2.48× |
+| GET capabilities | 1192 (2.43) | 1776.4 (2.20) | 161 (23.06) | 169.3 (22.87) | 7.4× | 10.49× |
+| PROPFIND depth-0 | 1595 (2.33) | 1604.4 (2.19) | 163 (22.31) | 171.3 (22.54) | 9.8× | 9.36× |
+| PROPFIND depth-1 | 750 (4.58) | **1135.1 (3.33)** | 157 (23.37) | 166.9 (22.92) | 4.8× | **6.80×** |
 
 ### Significance
 
-- **The oracle slowed ~1.8-2.2× across the board** (every php column is up
-  proportionally: 27→50, 124→205, 866→325 req/s, …).  Same binary, same
-  stack — the box is CPU-contended (the 08-14 run follows the suite + gate
-  on the same host).  This is why the *ratio* is the cross-run metric: it is
-  measured within one run, so the contention cancels.  The rust-side
-  absolute increases (17, 18, 23, 26, 30: +20-65%) track their php
-  counterparts — ratios flat-or-better — not regressions.
-- **The read path improved absolutely**: depth-1 PROPFIND 11.9 → 6.0 ms
-  (−50%; the T7 single-query CTE + 22.2-C gates + phase-21 concurrent
-  batches), and the depth-1 load probe 750 → 1826 req/s (+143%), p50 4.58 →
-  2.33 ms.  The GET op inside 10/17 is ~0.8-0.9 ms vs the baseline 1.3-1.4.
-- **Ratios improved in 18 of 20 scenarios**; 25/27 sit at parity by design
-  (shared Imaginary generation backend) and 30 at parity because it is
-  proxied PHP on both sides.  Headline wins: depth-1 PROPFIND 4.9× → 17.0×,
-  propfind_readonly 9.6× → 14.5×, chunked upload 14.8× → 23.0×, bulk upload
-  19.8× → 75.3×, invalid-filename 25.8× → 94.7×.
-- **Overwrite PUT improved absolutely** (16: 176.9 → 127.4 ms) — the
-  phase-22 write-path statement work; regular PUT is flat at p50 with noise
-  around it (the scenario mixes create + overwrite iterations).
+- **The oracle is at baseline speed — the first 08-14 run's "slowdown" was
+  xdebug, not the box.**  The milestone's initial table (php columns
+  ~1.8-2.6× worse, "box CPU contention") was invalid: the 08-13 `down -v`
+  reinstall had drifted both php-fpms into xdebug `develop` mode (~2.1-2.6×
+  per-request tax), which the first run measured and misattributed.  Under
+  the harness's xdebug enforcement every php value lands on the 08-10
+  baseline (status.php 866 → 881 req/s, capabilities 161 → 169, scenario
+  totals within ±5%).  The contaminated table is superseded; the root-cause
+  record lives in the phase-23 Changes log.
+- **The read path improved absolutely.**  depth-1 PROPFIND 11.9 → 6.07 ms
+  (−49%; the T7 single-query CTE + 22.2-C gates + phase-21 concurrent
+  batches), and the depth-1 load probe 750 → 1135 req/s (+51%), p50 4.58 →
+  3.33 ms (−27%) — the phase-21/22 win, now measured against a clean PHP.
+  The GET op inside 10/17 is ~0.8-0.9 ms vs the baseline 1.3-1.4.
+- **Ratios improved on the Rust-improved paths, flat elsewhere.**  Headline
+  wins: depth-1 PROPFIND 4.9× → 8.9×, bulk upload 19.8× → 37.4×,
+  invalid-filename 25.8× → 50.8×, capabilities load 7.4× → 10.5×.  Write
+  scenarios 16/17 also improved absolutely (176.9 → 138.2, 148.7 → 125.6).
+  25/27 sit at parity by design (shared Imaginary backend), 30 at parity
+  because it is proxied PHP on both sides — both now at their true ~1.0×.
+  Small scenarios (15: rust 11.92 vs 7.0-7.5 across other runs, re-run
+  confirmed 7.30) show the shared-host run-to-run band; load probes carry
+  ±30% run variance.
+- **25/27 improved absolutely only because the previews were cached.**  Both
+  sides dropped ~93-107 → ~75 ms because the 08-14 stack already had the
+  previews generated (milestone suite), while the 08-10 baseline generated
+  them cold during measurement.  The ratio is ~1.0 either way — not a
+  server change.
+- **The table's 01/10/12 deltas are 5-iteration-mean artifacts, not
+  regressions.**  Re-verified with the phase-21/22 methodology (30
+  iterations, same fixed binary): depth-1 root p50 2.21 ms (phase 21/22 band
+  2.09-2.68; the table's 3.10 was one tail iteration), SC=10 PUT p50 47.61 ms
+  (T9.2 measured 46.9 on 08-13), SC=12 total p50 167 ms (baseline 175.2).
+  The 5-iteration means catch the periodic tail (p90 ≈ 1.3-1.4× p50 on write
+  ops): mid-run Postgres autovacuum on the write-heavy `oc_filecache` (last
+  fired 05:33 UTC, inside the run window) plus the 5-min cron drainer tick —
+  dev-stack environmental, not code; the 30-iteration p50s are stable across
+  runs.
+- **The earlier "18/20 ratios improved, 17-94× headline" claim was an
+  xdebug artifact** (PHP inflated ~2× while Rust sat flat).  The honest
+  comparison: 5/20 ratios clearly improved (14, 16, 17, 21, 22); the rest
+  sit within the shared-host noise band, whose spread shows on the small
+  scenarios (01, 15, 26: −20-40%, one run each).

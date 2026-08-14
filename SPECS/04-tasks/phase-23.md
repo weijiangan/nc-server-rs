@@ -127,6 +127,31 @@ restates a task or the code.
   cleanup, so leftover `oc_share` rows + accumulated `oc_bruteforce_attempts`
   trip PHP's login throttler on the proxied share_create; the fix is the
   documented brute-force reset (delete both tables) before re-running.
+- 2026-08-14: **Milestone-comparison correction — the oracle "slowdown" was
+  xdebug `develop` mode, not box contention; the benchmark table above is
+  superseded by the re-measurement in `docs/benchmarks.md`.** The first 08-14
+  bench run's php columns were ~2× worse than baseline (status.php 13.5 ms
+  vs 4.5); the "box CPU contention" attribution in the entry above was wrong
+  — the host was idle (load 0.04) and Rust was unaffected.  A live bisect
+  pinned the cost inside `base.php`'s boot (15.3 ms CPU, dominated by the
+  Composer autoloader closure + DI/app registration; below-PHP layers all
+  measured fast: bare fpm 0.5 ms, Redis ~35 µs/op, opcache 99.98% hit, fs
+  stat ~1.5 µs).  Flipping `xdebug.mode` off dropped status.php to 4.9 ms —
+  the 08-10 baseline value — and the tax reproduced at ~2.1-2.6× on every
+  probe (status 13.5→4.9 ms, capabilities and propfind d1 ~2.1×).  Root
+  cause: `bootstrap.sh` rewrites `xdebug.ini` from `PHP_XDEBUG_MODE` at
+  container start (compose default `develop`); the 08-13 21:17 `down -v`
+  reinstall and subsequent recreations ran without the off override the
+  08-09/10 bring-up had effectively had, drifting both php-fpms into
+  develop.  The bruteforce throttle was excluded as a candidate: the oracle's
+  attempts table was empty and the formula's minimum non-zero delay is
+  0.1 s × 2^1 = 200 ms ≫ the observed +24 ms.  Fix: `nc-bench` now enforces
+  `xdebug.mode=off` on both instances before measuring (ephemeral
+  `zz-bench-xdebug.ini` override + USR2 reload, no persistent config — see
+  the phase-17 Changes entry).  Re-measured under the enforcement: php at
+  baseline across the board, honest ratios (read-path wins stand: depth-1
+  11.9 → 6.07 ms, 4.9× → 8.9×); the earlier "18/20 improved, 17-94×
+  headline" claim was an xdebug artifact.
 - 2026-08-14: **Milestone gate: propfind_depth1 budget corrected 12 → 13 (delta 1 → 2).** The perf-gate re-run on the fixed binary breached the 22.2-C budget with a steady [13,13,13] across two independent runs — and the 13th statement is real, not a regression: zero PROPFIND-path code changed between the T8.1 fix (ea1dcd5) and HEAD (verified by git diff), and the depth-1 set is exactly depth-0's 11 + CTE + custom-props batch. The 12 budget was set during the 2026-08-14 milestone on the T8.1 desync-buggy binary — a depth-1 request killed by the accounts-fallback panic produced truncated execute counts, and the gate's probe does not validate the response status (budget.rs). Corrected in perf-budget.yaml per the no-headroom policy; gate green.
 - 2026-08-14: **23.8 resolved without code — the bound already existed.** The
   `preview_concurrency_new` config key sizes the generation semaphore
