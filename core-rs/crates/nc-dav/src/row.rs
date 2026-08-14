@@ -847,6 +847,94 @@ pub async fn get_metadata_json(
     fetched.and_then(|j| serde_json::from_str(&j).ok())
 }
 
+/// The folder's workspace file — the first Readme* child, excluding
+/// directories (text app `WorkspaceService::getSupportedFilenames`,
+/// 2026-08-14: the localized "Readme".md first — en: "Readme.md" — then the
+/// static list).  Returns `(fileid, fc-path)` of the first match.
+pub async fn get_workspace_file(
+    pool: &DbPool,
+    prefix: &str,
+    dir_fileid: i64,
+    storage_id: i64,
+    dir_mime_id: i64,
+) -> Option<(i64, String)> {
+    let names: [&str; 4] = ["Readme.md", "README.md", "readme.md", ".Readme.md"];
+    let table = format!("{prefix}filecache");
+    let sql = format!(
+        "SELECT fileid, path, mimetype, name FROM {table} \
+         WHERE parent = $1 AND storage = $2 AND name = ANY($3::text[])",
+    );
+    let rows: Vec<(i64, String, i64, String)> = match pool {
+        DbPool::Pg(p) => sqlx::query_as::<Postgres, (i64, String, i64, String)>(&sql)
+            .bind(dir_fileid)
+            .bind(storage_id)
+            .bind(&names)
+            .fetch_all(p)
+            .await
+            .unwrap_or_default(),
+        DbPool::Sqlite(p) => {
+            let placeholders = (1..=names.len())
+                .map(|i| format!("${i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT fileid, path, mimetype, name FROM {table} \
+                 WHERE parent = $1 AND storage = $2 AND name IN ({placeholders})",
+            );
+            let mut q = sqlx::query_as::<Sqlite, (i64, String, i64, String)>(&sql)
+                .bind(dir_fileid)
+                .bind(storage_id);
+            for n in names {
+                q = q.bind(n);
+            }
+            q.fetch_all(p).await.unwrap_or_default()
+        }
+    };
+    // Priority order: the localized "Readme".md first (en: "Readme.md"),
+    // then the static list — first non-directory match wins.
+    for n in names {
+        if let Some((fileid, path, _mimetype, _name)) =
+            rows.iter().find(|(_, _, m, nm)| m != &dir_mime_id && nm == n)
+        {
+            return Some((*fileid, path.clone()));
+        }
+    }
+    None
+}
+
+/// One `oc_preferences` value (the text app's `workspace_enabled` gate;
+/// default handled by the caller).
+pub async fn get_user_preference(
+    pool: &DbPool,
+    prefix: &str,
+    uid: &str,
+    app: &str,
+    key: &str,
+) -> Option<String> {
+    let table = format!("{prefix}preferences");
+    let sql = format!(
+        "SELECT configvalue FROM {table} WHERE userid = $1 AND appid = $2 AND configkey = $3"
+    );
+    match pool {
+        DbPool::Pg(p) => sqlx::query_scalar::<Postgres, String>(&sql)
+            .bind(uid)
+            .bind(app)
+            .bind(key)
+            .fetch_optional(p)
+            .await
+            .ok()
+            .flatten(),
+        DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, String>(&sql)
+            .bind(uid)
+            .bind(app)
+            .bind(key)
+            .fetch_optional(p)
+            .await
+            .ok()
+            .flatten(),
+    }
+}
+
 /// Returns an empty string when no note exists (REQ §6.5, PHASE-7.6).
 pub async fn get_share_note(pool: &DbPool, prefix: &str, fileid: i64) -> String {
     let sql = format!(
@@ -3696,5 +3784,62 @@ mod tests {
             permissions_to_ocm_json(effective),
             r#"["share","read","write"]"#
         );
+    }
+
+    // ── get_workspace_file (text app workspace, 2026-08-14) ────────────────
+
+    async fn workspace_db() -> DbPool {
+        let pool = DbPool::Sqlite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("in-memory SQLite"),
+        );
+        sqlx::query::<Sqlite>(
+            "CREATE TABLE oc_filecache (
+                fileid BIGINT NOT NULL PRIMARY KEY, storage BIGINT NOT NULL,
+                path VARCHAR(4000) NOT NULL DEFAULT '', parent BIGINT NOT NULL DEFAULT 0,
+                name VARCHAR(250), mimetype BIGINT NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(test_pool(&pool))
+        .await
+        .expect("create oc_filecache");
+        sqlx::query::<Sqlite>(
+            "INSERT INTO oc_filecache (fileid, storage, path, parent, name, mimetype) VALUES              (1, 7, 'files/Media', 0, 'Media', 2),              (2, 7, 'files/Media/README.md', 1, 'README.md', 3),              (3, 7, 'files/Media/Readme.md', 1, 'Readme.md', 3),              (4, 7, 'files/Media/.Readme.md', 1, '.Readme.md', 3),              (5, 7, 'files/Media/Readme.md', 1, 'Readme.md', 2)",
+        )
+        .execute(test_pool(&pool))
+        .await
+        .expect("seed oc_filecache");
+        pool
+    }
+
+    #[tokio::test]
+    async fn workspace_file_priority_and_dir_filter() {
+        let pool = workspace_db().await;
+        // Priority order: Readme.md beats README.md; the directory-named
+        // row (mimetype 2 = dir) is skipped even though it matches first by
+        // name; .Readme.md is the last resort.
+        let got = get_workspace_file(&pool, "oc_", 1, 7, 2).await;
+        assert_eq!(got, Some((3, "files/Media/Readme.md".to_string())));
+
+        // No dir named Readme.md and no other match -> the .Readme.md fallback.
+        sqlx::query::<Sqlite>("UPDATE oc_filecache SET name = 'X' WHERE fileid = 3")
+            .execute(test_pool(&pool))
+            .await
+            .unwrap();
+        let got = get_workspace_file(&pool, "oc_", 1, 7, 2).await;
+        assert_eq!(got, Some((2, "files/Media/README.md".to_string())));
+    }
+
+    #[tokio::test]
+    async fn workspace_file_absent() {
+        let pool = workspace_db().await;
+        sqlx::query::<Sqlite>("DELETE FROM oc_filecache WHERE fileid IN (2, 3, 4, 5)")
+            .execute(test_pool(&pool))
+            .await
+            .unwrap();
+        assert_eq!(get_workspace_file(&pool, "oc_", 1, 7, 2).await, None);
     }
 }

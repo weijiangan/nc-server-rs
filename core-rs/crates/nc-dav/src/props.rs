@@ -221,11 +221,6 @@ pub fn build_props(
         // (FilesPlugin.php:350-352): "[]" when empty, NOT the empty string.
         // TODO(PHASE-12): real per-share attributes.
         make_prop("share-attributes", "nc", NC_NS, "[]"),
-        // {nc:}reminder-due-date — the files_reminders app registers the prop
-        // for EVERY node, empty when no reminder is set (verified against the
-        // web files app's propfind, 2026-08-14 — PHP answers 200 with an
-        // empty value; Rust has no reminders yet, so always empty).
-        make_prop("reminder-due-date", "nc", NC_NS, ""),
     ];
 
     // {nc:}acl-can-* and {nc:}remind-me-at were removed in PHASE-12.1:
@@ -520,9 +515,6 @@ fn prop_names() -> Vec<DavProp> {
         name_only("share-attributes", "nc", NC_NS),
         name_only("sharees", "nc", NC_NS),
         name_only("system-tags", "nc", NC_NS),
-        // {nc:}reminder-due-date — files_reminders registers the prop for all
-        // nodes (empty value; emitted unconditionally in build_props).
-        name_only("reminder-due-date", "nc", NC_NS),
         // {nc:}acl-can-* and {nc:}remind-me-at are not PHP-core properties
         // (PHASE-12.1) — removed.
         name_only("displayname", "d", "DAV:"),
@@ -1422,4 +1414,20 @@ pub fn add_metadata_props(props: &mut Vec<DavProp>, json: Option<&serde_json::Va
             .unwrap_or_default();
         props.push(make_prop(&format!("metadata-{key}"), "nc", NC_NS, &value));
     }
+}
+
+/// Emit the text app's `nc:rich-workspace-flat` / `nc:rich-workspace-file-flat`
+/// (2026-08-14): the folder's workspace file content + fileid.  The gating
+/// (app enabled, configs, depth-skip, the file lookup) lives in get_props;
+/// this is the pure emission — `content` is '' and `workspace_fileid` None
+/// when PHP would answer the prop with an empty value (no workspace file or
+/// the depth-skip).
+pub fn add_workspace_props(props: &mut Vec<DavProp>, content: &str, workspace_fileid: Option<i64>) {
+    props.push(make_prop("rich-workspace-flat", "nc", NC_NS, content));
+    props.push(make_prop(
+        "rich-workspace-file-flat",
+        "nc",
+        NC_NS,
+        &workspace_fileid.map(|i| i.to_string()).unwrap_or_default(),
+    ));
 }

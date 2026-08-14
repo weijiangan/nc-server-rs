@@ -81,6 +81,10 @@ pub struct NcFileSystem {
     /// fs into `PropWriter` only after the setter runs, and `read_dir` runs
     /// on the instance the setter was called on.
     pub(crate) requested_props: Option<Vec<(Option<String>, String)>>,
+    /// The propfind's target path (fc-normalized) + Depth header — set by
+    /// `set_propfind_request`; the rich-workspace depth-skip (2026-08-14).
+    pub(crate) propfind_target: String,
+    pub(crate) propfind_depth: u8,
 }
 
 /// Read a value from the per-request batch, or `None` when the node is
@@ -191,6 +195,8 @@ impl NcFileSystem {
             tag_cache,
             propfind_batch: PropfindBatch::default(),
             requested_props: None,
+            propfind_target: String::new(),
+            propfind_depth: 0,
         }
     }
 
@@ -1518,8 +1524,19 @@ fn trash_fc_name(basename: &str, ts: i64) -> String {
 impl DavFileSystem for NcFileSystem {
     // ── requested props (PHASE-22 T6.5) ─────────────────────────────────────
 
-    fn set_requested_props(&mut self, requested: Option<Vec<(Option<String>, String)>>) {
+    fn set_propfind_request(
+        &mut self,
+        requested: Option<Vec<(Option<String>, String)>>,
+        path: &dav_server::davpath::DavPath,
+        depth: u8,
+    ) {
         self.requested_props = requested;
+        // The propfind target (fc-path normalized) + Depth — the
+        // rich-workspace depth-skip needs the target-vs-child distinction
+        // (text app WorkspacePlugin, 2026-08-14).
+        let raw = String::from_utf8_lossy(path.as_bytes()).into_owned();
+        self.propfind_target = dav_to_fc_path(&raw);
+        self.propfind_depth = depth;
     }
 
     // ── metadata ─────────────────────────────────────────────────────────────
@@ -3309,6 +3326,109 @@ impl DavFileSystem for NcFileSystem {
             // ── Append Phase 12 extended properties ──────────────────────────
             if do_content {
                 crate::props::add_metadata_props(&mut props, metadata_json.as_ref());
+
+                // nc:reminder-due-date — the files_reminders app registers the
+                // prop for EVERY node, empty when no reminder is set (verified
+                // against the web files app's propfind, 2026-08-14).  Gated on
+                // the app's enabled state: with the app disabled PHP's plugin
+                // is not registered and the prop answers 404.
+                if self
+                    .state
+                    .appconfig_cache
+                    .read()
+                    .expect("appconfig lock")
+                    .get_raw("files_reminders", "enabled")
+                    == Some("yes")
+                {
+                    props.push(crate::props::make_prop(
+                        "reminder-due-date",
+                        "nc",
+                        crate::props::NC_NS,
+                        "",
+                    ));
+                }
+
+                // nc:rich-workspace-flat / nc:rich-workspace-file-flat — the
+                // text app's WorkspacePlugin (2026-08-14), gated exactly as
+                // PHP gates it: the app enabled, the admin config (default
+                // true), the user's preference (default true), Directory
+                // nodes only, the requested set, and the depth-skip (children
+                // of a depth>0 flat-only request answer '' — only the target
+                // gets content).
+                let want_workspace = meta.is_dir_flag
+                    && (self.prop_requested(crate::props::NC_NS, "rich-workspace")
+                        || self.prop_requested(crate::props::NC_NS, "rich-workspace-flat")
+                        || self.prop_requested(crate::props::NC_NS, "rich-workspace-file")
+                        || self.prop_requested(crate::props::NC_NS, "rich-workspace-file-flat"));
+                if want_workspace {
+                    let text_enabled = self
+                        .state
+                        .appconfig_cache
+                        .read()
+                        .expect("appconfig lock")
+                        .get_raw("text", "enabled")
+                        == Some("yes");
+                    let workspace_available = self
+                        .state
+                        .appconfig_cache
+                        .read()
+                        .expect("appconfig lock")
+                        .get_string("text", "workspace_available")
+                        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                        .unwrap_or(true);
+                    if text_enabled && workspace_available {
+                        let non_flat = self.prop_requested(crate::props::NC_NS, "rich-workspace")
+                            || self.prop_requested(crate::props::NC_NS, "rich-workspace-file");
+                        if self.propfind_depth > 0
+                            && !non_flat
+                            && self.propfind_target != fc_path
+                        {
+                            // Depth-skip: children answer '' without touching
+                            // the workspace file.
+                            crate::props::add_workspace_props(&mut props, "", None);
+                        } else {
+                            let user_enabled = row::get_user_preference(
+                                &self.state.pool,
+                                &self.state.table_prefix,
+                                &self.uid,
+                                "text",
+                                "workspace_enabled",
+                            )
+                            .await
+                            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                            .unwrap_or(true);
+                            let (content, ws_fileid) = if user_enabled {
+                                if let Some((ws_fileid, ws_path)) = row::get_workspace_file(
+                                    &self.state.pool,
+                                    &self.state.table_prefix,
+                                    meta.fileid,
+                                    self.storage_id,
+                                    self.state.dir_mime_id,
+                                )
+                                .await
+                                {
+                                    let rel =
+                                        ws_path.strip_prefix("files/").unwrap_or(&ws_path);
+                                    let full = self
+                                        .state
+                                        .data_directory
+                                        .join(&self.uid)
+                                        .join(rel);
+                                    let content = tokio::fs::read(&full)
+                                        .await
+                                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                                        .unwrap_or_default();
+                                    (content, Some(ws_fileid))
+                                } else {
+                                    (String::new(), None)
+                                }
+                            } else {
+                                (String::new(), None)
+                            };
+                            crate::props::add_workspace_props(&mut props, &content, ws_fileid);
+                        }
+                    }
+                }
 
                 crate::props::add_phase12_props(
                     &mut props,
