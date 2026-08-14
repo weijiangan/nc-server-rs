@@ -109,6 +109,10 @@ pub enum Op {
         path: String,
         #[serde(default)]
         depth: Option<u32>,
+        /// Explicit `<d:prop>` body (22.5 — the desktop client's narrow prop
+        /// set).  Absent = bare PROPFIND = allprop.
+        #[serde(default)]
+        body: Option<String>,
     },
     Proppatch {
         path: String,
@@ -192,8 +196,68 @@ pub struct OpResult {
     /// Response **bytes**, captured only for ops with `compare_bytes`
     /// (byte-exact parity for generated previews) — `None` otherwise.
     pub body_bytes: Option<Vec<u8>>,
+    /// Structural shape of a PROPFIND multistatus (22.6): response
+    /// cardinality + the `href` set.  The delta diff is blind to a
+    /// truncated/empty listing — a panicked or short-circuited request
+    /// writes no deltas — so the shape is the response-correctness surface.
+    pub propfind_shape: Option<PropfindShape>,
     /// Wall time of the op's HTTP round-trip (Phase 17 — benchmark harness).
     pub elapsed: std::time::Duration,
+}
+
+/// Structural shape of a PROPFIND multistatus response (22.6).  Compared
+/// across sides instead of bytes — the XML prolog, namespace prefixes, and
+/// etag quoting differ in known ways between PHP (sabre) and dav-server-rs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PropfindShape {
+    /// Number of `<d:response>` elements.
+    pub responses: usize,
+    /// The `href` values, in document order.
+    pub hrefs: Vec<String>,
+}
+
+/// Extract the multistatus shape from a PROPFIND response body.
+/// Prefix-agnostic (the sides may use different namespace prefixes): matches
+/// `<*:response` / `<*:href>` element names and takes the href text.
+fn propfind_shape(body: &str) -> PropfindShape {
+    let mut shape = PropfindShape::default();
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Next '<'; then the tag name up to whitespace/'>'.
+        let Some(rel) = body[i..].find('<') else { break };
+        let name_start = i + rel + 1;
+        let Some(name_len) = body[name_start..]
+            .find(|c| c == '>' || c == ' ' || c == '\n' || c == '\t' || c == '\r')
+        else {
+            break;
+        };
+        let name = &body[name_start..name_start + name_len];
+        // Closing tags (`</d:href>`) start with '/' — they must not match
+        // (their "content" is the NEXT element, which produced garbage hrefs
+        // and double-counted responses on the first version of this parser).
+        let after = name_start + name_len;
+        if name.starts_with('/') {
+            i = after;
+            continue;
+        }
+        let elem = name.rsplit(':').next().unwrap_or(name);
+        match elem {
+            "response" => shape.responses += 1,
+            "href" => {
+                // Content between '>' and the closing tag.
+                if let Some(gt) = body[after..].find('>') {
+                    let content = after + gt + 1;
+                    if let Some(close) = body[content..].find("</") {
+                        shape.hrefs.push(body[content..content + close].to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        i = after;
+    }
+    shape
 }
 
 /// Resolve a fixture body. `body_file` is relative to the crate's `fixtures/`.
@@ -238,7 +302,11 @@ fn describe(op: &Op) -> String {
         Op::Mkcol { path } => format!("MKCOL {path}"),
         Op::Move { from, to } => format!("MOVE {from} -> {to}"),
         Op::Copy { from, to } => format!("COPY {from} -> {to}"),
-        Op::Propfind { path, depth } => format!("PROPFIND {path} (depth {})", depth.unwrap_or(0)),
+        Op::Propfind { path, depth, body } => format!(
+            "PROPFIND {path} (depth {}{})",
+            depth.unwrap_or(0),
+            if body.is_some() { ", narrow prop set" } else { "" }
+        ),
         Op::Proppatch { path, .. } => format!("PROPPATCH {path}"),
         Op::ShareCreate {
             path, share_type, ..
@@ -338,6 +406,7 @@ pub async fn run_ops(
                     status: status.as_u16(),
                     body: body_text,
                     body_bytes: None,
+                    propfind_shape: None,
                     elapsed: start.elapsed(),
                 });
                 continue;
@@ -374,6 +443,7 @@ pub async fn run_ops(
                     status: status.as_u16(),
                     body: body_text,
                     body_bytes,
+                    propfind_shape: None,
                     elapsed: start.elapsed(),
                 });
                 continue;
@@ -394,9 +464,13 @@ pub async fn run_ops(
                     .copy(&interpolate(from, vars), &interpolate(to, vars))
                     .await?
             }
-            Op::Propfind { path, depth } => {
+            Op::Propfind { path, depth, body } => {
                 let resp = client
-                    .propfind(&interpolate(path, vars), depth.unwrap_or(0), None)
+                    .propfind(
+                        &interpolate(path, vars),
+                        depth.unwrap_or(0),
+                        body.as_deref(),
+                    )
                     .await?;
                 let status = resp.status();
                 // Consume the response body: dav-server-rs streams PROPFIND
@@ -408,13 +482,17 @@ pub async fn run_ops(
                 // The body is deliberately NOT recorded for comparison — the
                 // propfind XML shapes differ in known ways (prolog, namespace
                 // prefixes, etag quote-escaping); the delta diff is the
-                // propfind's parity surface.
-                let _ = resp.text().await.with_context(|| "reading propfind body")?;
+                // propfind's parity surface.  The multistatus SHAPE (22.6:
+                // response cardinality + href set) is extracted instead — the
+                // tripwire for an empty/truncated listing, which writes no
+                // deltas and passes the delta diff.
+                let text = resp.text().await.with_context(|| "reading propfind body")?;
                 results.push(OpResult {
                     op: describe(op),
                     status: status.as_u16(),
                     body: None,
                     body_bytes: None,
+                    propfind_shape: Some(propfind_shape(&text)),
                     elapsed: start.elapsed(),
                 });
                 continue;
@@ -461,6 +539,7 @@ pub async fn run_ops(
                         status: status.as_u16(),
                         body: None,
                         body_bytes: None,
+                        propfind_shape: None,
                         elapsed: start.elapsed(),
                     });
                     continue;
@@ -484,6 +563,7 @@ pub async fn run_ops(
                     status: mkcol.status().as_u16(),
                     body: None,
                     body_bytes: None,
+                    propfind_shape: None,
                     elapsed: start.elapsed(),
                 });
                 for (i, chunk) in chunks.iter().enumerate() {
@@ -496,6 +576,7 @@ pub async fn run_ops(
                         status: resp.status().as_u16(),
                         body: None,
                         body_bytes: None,
+                        propfind_shape: None,
                         elapsed: start.elapsed(),
                     });
                 }
@@ -544,6 +625,7 @@ pub async fn run_ops(
             status: resp.status().as_u16(),
             body: None,
             body_bytes: None,
+            propfind_shape: None,
             elapsed: start.elapsed(),
         });
     }
@@ -577,5 +659,54 @@ pub async fn run_cleanup(
         Ok(())
     } else {
         bail!("cleanup failed: {}", errors.join("; "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{propfind_shape, PropfindShape};
+
+    #[test]
+    fn shape_counts_responses_and_hrefs() {
+        // Two children + the root; a nested share-types prop must not confuse
+        // the href scan.
+        let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:response>
+    <d:href>/remote.php/dav/files/admin/</d:href>
+    <d:propstat><d:prop><d:getetag>"abc"</d:getetag></d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/admin/Media/</d:href>
+    <d:propstat><d:prop><oc:share-types><oc:share-type>1</oc:share-type></oc:share-types></d:prop></d:propstat>
+  </d:response>
+</d:multistatus>"#;
+        let s = propfind_shape(body);
+        assert_eq!(s.responses, 2, "closing tags must not double-count");
+        assert_eq!(
+            s.hrefs,
+            vec![
+                "/remote.php/dav/files/admin/",
+                "/remote.php/dav/files/admin/Media/"
+            ],
+            "hrefs must be the opening-tag values only"
+        );
+    }
+
+    #[test]
+    fn shape_empty_or_error_body() {
+        // A 401/500 body (or a truncated listing) has no multistatus shape.
+        assert_eq!(propfind_shape("Unauthorized"), PropfindShape::default());
+        assert_eq!(propfind_shape(""), PropfindShape::default());
+    }
+
+    #[test]
+    fn shape_ignores_other_prop_elements() {
+        // getetag values contain quotes and slashes; they must not leak into
+        // the href set.
+        let body = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/a</d:href><d:propstat><d:prop><d:getetag>"a/b"</d:getetag><d:getlastmodified>Fri, 14 Aug 2026 07:04:28 GMT</d:getlastmodified></d:prop></d:propstat></d:response></d:multistatus>"#;
+        let s = propfind_shape(body);
+        assert_eq!(s.responses, 1);
+        assert_eq!(s.hrefs, vec!["/a"]);
     }
 }

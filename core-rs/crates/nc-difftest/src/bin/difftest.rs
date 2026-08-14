@@ -308,6 +308,7 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
     let mut status_ok = true;
     let mut body_ok = true;
     let mut bytes_ok = true;
+    let mut shape_ok = true;
     for ((a, b), op) in sut_res.iter().zip(oracle_res.iter()).zip(sc.ops.iter()) {
         if !op.compare_status() {
             println!(
@@ -349,8 +350,32 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
                 println!("  {}: bytes identical ({} B)", a.op, ab.len());
             }
         }
+        // PROPFIND response-content parity (22.6): the delta diff is blind to
+        // a truncated/empty listing (a panicked or short-circuited request
+        // writes no deltas and passes); compare the multistatus shape —
+        // response cardinality + the href set — when both sides answered.
+        if let (Some(ss), Some(os)) = (&a.propfind_shape, &b.propfind_shape) {
+            let mut sh = ss.hrefs.clone();
+            let mut oh = os.hrefs.clone();
+            sh.sort();
+            oh.sort();
+            if ss.responses != os.responses || sh != oh {
+                println!(
+                    "  PROPFIND SHAPE MISMATCH {}: SUT {} responses vs oracle {}; hrefs SUT {:?} vs oracle {:?}",
+                    a.op, ss.responses, os.responses, sh, oh
+                );
+                shape_ok = false;
+            } else {
+                println!(
+                    "  {}: {} responses, {} hrefs identical",
+                    a.op,
+                    ss.responses,
+                    ss.hrefs.len()
+                );
+            }
+        }
     }
-    let ops_ok = status_ok && body_ok && bytes_ok;
+    let ops_ok = status_ok && body_ok && bytes_ok && shape_ok;
 
     // Quiesce the async background writers again: the ops queued preview
     // generations (and the 5-min container cron may have fired mid-window) —

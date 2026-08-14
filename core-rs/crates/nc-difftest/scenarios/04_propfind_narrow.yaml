@@ -1,0 +1,71 @@
+# Narrow prop-set PROPFIND (22.5, 2026-08-14).  The rest of the suite sends
+# bare PROPFINDs (allprop → every CTE family gate on); the desktop client's
+# explicit <d:prop> body takes the gates-off path — the CASE-gated CTE
+# sub-selects evaluate to NULL and the Option decodes run.  This is the class
+# that shipped the 22.2-C UnexpectedNullError panics (root PROPFIND, 2026-08-14
+# milestone) — invisible to the allprop-only suite.
+#
+# The target is the skeleton folder /Media — no native write ops (a setup PUT
+# queues preview generation whose drain races the snapshot window on one side;
+# same contract as scenarios 15 and 30).  The proppatch + share put real tags
+# and shares on a child so the gates have data when the client asks for them.
+# The propfind bodies cover the desktop set (getetag/getlastmodified/
+# getcontentlength/resourcetype + oc:id/permissions/size/favorite/share-types
+# + nc:system-tags — no contained-*-count, no comments), plus an allprop
+# control.  The 22.6 shape assertion (response cardinality + href set) is the
+# response-correctness surface for both.
+name: 04_propfind_narrow
+ops:
+  - op: proppatch
+    path: /remote.php/dav/files/admin/Media
+    body: |
+      <?xml version="1.0" encoding="utf-8" ?>
+      <d:propertyupdate xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+        <d:set>
+          <d:prop>
+            <oc:favorite>1</oc:favorite>
+          </d:prop>
+        </d:set>
+      </d:propertyupdate>
+  - op: share_create
+    path: /Media
+    share_type: 1
+    share_with: admin
+    capture:
+      narrow_share_id: ocs.data.id
+  - op: propfind
+    path: /remote.php/dav/files/admin/
+    depth: 1
+    body: |
+      <?xml version="1.0" encoding="utf-8" ?>
+      <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
+        <d:prop>
+          <d:getetag/>
+          <d:getlastmodified/>
+          <d:getcontentlength/>
+          <d:resourcetype/>
+          <oc:id/>
+          <oc:permissions/>
+          <oc:size/>
+          <oc:favorite/>
+          <oc:share-types/>
+          <nc:system-tags/>
+        </d:prop>
+      </d:propfind>
+  - op: propfind
+    path: /remote.php/dav/files/admin/
+    depth: 1
+cleanup:
+  - op: share_delete
+    id: "{narrow_share_id}"
+  - op: proppatch
+    path: /remote.php/dav/files/admin/Media
+    body: |
+      <?xml version="1.0" encoding="utf-8" ?>
+      <d:propertyupdate xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+        <d:set>
+          <d:prop>
+            <oc:favorite>0</oc:favorite>
+          </d:prop>
+        </d:set>
+      </d:propertyupdate>
