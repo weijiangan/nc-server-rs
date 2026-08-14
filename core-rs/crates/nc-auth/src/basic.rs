@@ -131,8 +131,13 @@ async fn try_app_token(
     // which filters `WHERE token = $hash AND version = $version` — no `login_name` in the
     // WHERE clause).  The `login_name` validation happens below, matching PHP's
     // `validateTokenLoginName()` case-insensitive comparison.
+    // `type` is nullable (NULL → 0, PHP's (int) cast — the literal `0`
+    // promotes smallint → int4, so re-cast to smallint for the i16 decode)
+    // and `expires` is INT4 in the schema — the strict INT8 `i64` decode
+    // fails on a non-NULL INT4 value (PG-only; invisible to SQLite's
+    // dynamic typing), so widen it.
     let sql = format!(
-        "SELECT id, uid, type, expires, login_name \
+        "SELECT id, uid, COALESCE(type, 0)::smallint, expires::bigint, login_name \
          FROM {table} \
          WHERE token = $1"
     );

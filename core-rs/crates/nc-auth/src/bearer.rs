@@ -85,8 +85,15 @@ pub async fn lookup_bearer(
     let hash_hex = hex::encode(hash);
     let table = format!("{prefix}authtoken");
 
+    // Normalize to PHP's `PublicKeyToken` semantics: `type` NULL → 0,
+    // `scope` NULL → ''; `expires`/`last_activity` are INT4 in the schema
+    // and must widen to the i64 tuple — a bare INT4 column fails sqlx's
+    // strict INT8 decode (PG-only; invisible to SQLite's dynamic typing).
+    // Every COALESCE is cast back to its column's exact type: the integer
+    // literal `0` promotes smallint → int4, which then fails the i16 decode.
     let sql = format!(
-        "SELECT id, uid, type, scope, expires, last_activity \
+        "SELECT id, uid, COALESCE(type, 0)::smallint, COALESCE(scope, ''), \
+                expires::bigint, COALESCE(last_activity, 0)::bigint \
                  FROM {table} WHERE token = $1"
     );
     let fetched: Result<Option<(i64, String, i16, String, Option<i64>, i64)>, sqlx::Error> =
