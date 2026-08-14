@@ -68,7 +68,11 @@ build() {
     export CFLAGS="$CFLAGS -ffat-lto-objects"
     unset CXXFLAGS LDFLAGS DEBUG_RUSTFLAGS
     export RUSTFLAGS="${RUSTFLAGS:--C force-frame-pointers=yes}"
-    cargo build --release --locked --features postgres
+    # Build the server binary only — the workspace-wide build would also
+    # compile the nc-difftest/nc-bench harness crates (a dev-only oracle
+    # that deliberately links no nc-* crate; it does not go into the
+    # package, and compiling it wastes build time and disk).
+    cargo build --release --locked --features postgres -p nc-server
 }
 
 package() {
