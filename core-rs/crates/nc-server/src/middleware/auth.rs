@@ -614,6 +614,7 @@ mod tests {
         appconfig::AppConfigCache,
         config::{DbType, NcConfig},
         mime::MimeCache,
+        pool::DbPool,
     };
     use std::sync::{Arc, RwLock};
     use tower::ServiceExt;
@@ -697,6 +698,10 @@ mod tests {
         AppState {
             pool,
             mime_cache: Arc::new(RwLock::new(MimeCache::default())),
+            dir_mime_id: 2,
+            dir_mimepart_id: 1,
+            lazy_cache_ensured: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            storage_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             appconfig_cache,
             capability_cache,
             token_cache: nc_auth::new_token_cache(),

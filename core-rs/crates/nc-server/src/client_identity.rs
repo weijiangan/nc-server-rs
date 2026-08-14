@@ -15,6 +15,11 @@
 //! config and converges (the chained-proxy coherence argument).
 
 use std::net::IpAddr;
+// The test-only `const PEER` uses Ipv4Addr — import it for the test build
+// only, so the production build doesn't warn "unused import" (the warning
+// fires there because `#[cfg(test)] mod tests` isn't compiled).
+#[cfg(test)]
+use std::net::Ipv4Addr;
 
 use axum::http::{HeaderMap, Response, StatusCode};
 use nc_db::config::NcConfig;
