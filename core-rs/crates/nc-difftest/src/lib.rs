@@ -8,6 +8,7 @@
 //! instances and SQL to their two databases, and links **no** `nc-*` crate, so
 //! it remains an independent oracle for their behavior.
 
+pub mod auth;
 pub mod canonicalize;
 pub mod client;
 pub mod config;

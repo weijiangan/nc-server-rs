@@ -19,12 +19,25 @@ use crate::config::Instance;
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) mirall/3.13.0 \
      (Nextcloud, linux ClientArchitecture: x86_64 OsArchitecture: x86_64)";
 
+/// How requests authenticate.  Default Basic (the app token sent as the
+/// password field, like desktop clients); `Bearer` sends the raw token in the
+/// `Authorization: Bearer` header — the auth path the 2026-08-14 PG-only
+/// decode bug broke (see `scenario 03_bearer_auth`).
+#[derive(Debug, Clone)]
+pub enum AuthMode {
+    Basic,
+    Bearer(String),
+}
+
 pub struct NextcloudClient {
     http: Client,
     base_url: String,
     host: String,
     user: String,
     pass: String,
+    /// Interior-mutable: the scenario runner switches the mode between ops
+    /// (replays are strictly sequential on one client per side).
+    auth: std::sync::Arc<std::sync::Mutex<AuthMode>>,
 }
 
 /// Build a WebDAV/custom [`Method`] from its name (PROPFIND, MKCOL, …).
@@ -44,11 +57,19 @@ impl NextcloudClient {
             host: inst.host.clone(),
             user: user.to_string(),
             pass: pass.to_string(),
+            auth: std::sync::Arc::new(std::sync::Mutex::new(AuthMode::Basic)),
         })
     }
 
+    /// Switch the auth mode for subsequent requests (scenario-level
+    /// `auth: bearer`).
+    pub fn set_auth(&self, mode: AuthMode) {
+        *self.auth.lock().unwrap() = mode;
+    }
+
     /// Issue one request and return the raw response. `path` is appended to the
-    /// base URL; the configured `Host` header and basic auth are always sent.
+    /// base URL; the configured `Host` header and the current auth mode are
+    /// always sent.
     pub async fn request(
         &self,
         m: Method,
@@ -60,8 +81,15 @@ impl NextcloudClient {
         let mut req = self
             .http
             .request(m.clone(), &url)
-            .basic_auth(&self.user, Some(&self.pass))
             .header(HOST, &self.host);
+        match self.auth.lock().unwrap().clone() {
+            AuthMode::Basic => {
+                req = req.basic_auth(&self.user, Some(&self.pass));
+            }
+            AuthMode::Bearer(token) => {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
+        }
         for (k, v) in headers.iter() {
             req = req.header(k.clone(), v.clone());
         }

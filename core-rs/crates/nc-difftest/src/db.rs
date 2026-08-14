@@ -37,6 +37,15 @@ const SKIP_TABLES: &[&str] = &[
     "oc_jobs",
     "oc_preferences",
     "oc_ratelimit_entries",
+    // oc_authtoken: auth bookkeeping, not file behavior. Both sides' auth
+    // paths write back activity on token use — PHP's updateTokenActivity
+    // synchronously, Rust's spawn_last_activity_update on an async task — so
+    // a scenario that authenticates with a token races the write-back window
+    // (2026-08-14, scenario 03_bearer_auth: the oracle's row bumped within
+    // the run while the SUT's landed after the snapshot). The response status
+    // comparison is the auth parity surface; the last_activity delta is
+    // timing noise, the same class as oc_preferences.
+    "oc_authtoken",
     // CardDAV + Circles side effects of OCS user-account edits (Phase 16.10,
     // scenario 23: setting a quota updates the user's system-addressbook card
     // and the circles member cache). Both sides run identical proxied PHP for

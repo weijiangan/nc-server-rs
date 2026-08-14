@@ -1,0 +1,17 @@
+# Bearer app-token auth parity (2026-08-14).  Every other scenario
+# authenticates via Basic (the app token sent as the password field), which
+# exercises basic.rs's lookup only.  The `Authorization: Bearer` path was
+# never covered end-to-end — a PG-only decode bug (lookup_bearer decoding the
+# INT4 `expires`/`last_activity` columns as i64 and the nullable `scope` as a
+# non-Option String) 401'd every Bearer request on the SUT while PHP returned
+# 200, invisible to every gate (SQLite's dynamic typing, the Basic-only
+# harness, statement-count budgets).
+#
+# Read-only: the divergence signal is the STATUS comparison — a broken bearer
+# path yields SUT 401 vs oracle 207.
+name: 03_bearer_auth
+auth: bearer
+ops:
+  - op: propfind
+    path: /remote.php/dav/files/admin/
+    depth: 1

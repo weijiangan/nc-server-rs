@@ -269,6 +269,25 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
     let sut = NextcloudClient::new(&cfg.sut, &cfg.admin_user, &cfg.admin_pass)?;
     let oracle = NextcloudClient::new(&cfg.oracle, &cfg.admin_user, &cfg.admin_pass)?;
 
+    // Scenario-level auth override: `auth: bearer` authenticates with an app
+    // token via the `Authorization: Bearer` header (the path the 2026-08-14
+    // PG-only decode bug broke).  The token row is created before the
+    // before-snapshot, so it appears on both sides in both snapshots and
+    // produces no delta.
+    match sc.auth.as_deref() {
+        None | Some("basic") => {}
+        Some("bearer") => {
+            let sut_token =
+                nc_difftest::auth::ensure_bearer_token(&cfg.sut, &cfg.admin_user).await?;
+            let oracle_token =
+                nc_difftest::auth::ensure_bearer_token(&cfg.oracle, &cfg.admin_user).await?;
+            sut.set_auth(nc_difftest::client::AuthMode::Bearer(sut_token));
+            oracle.set_auth(nc_difftest::client::AuthMode::Bearer(oracle_token));
+            println!("[auth] bearer app-token auth on both sides");
+        }
+        Some(other) => anyhow::bail!("unknown scenario auth mode {other:?}"),
+    }
+
     quiesce_background(&cfg).await?;
 
     println!("[before] snapshotting both (DB + file tree) ...");

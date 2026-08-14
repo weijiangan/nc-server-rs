@@ -33,6 +33,13 @@ clap = { workspace = true }
 # Native Postgres driver (in addition to the workspace `any` feature) so the
 # preconditions/snapshot code can open the two databases directly.
 sqlx = { workspace = true, features = ["postgres"] }
+# App-token bootstrap for bearer-auth scenarios (2026-08-14): stored token =
+# hex(sha512(raw + secret)), version 2 + a real RSA keypair — exactly PHP's
+# `PublicKeyTokenProvider` (same machinery as nc-bench's auth module).
+sha2 = { workspace = true }
+hex = { workspace = true }
+rsa = "0.9"
+rand = "0.8"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

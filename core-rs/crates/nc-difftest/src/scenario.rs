@@ -36,6 +36,11 @@ pub struct Scenario {
     /// masking (Phase 16.9).
     #[serde(default)]
     pub stable_overrides: Vec<String>,
+    /// Auth mode for all ops: `bearer` = `Authorization: Bearer` with a
+    /// per-side app token (2026-08-14); absent = Basic auth with the admin
+    /// password (the default for every other scenario).
+    #[serde(default)]
+    pub auth: Option<String>,
 }
 
 fn default_true() -> bool {
