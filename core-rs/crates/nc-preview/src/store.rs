@@ -127,8 +127,14 @@ pub fn find_match(
 /// as `bool` on PostgreSQL** (their real column type — best-in-class, no projection
 /// on this hot path).  SQLite has no boolean type and sqlx's `Any` driver
 /// cannot decode one, so there — and only there, the test/legacy DB — they are read
-/// as integers (`!= 0`).  `id`/`width`/`height` are read 64-bit and narrowed
-/// (snowflake ids and pixel dimensions fit comfortably for the foreseeable future).
+/// as integers (`!= 0`).
+///
+/// Column types follow PHP's Doctrine schema (`Preview` entity, Postgres): the
+/// key columns `id`/`file_id`/`storage_id`/`version_id` are `bigint` (read i64),
+/// while `width`/`height`/`mtime`/`size` are `integer` (read i32 and widened to
+/// the struct's `u32`/`i64`).  sqlx's Postgres driver decodes strictly — an i64
+/// read off an `integer` column fails with `ColumnDecode`, so the decode must
+/// match the column, exactly as the insert path binds `as i32` (persist.rs).
 ///
 /// `etag` is `CHAR(40)` (fixed, blank-padded — see [`ETAG_CHAR_WIDTH`]).  sqlx's
 /// `Any` driver has **no mapping for PostgreSQL's `bpchar`**, so a bare `etag`
@@ -159,12 +165,12 @@ pub async fn load_preview_rows(pool: &DbPool, prefix: &str, file_id: i64) -> Vec
                     id: r.get("id"),
                     file_id: r.get("file_id"),
                     storage_id: r.get("storage_id"),
-                    width: r.get::<i64, _>("width") as u32,
-                    height: r.get::<i64, _>("height") as u32,
+                    width: r.get::<i32, _>("width") as u32,
+                    height: r.get::<i32, _>("height") as u32,
                     mimetype_id: r.get("mimetype_id"),
                     source_mimetype_id: r.get("source_mimetype_id"),
-                    mtime: r.get("mtime"),
-                    size: r.get("size"),
+                    mtime: r.get::<i32, _>("mtime") as i64,
+                    size: r.get::<i32, _>("size") as i64,
                     max: r.get::<bool, _>("max"),
                     cropped: r.get::<bool, _>("cropped"),
                     encrypted: r.get::<bool, _>("encrypted"),
