@@ -359,18 +359,57 @@ async fn run_scenario(cfg: &Config, path: &str) -> Result<()> {
             let mut oh = os.hrefs.clone();
             sh.sort();
             oh.sort();
-            if ss.responses != os.responses || sh != oh {
+            // Per-node prop availability (2026-08-14): the 200/404 prop sets
+            // must match — this is what caught reminder-due-date (PHP 200 vs
+            // Rust 404) and quota-on-files (PHP 404 vs Rust 200) in the web
+            // files app A/B.
+            let mut prop_diffs = Vec::new();
+            for (href, (sp200, sp404)) in &ss.props {
+                let (op200, op404) = os.props.get(href).cloned().unwrap_or_default();
+                let mut a = sp200.clone();
+                let mut b = op200;
+                a.sort();
+                b.sort();
+                if a != b {
+                    prop_diffs.push(format!(
+                        "{href}: 200 [{}] vs [{}]",
+                        a.join(","),
+                        b.join(",")
+                    ));
+                }
+                let mut a = sp404.clone();
+                let mut b = op404;
+                a.sort();
+                b.sort();
+                if a != b {
+                    prop_diffs.push(format!(
+                        "{href}: 404 [{}] vs [{}]",
+                        a.join(","),
+                        b.join(",")
+                    ));
+                }
+            }
+            for href in os.props.keys() {
+                if !ss.props.contains_key(href) {
+                    prop_diffs.push(format!("{href}: SUT node absent"));
+                }
+            }
+            if ss.responses != os.responses || sh != oh || !prop_diffs.is_empty() {
                 println!(
                     "  PROPFIND SHAPE MISMATCH {}: SUT {} responses vs oracle {}; hrefs SUT {:?} vs oracle {:?}",
                     a.op, ss.responses, os.responses, sh, oh
                 );
+                for d in &prop_diffs {
+                    println!("    {d}");
+                }
                 shape_ok = false;
             } else {
                 println!(
-                    "  {}: {} responses, {} hrefs identical",
+                    "  {}: {} responses, {} hrefs, {} nodes' prop sets identical",
                     a.op,
                     ss.responses,
-                    ss.hrefs.len()
+                    ss.hrefs.len(),
+                    ss.props.len()
                 );
             }
         }

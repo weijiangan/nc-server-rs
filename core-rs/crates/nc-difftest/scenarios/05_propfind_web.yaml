@@ -1,0 +1,22 @@
+# The web files app's full prop set (2026-08-14).  The desktop client's
+# narrow set (scenario 04) misses the web-only props — lock/reminder/
+# rich-workspace/metadata-* — whose availability the web app's FileInfo
+# model reads.  The 22.6 assertion's per-node 200/404 prop sets are the
+# tripwire; this scenario is what exposed reminder-due-date (PHP 200 vs
+# Rust 404) and quota-on-files (PHP 404 vs Rust 200) before the parity
+# fixes.  The body mirrors the web app's FileInfo request exactly.
+name: 05_propfind_web
+ops:
+  - op: propfind
+    path: /remote.php/dav/files/admin/
+    depth: 1
+    body: |
+      <?xml version="1.0" encoding="utf-8"?>
+      <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns" xmlns:ocs="http://open-collaboration-services.org/ns">
+        <d:prop>
+          <d:getetag/><d:getlastmodified/><d:creationdate/><d:displayname/><d:quota-available-bytes/><d:resourcetype/><d:getcontentlength/><d:getcontenttype/>
+          <nc:has-preview/><nc:mount-type/><oc:comments-unread/><oc:favorite/><oc:fileid/><oc:owner-display-name/><oc:owner-id/><oc:permissions/><oc:size/>
+          <nc:hidden/><nc:is-mount-root/><nc:lock/><nc:lock-owner/><nc:lock-owner-displayname/><nc:lock-owner-type/><nc:lock-owner-editor/><nc:lock-time/><nc:reminder-due-date/>
+          <nc:sharees/><nc:share-attributes/><oc:share-types/><ocs:share-permissions/><nc:system-tags/><nc:is-encrypted/><nc:metadata-blurhash/><nc:metadata-files-live-photo/><nc:note/><nc:hide-download/><nc:rich-workspace-flat/><nc:rich-workspace-file-flat/>
+        </d:prop>
+      </d:propfind>

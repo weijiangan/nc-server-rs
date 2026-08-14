@@ -214,6 +214,12 @@ pub struct PropfindShape {
     pub responses: usize,
     /// The `href` values, in document order.
     pub hrefs: Vec<String>,
+    /// Per-node prop availability (2026-08-14): `href` → the prop names in
+    /// the 200 and 404 propstats.  The web files app's propfind A/B exposed
+    /// availability gaps (reminder-due-date PHP 200 vs Rust 404,
+    /// quota-on-files PHP 404 vs Rust 200) that cardinality+hrefs cannot
+    /// catch.
+    pub props: std::collections::BTreeMap<String, (Vec<String>, Vec<String>)>,
 }
 
 /// Extract the multistatus shape from a PROPFIND response body.
@@ -223,37 +229,96 @@ fn propfind_shape(body: &str) -> PropfindShape {
     let mut shape = PropfindShape::default();
     let bytes = body.as_bytes();
     let mut i = 0usize;
+    // Per-node accumulation state: the current response's href, the current
+    // propstat's pending prop names (the <d:status> comes AFTER the <d:prop>
+    // block), and the depth inside <d:prop> so nested value elements
+    // (sharee details, share-type, ...) are not counted as props.
+    let mut cur_href: Option<String> = None;
+    let mut pending: Vec<String> = Vec::new();
+    let mut prop_depth: u8 = 0;
     while i < bytes.len() {
-        // Next '<'; then the tag name up to whitespace/'>'.
+        // Next '<'; then the tag name up to whitespace/'/'/'>'.
         let Some(rel) = body[i..].find('<') else { break };
         let name_start = i + rel + 1;
-        let Some(name_len) = body[name_start..]
-            .find(|c| c == '>' || c == ' ' || c == '\n' || c == '\t' || c == '\r')
+let closing = body[name_start..].starts_with('/');
+        let scan_start = name_start + usize::from(closing);
+        let Some(name_len) = body[scan_start..]
+            .find(|c| c == '>' || c == ' ' || c == '/' || c == '\n' || c == '\t' || c == '\r')
         else {
             break;
         };
-        let name = &body[name_start..name_start + name_len];
-        // Closing tags (`</d:href>`) start with '/' — they must not match
-        // (their "content" is the NEXT element, which produced garbage hrefs
-        // and double-counted responses on the first version of this parser).
-        let after = name_start + name_len;
-        if name.starts_with('/') {
-            i = after;
-            continue;
-        }
-        let elem = name.rsplit(':').next().unwrap_or(name);
+        let name = &body[scan_start..scan_start + name_len];
+        let after = scan_start + name_len;
+        // Self-closing `<d:collection/>`: the char after the name is '/'.
+        let self_closing = !closing && body[after..].starts_with('/');
+        let elem = name;
+        let elem = elem.rsplit(':').next().unwrap_or(elem);
         match elem {
-            "response" => shape.responses += 1,
-            "href" => {
+            "response" if !closing => {
+                shape.responses += 1;
+                cur_href = None;
+                pending.clear();
+                prop_depth = 0;
+            }
+            "href" if !closing => {
                 // Content between '>' and the closing tag.
                 if let Some(gt) = body[after..].find('>') {
                     let content = after + gt + 1;
                     if let Some(close) = body[content..].find("</") {
-                        shape.hrefs.push(body[content..content + close].to_string());
+                        let href = body[content..content + close].to_string();
+                        shape.hrefs.push(href.clone());
+                        cur_href = Some(href);
                     }
                 }
             }
-            _ => {}
+            "prop" if !closing => {
+                pending.clear();
+                prop_depth = 1;
+            }
+            "prop" => {}
+            "status" if !closing => {
+                // The propstat's status comes AFTER its <d:prop> block —
+                // classify the buffered prop names.  Only the immediate
+                // value counts (a later propstat's 404 must not leak in).
+                let is_200 = if let Some(gt) = body[after..].find('>') {
+                    let content = after + gt + 1;
+                    let close = body[content..].find("</").unwrap_or(body.len() - content);
+                    !body[content..content + close].contains("404")
+                } else {
+                    true
+                };
+                if let Some(href) = &cur_href {
+                    let entry = shape.props.entry(href.clone()).or_default();
+                    if is_200 {
+                        entry.0.append(&mut pending);
+                    } else {
+                        entry.1.append(&mut pending);
+                    }
+                } else {
+                    pending.clear();
+                }
+            }
+            "propstat" | "multistatus" => {}
+            _ => {
+                if closing {
+                    // A closing tag ends its element: a direct prop's close
+                    // returns to depth 1; a nested element's close descends.
+                    if prop_depth >= 2 {
+                        prop_depth -= 1;
+                    }
+                } else if prop_depth == 1 {
+                    // A direct child of <d:prop>: a prop name.  Non-self-
+                    // closing props contain nested value elements (depth 2).
+                    pending.push(elem.to_string());
+                    if !self_closing {
+                        prop_depth = 2;
+                    }
+                } else if prop_depth >= 2 && !self_closing {
+                    // Nested value elements (sharee details, share-type...)
+                    // — tracked only for the closing-tag depth bookkeeping.
+                    prop_depth += 1;
+                }
+            }
         }
         i = after;
     }
@@ -691,6 +756,29 @@ mod tests {
             ],
             "hrefs must be the opening-tag values only"
         );
+    }
+
+    #[test]
+    fn shape_prop_sets_with_nested_values() {
+        // Two propstats (200 + 404), a self-closing prop, and nested value
+        // elements (sharee details) that must not count as props.
+        let body = r#"<d:multistatus xmlns:d="DAV:" xmlns:nc="http://nextcloud.org/ns">
+  <d:response>
+    <d:href>/a</d:href>
+    <d:propstat><d:prop><d:getetag>"x"</d:getetag><nc:sharees><nc:sharee><nc:id>1</nc:id><nc:type>user</nc:type></nc:sharee></nc:sharees><nc:system-tags/></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+    <d:propstat><d:prop><nc:lock/><d:getcontentlength></d:getcontentlength></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>
+  </d:response>
+</d:multistatus>"#;
+        let s = propfind_shape(body);
+        assert_eq!(s.responses, 1);
+        let (p200, p404) = s.props.get("/a").expect("node props");
+        let mut p200 = p200.clone();
+        p200.sort();
+        let mut p404 = p404.clone();
+        p404.sort();
+        if p200 != vec!["getetag", "sharees", "system-tags"] || p404 != vec!["getcontentlength", "lock"] {
+            panic!("props map: {:#?}", s.props);
+        }
     }
 
     #[test]
