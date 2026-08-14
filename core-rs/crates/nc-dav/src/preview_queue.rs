@@ -35,11 +35,14 @@ pub(crate) async fn queue_preview_generation(
          )",
         prefix = prefix
     );
+    // The columns are `integer` (INT4) on Postgres — bind at their exact SQL
+    // types or the strict native driver rejects the statement (every file
+    // write then fails to queue, starving background preview generation).
     let result = match pool {
         DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
             .bind(uid)
-            .bind(file_id)
-            .bind(queued_at)
+            .bind(file_id as i32)
+            .bind(queued_at as i32)
             .execute(p)
             .await
             .map(|_| ()),
