@@ -229,7 +229,13 @@ const PROXIED_DAV_SUBTREES: [&str; 10] = [
 ///   proxied subtree prefix → PHP-FPM (versions, comments, trashbin, …)
 ///   /uploads               → native upload handler (Phase 5.5)
 ///   /bulk (POST)           → native bulk handler (Phase 5.9)
-///   everything else        → native files tree (dav_handler)
+///   /files                 → native files tree (dav_handler)
+///   everything else        → PHP-FPM.  PHP's sabre root is dynamic — fixed
+///                             children plus app-registered collections
+///                             (photos, photospublic, …), so a static list
+///                             can never be complete; PHP is the registrar
+///                             of its own root (phase-18.md Changes
+///                             2026-08-16).
 async fn dav_arbiter_handler(State(state): State<AppState>, req: Request<Body>) -> Response {
     // Path remainder after the mount root.  Trim in this order so a
     // "/dav/…" path cannot consume the "/remote.php/dav" prefix.
@@ -266,6 +272,26 @@ async fn dav_arbiter_handler(State(state): State<AppState>, req: Request<Body>) 
         return nc_dav::bulk_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await;
     }
 
+    // ── The native files tree — the hot path ───────────────────────────────
+    // Classified explicitly now that the default branch proxies to PHP:
+    // everything else (the dav root itself, app-registered collections such
+    // as photos/systemtags/provisioning, any future subtree) belongs to
+    // PHP's sabre tree.  PHP is the registrar of its own root collection
+    // (apps/dav/lib/Server.php:415-417 mounts app collections;
+    // RootCollection.php:189-217 the fixed ones) — a static proxy list can
+    // never enumerate them, and the native files tree 404s anything that is
+    // not a filecache path (the live Photos Places PROPFIND
+    // /photos/{uid}/places/ died this way with an empty body).
+    if remainder.starts_with("/files/") || remainder == "/files" {
+        return nc_dav::dav_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await;
+    }
+
+    // Everything else → PHP-FPM; PHP decides whether the path exists.
+    if let Some(ref fpm) = state.fastcgi {
+        return nc_fastcgi::proxy_handler(fpm, req).await;
+    }
+    // No PHP-FPM configured (standalone dev) → native files tree, which
+    // returns its empty 404 for unknown subtrees.
     nc_dav::dav_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await
 }
 
@@ -431,7 +457,6 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nc_db::config::AppsPath;
 
     /// Build a config whose `apps_paths` contains one entry per url.
     fn cfg_with_apps_paths(urls: &[&str]) -> NcConfig {
