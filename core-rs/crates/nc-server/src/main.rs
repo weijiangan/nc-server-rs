@@ -240,6 +240,11 @@ async fn async_main() -> anyhow::Result<()> {
     let preview_gen =
         preview_gen::PreviewGen::from_config(&config, &appconfig_cache, &preview_registry);
 
+    // Static-asset whitelist prefixes derive from `apps_paths`; computed
+    // before `config` moves into the Arc below.
+    let static_prefixes =
+        std::sync::Arc::new(crate::router::static_prefixes_from_config(&config, &args.root));
+
     let state = AppState {
         pool,
         mime_cache,
@@ -248,6 +253,7 @@ async fn async_main() -> anyhow::Result<()> {
         token_cache,
         nc_config: std::sync::Arc::new(config),
         nc_root: args.root.clone(),
+        static_prefixes,
         table_prefix,
         fastcgi,
         instanceid,

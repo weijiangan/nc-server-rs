@@ -20,6 +20,12 @@ pub struct AppState {
     pub nc_config: Arc<NcConfig>,
     /// Nextcloud installation root (parent of `config/`, `apps/`, etc.)
     pub nc_root: std::path::PathBuf,
+    /// Static-asset whitelist prefixes (Phase 18.1): `/core/ /dist/ /themes/`
+    /// plus every `apps_paths` `url`, derived once at startup from
+    /// `nc_config` (see [`crate::router::static_prefixes_from_config`]).
+    /// Kept out of the request path so the per-request cost stays a handful
+    /// of string comparisons and the fs stat fires only on a candidate.
+    pub static_prefixes: std::sync::Arc<Vec<String>>,
     /// Table prefix (default `oc_`)
     pub table_prefix: String,
     /// PHP-FPM FastCGI proxy state.  `None` when `fastcgi_socket` is not set

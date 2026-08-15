@@ -29,6 +29,26 @@ impl std::fmt::Debug for Sensitive {
     }
 }
 
+/// One entry of `apps_paths` (PHP `OC::$APPSROOTS`, `lib/base.php:157-175`).
+///
+/// `path` / `url` are `Option` because PHP skips entries that lack either
+/// key (`isset($paths['url']) && isset($paths['path'])`) instead of failing
+/// the whole config.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct AppsPath {
+    /// Absolute filesystem path to the app folder.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// HTTP web path of that folder, relative to the Nextcloud webroot
+    /// (e.g. `/apps`, `/custom_apps`).  App asset URLs derive from it
+    /// (`AppManager::getAppWebPath`).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Whether a Web server can write to the folder.
+    #[serde(default)]
+    pub writable: Option<bool>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct NcConfig {
     // ── Database ────────────────────────────────────────────────────────────
@@ -78,6 +98,12 @@ pub struct NcConfig {
     /// default only, "so we cannot ship an insecure product out of the box".
     #[serde(default)]
     pub forwarded_for_headers: Option<Vec<String>>,
+    /// `apps_paths` — app installation roots, each mapping an absolute
+    /// filesystem `path` to a `url` web path.  PHP: `OC::$APPSROOTS`
+    /// (`lib/base.php:157-175`).  Absent/empty → the default `/apps` root
+    /// applies (mirrored by `router::static_prefixes_from_config`).
+    #[serde(default)]
+    pub apps_paths: Option<Vec<AppsPath>>,
     /// `overwritehost` — always-trusted host override (F2).
     #[serde(default)]
     pub overwritehost: Option<String>,
@@ -607,6 +633,30 @@ $CONFIG = [
             "URL leaked into Debug: {debug}"
         );
         assert!(debug.contains("Sensitive(<redacted>)"));
+    }
+
+    #[test]
+    fn apps_paths_parses() {
+        // JSON shape produced by the PHP-CLI loader (`json_encode($CONFIG)`).
+        let cfg: NcConfig = serde_json::from_value(serde_json::json!({
+            "dbtype": "pgsql",
+            "apps_paths": [
+                {"path": "/var/www/html/apps", "url": "/apps", "writable": true},
+                {"path": "/var/www/html/wapps", "url": "/wapps"}
+            ]
+        }))
+        .expect("parse failed");
+        let paths = cfg.apps_paths.as_ref().expect("apps_paths");
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].path.as_deref(), Some("/var/www/html/apps"));
+        assert_eq!(paths[0].url.as_deref(), Some("/apps"));
+        assert_eq!(paths[0].writable, Some(true));
+        // `writable` absent → `None`, not a parse failure.
+        assert_eq!(paths[1].url.as_deref(), Some("/wapps"));
+        assert_eq!(paths[1].writable, None);
+        // Absent key → `None`.
+        let cfg2: NcConfig = serde_json::from_str("{}").expect("empty config");
+        assert!(cfg2.apps_paths.is_none());
     }
 
     #[test]

@@ -624,12 +624,17 @@ mod tests {
     /// `fastcgi` and `session_cache` are left as `None` — these tests exercise
     /// the middleware paths that do not require a live PHP-FPM connection.
     async fn make_test_state(instanceid: &str) -> AppState {
-        make_test_state_with_root(instanceid, std::path::PathBuf::from(".")).await
+        make_test_state_with_root(instanceid, std::path::PathBuf::from("."), None).await
     }
 
     /// Same, with an explicit `nc_root` (the static-file whitelist resolves
-    /// candidates against it).
-    async fn make_test_state_with_root(instanceid: &str, nc_root: std::path::PathBuf) -> AppState {
+    /// candidates against it) and optional `apps_paths` (config-derived
+    /// whitelist prefixes).
+    async fn make_test_state_with_root(
+        instanceid: &str,
+        nc_root: std::path::PathBuf,
+        apps_paths: Option<Vec<nc_db::config::AppsPath>>,
+    ) -> AppState {
         let pool = DbPool::Sqlite(
             sqlx::sqlite::SqlitePoolOptions::new()
                 .connect("sqlite::memory:")
@@ -662,6 +667,7 @@ mod tests {
             overwritecondaddr: None,
             bruteforce_protection_enabled: false,
             oauth2_enable_oc_clients: false,
+            apps_paths,
             memcache_distributed: None,
             loglevel: 1,
             logfile: None,
@@ -695,6 +701,8 @@ mod tests {
             &appconfig_cache,
             &preview_registry,
         );
+        let static_prefixes =
+            Arc::new(crate::router::static_prefixes_from_config(&nc_config, &nc_root));
         AppState {
             pool,
             mime_cache: Arc::new(RwLock::new(MimeCache::default())),
@@ -706,6 +714,7 @@ mod tests {
             capability_cache,
             token_cache: nc_auth::new_token_cache(),
             nc_config: Arc::new(nc_config),
+            static_prefixes,
             nc_root,
             table_prefix: "oc_".to_owned(),
             fastcgi: None,
@@ -880,8 +889,9 @@ mod tests {
 
     // ── Static-file whitelist deny-path pins (15.1 remainder) ────────────────
     //
-    // The `try_static_files_check` whitelist (`/core/ /dist/ /themes/ /apps/`
-    // + `robots.txt` + `index.html`, Phase 18.1) is the F1 static-serving
+    // The `try_static_files_check` whitelist (`/core/ /dist/ /themes/` + every
+    // `apps_paths` `url` + `robots.txt` + `index.html`, Phase 18.1, prefixes
+    // config-derived since the /wapps incident) is the F1 static-serving
     // control: paths outside it never reach the filesystem.  These tests pin
     // that the deny side holds even when a real file exists at the denied
     // path — the property is whitelist-first, not "check the filesystem".
@@ -909,7 +919,7 @@ mod tests {
     /// GET `uri` through the composite middleware with `root` as `nc_root`;
     /// returns the final status.
     async fn static_request(root: &ScratchRoot, uri: &str) -> StatusCode {
-        let state = make_test_state_with_root("oc1abc", root.0.clone()).await;
+        let state = make_test_state_with_root("oc1abc", root.0.clone(), None).await;
         let app = Router::new()
             .route("/dav/files/alice", get(ok_handler))
             .layer(middleware::from_fn_with_state(
@@ -991,6 +1001,52 @@ mod tests {
         assert_eq!(
             static_request(&root, "/core/img/logo.svg").await,
             StatusCode::OK
+        );
+    }
+
+    /// A file under a configured `apps_paths` `url` IS served — the whitelist
+    /// is config-derived, so apps installed outside `/apps` (memories under
+    /// `/wapps` on the live install) work in standalone mode.
+    #[tokio::test]
+    async fn static_serves_custom_app_dir() {
+        let root = ScratchRoot::new(
+            "wapps",
+            &[("wapps/memories/js/memories-main.js", "x")],
+        );
+        let apps_paths = Some(vec![nc_db::config::AppsPath {
+            path: Some("/var/www/html/wapps".into()),
+            url: Some("/wapps".into()),
+            writable: Some(true),
+        }]);
+        let state = make_test_state_with_root("oc1abc", root.0.clone(), apps_paths).await;
+        let app = Router::new()
+            .route("/dav/files/alice", get(ok_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::router::http_middleware_stack,
+            ));
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/wapps/memories/js/memories-main.js")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    /// Without the matching `apps_paths` entry the same file is denied — the
+    /// config-derived whitelist is exclusive, not "anything under the root".
+    #[tokio::test]
+    async fn static_denies_unlisted_app_dir() {
+        let root = ScratchRoot::new(
+            "nowapps",
+            &[("wapps/memories/js/memories-main.js", "x")],
+        );
+        assert_eq!(
+            static_request(&root, "/wapps/memories/js/memories-main.js").await,
+            StatusCode::NOT_FOUND
         );
     }
 }

@@ -17,6 +17,75 @@ use crate::{
     middleware::{auth::auth_check, maintenance::maintenance_check},
     state::AppState,
 };
+use nc_db::config::NcConfig;
+
+/// Derive the static-asset whitelist prefixes from config — PHP's
+/// `OC::$APPSROOTS` (`lib/base.php:157-175`) mapped to web paths.
+///
+/// The server's own three asset roots (`/core/ /dist/ /themes/`) are fixed;
+/// app-level assets use every `apps_paths` entry's `url`, rtrimmed of
+/// trailing `/` exactly like PHP, with PHP's default-root fallback
+/// (`/apps`, only when that directory exists — `base.php:167-170`).
+/// Absent/empty `apps_paths` therefore yields the same surface as the
+/// original hardcoded whitelist, while custom app dirs (e.g. `/wapps` for
+/// memories on the live install) become servable in standalone mode.
+///
+/// Deliberate guards (see phase-18.md Changes):
+/// - A `url` that is empty or `/` after rtrim is skipped — as a prefix it
+///   would make every request path a static candidate, resurrecting the
+///   per-request fs stat Phase 18.1 removed (PHP tolerates webroot-root
+///   apps; the canonical deployment serves them via nginx's extension
+///   regex instead, which costs no fs stat).
+/// - A `url` not starting with `/` is skipped (a browser-relative web path —
+///   broken config in PHP too, `getAppWebPath` would emit `WEBROOT + url`).
+/// - Duplicate urls are collapsed (PHP de-duplicates nothing; the whitelist
+///   only needs the set).
+pub(crate) fn static_prefixes_from_config(cfg: &NcConfig, nc_root: &std::path::Path) -> Vec<String> {
+    let mut prefixes = vec![
+        "/core/".to_string(),
+        "/dist/".to_string(),
+        "/themes/".to_string(),
+    ];
+    let mut seen: std::collections::HashSet<String> = prefixes.iter().cloned().collect();
+
+    let app_urls: Vec<&str> = match &cfg.apps_paths {
+        // PHP: a non-empty `apps_paths` replaces the default entirely;
+        // entries lacking `url`/`path` are skipped (`isset` checks).
+        Some(paths) if !paths.is_empty() => {
+            paths.iter().filter_map(|p| p.url.as_deref()).collect()
+        }
+        _ => {
+            if nc_root.join("apps").is_dir() {
+                vec!["/apps"]
+            } else {
+                tracing::warn!(
+                    "no apps_paths configured and {}/apps missing — app static assets will not be served",
+                    nc_root.display()
+                );
+                vec![]
+            }
+        }
+    };
+    for url in app_urls {
+        // PHP rtrims both keys (`base.php:161-162`).
+        let url = url.trim_end_matches('/');
+        if url.is_empty() || url == "/" {
+            tracing::warn!(
+                "apps_paths url {url:?} skipped: a webroot-root path would make every request a static candidate"
+            );
+            continue;
+        }
+        if !url.starts_with('/') {
+            tracing::warn!("apps_paths url {url:?} skipped: not a web-root-relative path");
+            continue;
+        }
+        let prefix = format!("{url}/");
+        if seen.insert(prefix.clone()) {
+            prefixes.push(prefix);
+        }
+    }
+    prefixes
+}
 
 /// Static-file serving check (Phase 18.6): returns `Some(response)` when the
 /// path is a whitelisted static asset that exists on disk, `None` to fall
@@ -34,20 +103,20 @@ use crate::{
 ///   `ServeDir` (which handles ETag, Last-Modified, Range, and Content-Type
 ///   detection automatically).
 ///
-/// Covers `/core/`, `/dist/`, `/themes/`, and app-level static assets such as
-/// `/apps/files/img/icon.svg` that the PHP route wildcards would otherwise
-/// swallow and send to PHP-FPM.
+/// The candidate prefixes are config-derived (see
+/// [`static_prefixes_from_config`]): `/core/`, `/dist/`, `/themes/`, every
+/// `apps_paths` `url` (e.g. `/apps/`, `/wapps/`), plus the two exact root
+/// files.  Everything else (status.php, OCS, DAV, index.php, …) skips the fs
+/// stat entirely — this also stops serving repo files (AUTHORS, 3rdparty/*,
+/// dotfiles) that real nginx installs deny.  `/index.html` preserves the
+/// install page; GET / itself still falls through (the root is a directory).
 async fn try_static_files_check(state: &AppState, req: &mut Request<Body>) -> Option<Response> {
     if matches!(req.method(), &Method::GET | &Method::HEAD) {
         let path = req.uri().path().to_string();
-        // Phase 18: static files live only under the app's four asset roots
-        // plus two exact root files; everything else (status.php, OCS, DAV,
-        // index.php, …) skips the fs stat entirely.  This also stops serving
-        // repo files (AUTHORS, 3rdparty/*, dotfiles) that real nginx
-        // installs deny.  `/index.html` preserves the install page; GET /
-        // itself still falls through (the root is a directory).
-        const STATIC_PREFIXES: [&str; 4] = ["/core/", "/dist/", "/themes/", "/apps/"];
-        let is_static = STATIC_PREFIXES.iter().any(|p| path.starts_with(p))
+        let is_static = state
+            .static_prefixes
+            .iter()
+            .any(|p| path.starts_with(p))
             || matches!(path.as_str(), "/robots.txt" | "/index.html");
         // Skip PHP scripts and any path that looks like traversal.
         if is_static && !path.contains(".php") && !path.contains("..") {
@@ -357,4 +426,152 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
     ))
     .layer(trace_layer)
     .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nc_db::config::AppsPath;
+
+    /// Build a config whose `apps_paths` contains one entry per url.
+    fn cfg_with_apps_paths(urls: &[&str]) -> NcConfig {
+        let entries: Vec<serde_json::Value> = urls
+            .iter()
+            .map(|u| {
+                serde_json::json!({
+                    "path": format!("/var/www/html/{}", u.trim_start_matches('/')),
+                    "url": u,
+                    "writable": true,
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({ "apps_paths": entries })).expect("config parse")
+    }
+
+    /// Temp webroot with an `apps/` dir (PHP's default-root fallback needs
+    /// the directory to exist); unique per test+process.
+    fn root_with_apps_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nc-static-prefixes-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("apps")).expect("mkdir apps");
+        dir
+    }
+
+    #[test]
+    fn default_config_uses_apps_fallback() {
+        // No `apps_paths` + an existing `apps/` dir → PHP's default root.
+        let cfg: NcConfig = serde_json::from_str("{}").expect("empty config");
+        let root = root_with_apps_dir();
+        let prefixes = static_prefixes_from_config(&cfg, &root);
+        assert_eq!(
+            prefixes,
+            vec![
+                "/core/".to_string(),
+                "/dist/".to_string(),
+                "/themes/".to_string(),
+                "/apps/".to_string(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_apps_dir_drops_the_fallback() {
+        let cfg: NcConfig = serde_json::from_str("{}").expect("empty config");
+        let root = std::env::temp_dir().join(format!("nc-no-apps-{}", std::process::id()));
+        let prefixes = static_prefixes_from_config(&cfg, &root);
+        assert_eq!(
+            prefixes,
+            vec!["/core/".to_string(), "/dist/".to_string(), "/themes/".to_string()]
+        );
+    }
+
+    #[test]
+    fn apps_paths_replace_the_default() {
+        // A non-empty `apps_paths` replaces the `/apps` fallback entirely.
+        let cfg = cfg_with_apps_paths(&["/wapps", "/custom_apps"]);
+        let root = root_with_apps_dir();
+        let prefixes = static_prefixes_from_config(&cfg, &root);
+        assert_eq!(
+            prefixes,
+            vec![
+                "/core/".to_string(),
+                "/dist/".to_string(),
+                "/themes/".to_string(),
+                "/wapps/".to_string(),
+                "/custom_apps/".to_string(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trailing_slash_is_trimmed() {
+        // PHP rtrims `url` (`base.php:161`); both spellings yield one prefix.
+        let cfg = cfg_with_apps_paths(&["/wapps/", "/apps"]);
+        let root = root_with_apps_dir();
+        let prefixes = static_prefixes_from_config(&cfg, &root);
+        assert_eq!(
+            prefixes,
+            vec![
+                "/core/".to_string(),
+                "/dist/".to_string(),
+                "/themes/".to_string(),
+                "/wapps/".to_string(),
+                "/apps/".to_string(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn webroot_root_and_bare_urls_are_skipped() {
+        // `/` or `` as a prefix would make every request a static candidate
+        // (the per-request fs stat Phase 18.1 removed); a non-slash url is a
+        // browser-relative web path, broken in PHP too.
+        let cfg = cfg_with_apps_paths(&["/", "", "apps"]);
+        let root = root_with_apps_dir();
+        let prefixes = static_prefixes_from_config(&cfg, &root);
+        assert_eq!(
+            prefixes,
+            vec!["/core/".to_string(), "/dist/".to_string(), "/themes/".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn duplicate_urls_collapse() {
+        let cfg = cfg_with_apps_paths(&["/apps", "/apps"]);
+        let root = root_with_apps_dir();
+        let prefixes = static_prefixes_from_config(&cfg, &root);
+        assert_eq!(prefixes.iter().filter(|p| *p == "/apps/").count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn entries_without_url_are_skipped() {
+        // PHP skips entries lacking `url` or `path` (`isset` checks); a
+        // path-only entry contributes no web path.
+        let cfg: NcConfig = serde_json::from_value(serde_json::json!({
+            "apps_paths": [
+                {"path": "/var/www/html/wapps", "url": "/wapps"},
+                {"path": "/var/www/html/other"}
+            ]
+        }))
+        .expect("config parse");
+        let root = root_with_apps_dir();
+        let prefixes = static_prefixes_from_config(&cfg, &root);
+        assert_eq!(
+            prefixes,
+            vec![
+                "/core/".to_string(),
+                "/dist/".to_string(),
+                "/themes/".to_string(),
+                "/wapps/".to_string(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
