@@ -30,23 +30,8 @@ Rules and step-by-step procedures for agents working in this repo.
 - [`05-llm-playbooks/README.md`](05-llm-playbooks/README.md)
   - [`CONTRIBUTING-tasks.md`](05-llm-playbooks/CONTRIBUTING-tasks.md)
 
----
+## 6) Development notes
+Incident-derived engineering lessons (root causes and decisions the code alone hides).
+- [`06-development-notes/README.md`](06-development-notes/README.md)
+  - [`01-static-assets-outside-apps.md`](06-development-notes/01-static-assets-outside-apps.md)
 
-## Directory map
-
-```
-SPECS/
-├── 01-requirements/
-│   ├── problem-statement.md
-│   └── requirements/         # REQ split into 20 section files + index
-├── 02-specifications/
-│   ├── improvements.md
-│   └── api-compatibility/    # API_COMPATIBILITY split into 15 section files + index
-├── 03-implementation-plan/
-│   └── plan/                 # IMPL_PLAN split into 13 section files + index
-├── 04-tasks/
-│   ├── tasks.md
-│   └── phase-0.md … phase-8.md
-└── 05-llm-playbooks/
-    └── CONTRIBUTING-tasks.md
-```
