@@ -26,6 +26,18 @@ pub struct AppState {
     /// Kept out of the request path so the per-request cost stays a handful
     /// of string comparisons and the fs stat fires only on a candidate.
     pub static_prefixes: std::sync::Arc<Vec<String>>,
+    /// Path prefixes whose requests Rust serves natively — the surface where
+    /// the edge SameSite gate applies (see
+    /// [`crate::router::samesite_gated_prefixes`]).
+    ///
+    /// PHP-proxied paths (index.php and app routes, public.php, login, root,
+    /// well-known, the OCS catch-all) are deliberately absent: PHP's own
+    /// pipeline (base.php + AppFramework SecurityMiddleware) enforces the
+    /// strict-cookie gate there with route-annotation knowledge the edge
+    /// cannot have.  An edge gate on proxied index.php routes 412s
+    /// cross-site flows PHP passes — e.g. the user_oidc login callback,
+    /// whose route is `@NoCSRFRequired`.
+    pub samesite_gated_prefixes: std::sync::Arc<Vec<String>>,
     /// Table prefix (default `oc_`)
     pub table_prefix: String,
     /// PHP-FPM FastCGI proxy state.  `None` when `fastcgi_socket` is not set

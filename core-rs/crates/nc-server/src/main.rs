@@ -244,6 +244,9 @@ async fn async_main() -> anyhow::Result<()> {
     // before `config` moves into the Arc below.
     let static_prefixes =
         std::sync::Arc::new(crate::router::static_prefixes_from_config(&config, &args.root));
+    // Edge SameSite gate scope — the Rust-native surface (see
+    // `router::samesite_gated_prefixes`); proxied paths defer to PHP.
+    let samesite_gated_prefixes = std::sync::Arc::new(crate::router::samesite_gated_prefixes());
 
     let state = AppState {
         pool,
@@ -254,6 +257,7 @@ async fn async_main() -> anyhow::Result<()> {
         nc_config: std::sync::Arc::new(config),
         nc_root: args.root.clone(),
         static_prefixes,
+        samesite_gated_prefixes,
         table_prefix,
         fastcgi,
         instanceid,

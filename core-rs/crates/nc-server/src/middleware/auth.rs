@@ -130,8 +130,8 @@ pub async fn auth_check(
     let legacy_salt = state.nc_config.passwordsalt.as_deref().unwrap_or_default();
 
     // ── CSRF check ────────────────────────────────────────────────────────
-    // For Phase 3, we only enforce CSRF if session cookies are present AND
-    // the strict cookie guard fails (task 3.5).
+    // We only enforce CSRF if session cookies are present AND the strict
+    // cookie guard fails (task 3.5).
     let cookie_header = req
         .headers()
         .get("cookie")
@@ -148,7 +148,24 @@ pub async fn auth_check(
         .unwrap_or(false);
 
     use nc_auth::session::{check_samesite_cookies, CookieCheck};
-    if auth_header.is_none() && !ocs_api_request {
+    // The edge gate mirrors PHP's base.php check (base.php:560-611) and
+    // therefore applies ONLY to the Rust-native surface (see
+    // `router::samesite_gated_prefixes`).  Requests proxied to PHP-FPM skip
+    // it: PHP's own pipeline enforces the strict-cookie gate there with
+    // route-annotation knowledge the edge cannot have — index.php routes
+    // are gated per-route by the AppFramework SecurityMiddleware
+    // (SecurityMiddleware.php:190-195), which exempts `@NoCSRFRequired`
+    // endpoints such as user_oidc's cross-site login callback
+    // (`login#code`).  Gating those at the edge 412s flows PHP passes:
+    // browsers withhold the SameSite=Strict guard cookie on the cross-site
+    // OIDC redirect, and the `state` param is that flow's CSRF protection.
+    if auth_header.is_none()
+        && !ocs_api_request
+        && state
+            .samesite_gated_prefixes
+            .iter()
+            .any(|p| path.starts_with(p))
+    {
         match check_samesite_cookies(&cookie_header, &state.instanceid, is_https) {
             CookieCheck::StrictCheckFailed => {
                 // PHP returns 412 Precondition Failed for strict cookie check
@@ -703,6 +720,7 @@ mod tests {
         );
         let static_prefixes =
             Arc::new(crate::router::static_prefixes_from_config(&nc_config, &nc_root));
+        let samesite_gated_prefixes = Arc::new(crate::router::samesite_gated_prefixes());
         AppState {
             pool,
             mime_cache: Arc::new(RwLock::new(MimeCache::default())),
@@ -715,6 +733,7 @@ mod tests {
             token_cache: nc_auth::new_token_cache(),
             nc_config: Arc::new(nc_config),
             static_prefixes,
+            samesite_gated_prefixes,
             nc_root,
             table_prefix: "oc_".to_owned(),
             fastcgi: None,
@@ -877,6 +896,69 @@ mod tests {
             .method("GET")
             .uri("/remote.php/webdav/")
             .header("cookie", "oc1abc=somesessionid")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    /// The OIDC login callback (cross-site redirect from the identity
+    /// provider) is proxied to PHP-FPM and must NOT hit the edge SameSite
+    /// gate — PHP's SecurityMiddleware exempts the route (`@NoCSRFRequired`
+    /// on user_oidc's `login#code`; the `state` param is the CSRF
+    /// protection).  Browsers send the lax guard cookie on the cross-site
+    /// top-level navigation but withhold the SameSite=Strict one, so the
+    /// edge gate would 412 a flow PHP passes (Safari OIDC login broke this
+    /// way on the live deployment, 2026-08-15).
+    #[tokio::test]
+    async fn proxied_index_php_path_skips_samesite_gate() {
+        let state = make_test_state("oc1abc").await;
+        let app = Router::new()
+            .route("/index.php/apps/user_oidc/code", get(ok_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::router::http_middleware_stack,
+            ));
+
+        // Session cookie + lax guard only — the exact cookie shape of the
+        // cross-site OIDC redirect (Safari withholds SameSite=Strict).
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/index.php/apps/user_oidc/code?code=xyz&state=abc")
+            .header("cookie", "oc1abc=somesessionid; nc_sameSiteCookielax=true")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Gate skipped → anonymous → handler returns 200, not 412.
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The same cookie shape on a Rust-native path must still 412: the edge
+    /// gate mirrors PHP's base.php check for the scripts Rust serves itself
+    /// (remote.php), and PHP gates those wholesale — no annotation exemption
+    /// exists below index.php.
+    #[tokio::test]
+    async fn native_path_with_lax_only_guard_returns_412() {
+        let state = make_test_state("oc1abc").await;
+        let app = Router::new()
+            .route("/remote.php/dav/files/alice", get(ok_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::router::http_middleware_stack,
+            ));
+
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/remote.php/dav/files/alice")
+            .header("cookie", "oc1abc=somesessionid; nc_sameSiteCookielax=true")
             .body(Body::empty())
             .unwrap();
         req.extensions_mut().insert(axum::extract::ConnectInfo(

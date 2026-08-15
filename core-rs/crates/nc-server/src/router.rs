@@ -87,6 +87,48 @@ pub(crate) fn static_prefixes_from_config(cfg: &NcConfig, nc_root: &std::path::P
     prefixes
 }
 
+/// Path prefixes where the edge SameSite gate applies — the Rust-native
+/// surface (every route whose handler is NOT `php_fpm_fallback`).
+///
+/// PHP enforces the strict-cookie check in two layers:
+/// 1. `base.php` `performSameSiteCookieProtection` (base.php:560-611,
+///    invoked from `OC::init` at base.php:773) — for every script except
+///    `index.php`, `cron.php`, `public.php` (base.php:588-591).
+/// 2. The AppFramework `SecurityMiddleware` (SecurityMiddleware.php:190-195)
+///    — for index.php routes, annotation-driven: skipped when the route is
+///    `@NoCSRFRequired`.
+///
+/// Rust replicates layer 1 at the edge for the scripts it serves natively:
+/// remote.php (DAV), the OCS scripts, and the native index.php preview /
+/// thumbnail routes (PHP's middleware gates those too — none of the native
+/// handlers is `@NoCSRFRequired`).  Requests proxied to PHP-FPM are exempt
+/// on purpose — PHP's own pipeline decides there, with annotation knowledge
+/// the edge cannot have.  Gating a proxied index.php route 412s cross-site
+/// flows PHP passes: the OIDC login callback `/index.php/apps/user_oidc/code`
+/// is `#[NoCSRFRequired]` (the `state` param is the CSRF protection), and
+/// browsers withhold the SameSite=Strict guard cookie on the cross-site
+/// redirect from the identity provider — an edge gate would break every
+/// Safari OIDC login.
+///
+/// Must be kept in sync with the native route registrations in [`build`]:
+/// /remote.php* (webdav, dav arbiter incl. uploads), /dav*, /ocs/v1.php,
+/// /ocs/v2.php (native OCS routes and the proxy catch-all — PHP gates the
+/// v1.php/v2.php scripts at base.php either way), and the native preview /
+/// thumbnail routes.  `/status.php` and `/heartbeat` are absent because
+/// `auth_check` returns before the gate for them.
+pub(crate) fn samesite_gated_prefixes() -> Vec<String> {
+    vec![
+        "/remote.php".to_string(),
+        "/dav".to_string(),
+        "/ocs/v1.php".to_string(),
+        "/ocs/v2.php".to_string(),
+        "/core/preview".to_string(),
+        "/index.php/core/preview".to_string(),
+        "/apps/files/api/v1/thumbnail/".to_string(),
+        "/index.php/apps/files/api/v1/thumbnail/".to_string(),
+    ]
+}
+
 /// Static-file serving check (Phase 18.6): returns `Some(response)` when the
 /// path is a whitelisted static asset that exists on disk, `None` to fall
 /// through to the maintenance + auth + route stack.  Extracted from the
@@ -573,6 +615,52 @@ mod tests {
         let prefixes = static_prefixes_from_config(&cfg, &root);
         assert_eq!(prefixes.iter().filter(|p| *p == "/apps/").count(), 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The edge SameSite gate's scope must cover exactly the native surface:
+    /// remote.php (webdav + dav arbiter + uploads), the /dav alias, the OCS
+    /// scripts (native routes AND the proxy catch-all — PHP gates the
+    /// v1.php/v2.php scripts at base.php either way), and the native preview /
+    /// thumbnail routes.  Proxied index.php / app / public.php / login / root /
+    /// well-known paths are deliberately absent (PHP's annotation-aware
+    /// middleware decides there).
+    #[test]
+    fn samesite_gated_prefixes_cover_the_native_surface() {
+        let prefixes = samesite_gated_prefixes();
+        for native in [
+            "/remote.php/webdav/",
+            "/remote.php/dav/files/alice/",
+            "/remote.php/dav/uploads/",
+            "/dav/files/alice/",
+            "/ocs/v1.php/config",
+            "/ocs/v2.php/cloud/capabilities",
+            "/core/preview",
+            "/core/preview.png",
+            "/index.php/core/preview",
+            "/apps/files/api/v1/thumbnail/32/32/test.png",
+            "/index.php/apps/files/api/v1/thumbnail/32/32/test.png",
+        ] {
+            assert!(
+                prefixes.iter().any(|p| native.starts_with(p)),
+                "{native} must be SameSite-gated"
+            );
+        }
+        for proxied in [
+            "/index.php/apps/user_oidc/code",
+            "/index.php/login",
+            "/index.php",
+            "/public.php/webdav",
+            "/login",
+            "/.well-known/webfinger",
+            "/apps/files/",
+            "/",
+            "/ocs-provider/index.php",
+        ] {
+            assert!(
+                !prefixes.iter().any(|p| proxied.starts_with(p)),
+                "{proxied} must defer the SameSite gate to PHP"
+            );
+        }
     }
 
     #[test]
