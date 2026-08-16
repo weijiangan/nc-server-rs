@@ -16,8 +16,10 @@ use axum::{
     response::Response,
 };
 use http::{HeaderName, HeaderValue, StatusCode};
+use md5::Digest;
 use nc_auth::AuthInfo;
 use nc_db::pool::DbPool;
+use std::time::SystemTime;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -80,7 +82,171 @@ pub async fn upload_handler(State(state): State<NcDavState>, req: Request) -> Re
         "PUT" => handle_put(state, req, upload_id.as_deref(), &path).await,
         "MOVE" => handle_move(state, req, &path, upload_id.as_deref()).await,
         "DELETE" => handle_delete(state, upload_id.as_deref(), &path).await,
+        "PROPFIND" => handle_propfind(state, upload_id.as_deref(), &path).await,
         _ => method_not_allowed_response(),
+    }
+}
+
+/// Handle PROPFIND on the uploads tree — PHP parity.
+///
+/// PHP (SabreDAV) treats the uploads tree as ordinary collections
+/// (`apps/dav/lib/Upload/UploadHome.php`, `UploadFolder.php`): the user's
+/// upload home always exists (207), a missing upload slot 404s, and an
+/// existing slot / chunk part returns 207 with sabre's default allprop
+/// properties.  The previous `_ => 405` default broke every chunked upload:
+/// the iOS client opens an upload with a PROPFIND on
+/// `/uploads/{uid}/{upload_id}` (existence/resume check) and aborts with
+/// "failed to create folder" (-9996) on any non-2xx/404 status.  Verified
+/// live against the oracle: missing slot → 404, existing slot → 207 with
+/// `<d:getlastmodified>` + `<d:resourcetype><d:collection/>`, part file →
+/// 207 with `getlastmodified`, `getcontentlength`, `getetag` (content MD5,
+/// quoted) and `getcontenttype application/octet-stream`.
+///
+/// Deliberate deviations (wire-identical):
+/// - The part `getetag` is the content MD5, whereas PHP serves the
+///   manifest-stored ETag (`PartFile::getETag` reads `$partInfo['ETag']`,
+///   which the chunking plugin set from the OC node etag at PUT time).
+///   Both are opaque strings; no client consumes the part etag.
+/// - The PROPFIND request body is not parsed; all requested prop sets get
+///   the default allprop set (clients ignore extras; Depth is ignored, so
+///   children are never listed).
+/// - PHP's UploadHome lazily *creates* the user's upload folder on first
+///   access (a write side effect); Rust uses a shared
+///   `{data_dir}/uploads/{uid}` layout materialized only when chunks are
+///   written, so a missing folder reports `now` as mtime instead of being
+///   created.
+async fn handle_propfind(state: NcDavState, upload_id: Option<&str>, path: &str) -> Response {
+    let path_parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let uploads_pos = path_parts.iter().position(|&s| s == "uploads").unwrap_or(0);
+    let user_id = path_parts.get(uploads_pos + 1).copied().unwrap_or("");
+
+    // uploads/{uid} — the upload home itself; PHP's UploadHome always exists.
+    let Some(upload_id) = upload_id else {
+        return propfind_response(
+            propfind_href(path, true),
+            &[
+                format!(
+                    "<d:getlastmodified>{}</d:getlastmodified>",
+                    httpdate::fmt_http_date(
+                        dir_mtime_or_now(&state.data_directory.join("uploads").join(user_id))
+                            .await
+                    )
+                ),
+                "<d:resourcetype><d:collection/></d:resourcetype>".to_string(),
+            ],
+        );
+    };
+
+    // uploads/{uid}/{upload_id}/{part_id} — a chunk part.
+    if let Some(part_id) = path_parts.get(uploads_pos + 3) {
+        let part_path = state
+            .data_directory
+            .join("uploads")
+            .join(user_id)
+            .join(upload_id)
+            .join(part_id);
+        let meta = match fs::metadata(&part_path).await {
+            Ok(m) if m.is_file() => m,
+            _ => return not_found_response(),
+        };
+        // Content MD5 — stable and strong; PHP serves the manifest ETag
+        // instead (documented in the fn doc).
+        let etag = match fs::read(&part_path).await {
+            Ok(bytes) => hex::encode(md5::Md5::digest(&bytes)),
+            Err(_) => return not_found_response(),
+        };
+        return propfind_response(
+            propfind_href(path, false),
+            &[
+                format!(
+                    "<d:getlastmodified>{}</d:getlastmodified>",
+                    httpdate::fmt_http_date(meta.modified().unwrap_or(SystemTime::now()))
+                ),
+                format!("<d:getcontentlength>{}</d:getcontentlength>", meta.len()),
+                "<d:resourcetype/>".to_string(),
+                format!("<d:getetag>&quot;{etag}&quot;</d:getetag>"),
+                "<d:getcontenttype>application/octet-stream</d:getcontenttype>".to_string(),
+            ],
+        );
+    }
+
+    // uploads/{uid}/{upload_id} — the slot.  A slot exists once MKCOL
+    // registered it, or when chunks are on disk (survives a server restart
+    // that loses the in-process session store — PHP reads the disk too).
+    let slot_dir = state
+        .data_directory
+        .join("uploads")
+        .join(user_id)
+        .join(upload_id);
+    let slot_exists = state.upload_state_store.session_exists(upload_id).await
+        || fs::metadata(&slot_dir).await.map(|m| m.is_dir()).unwrap_or(false);
+    if !slot_exists {
+        return not_found_response();
+    }
+    propfind_response(
+        propfind_href(path, true),
+        &[
+            format!(
+                "<d:getlastmodified>{}</d:getlastmodified>",
+                httpdate::fmt_http_date(dir_mtime_or_now(&slot_dir).await)
+            ),
+            "<d:resourcetype><d:collection/></d:resourcetype>".to_string(),
+        ],
+    )
+}
+
+/// Build the multistatus body for a single node, mirroring PHP's sabre
+/// output shape (one propstat, `HTTP/1.1 200 OK`).
+fn propfind_response(href: String, props: &[String]) -> Response {
+    let body = format!(
+        "<?xml version=\"1.0\"?>\n\
+         <d:multistatus \
+         xmlns:d=\"DAV:\" \
+         xmlns:s=\"http://sabredav.org/ns\" \
+         xmlns:oc=\"http://owncloud.org/ns\" \
+         xmlns:nc=\"http://nextcloud.org/ns\">\
+         <d:response><d:href>{}</d:href><d:propstat><d:prop>{}</d:prop>\
+         <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>\
+         </d:multistatus>",
+        xml_escape(&href),
+        props.join(""),
+    );
+    http::Response::builder()
+        .status(StatusCode::MULTI_STATUS)
+        .header(
+            H_CSP.clone(),
+            HeaderValue::from_static("default-src 'none';"),
+        )
+        .header(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/xml; charset=utf-8"),
+        )
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// The href sabre echoes in a PROPFIND response: the request path, with a
+/// trailing slash appended for collections (sabre normalizes collection
+/// hrefs; oracle responses end with `/`).
+fn propfind_href(path: &str, is_collection: bool) -> String {
+    if is_collection && !path.ends_with('/') {
+        format!("{path}/")
+    } else {
+        path.to_string()
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// mtime of a directory if it exists, otherwise `now` — PHP's upload home
+/// always has a real mtime because it materializes the folder on first
+/// access; Rust's shared layout does not.
+async fn dir_mtime_or_now(dir: &std::path::Path) -> SystemTime {
+    match fs::metadata(dir).await {
+        Ok(m) => m.modified().unwrap_or(SystemTime::now()),
+        Err(_) => SystemTime::now(),
     }
 }
 
@@ -1088,5 +1254,56 @@ mod tests {
         // Destination for root of user's files: /dav/files/user
         let result = parse_destination_path("/dav/files/user", "/dav/uploads/user/upload123");
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_propfind_href_collection_appends_slash() {
+        assert_eq!(
+            propfind_href("/remote.php/dav/uploads/admin/slot123", true),
+            "/remote.php/dav/uploads/admin/slot123/"
+        );
+    }
+
+    #[test]
+    fn test_propfind_href_collection_no_double_slash() {
+        assert_eq!(
+            propfind_href("/remote.php/dav/uploads/admin/slot123/", true),
+            "/remote.php/dav/uploads/admin/slot123/"
+        );
+    }
+
+    #[test]
+    fn test_propfind_href_file_no_slash() {
+        assert_eq!(
+            propfind_href("/remote.php/dav/uploads/admin/slot123/1", false),
+            "/remote.php/dav/uploads/admin/slot123/1"
+        );
+    }
+
+    #[test]
+    fn test_xml_escape() {
+        assert_eq!(xml_escape("a&b<c>d"), "a&amp;b&lt;c&gt;d");
+    }
+
+    #[tokio::test]
+    async fn test_propfind_response_shape() {
+        let resp = propfind_response(
+            propfind_href("/remote.php/dav/uploads/admin/slot123", true),
+            &[
+                "<d:getlastmodified>Sun, 16 Aug 2026 11:30:07 GMT</d:getlastmodified>".to_string(),
+                "<d:resourcetype><d:collection/></d:resourcetype>".to_string(),
+            ],
+        );
+        assert_eq!(resp.status(), StatusCode::MULTI_STATUS);
+        let (_, body) = resp.into_parts();
+        let body = axum::body::to_bytes(body, 4096)
+            .await
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .unwrap();
+        assert!(body.contains("<d:multistatus"));
+        assert!(body.contains("<d:href>/remote.php/dav/uploads/admin/slot123/</d:href>"));
+        assert!(body.contains("<d:getlastmodified>Sun, 16 Aug 2026 11:30:07 GMT</d:getlastmodified>"));
+        assert!(body.contains("<d:resourcetype><d:collection/></d:resourcetype>"));
+        assert!(body.contains("<d:status>HTTP/1.1 200 OK</d:status>"));
     }
 }
