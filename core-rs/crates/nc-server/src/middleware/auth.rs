@@ -186,6 +186,39 @@ pub async fn auth_check(
     // path — §7.9.3/§7.9.4).  They are appended to the final HTTP response
     // after the downstream handler completes.
     let mut pending_set_cookies: Vec<String> = Vec::new();
+
+    // ── Session-over-Basic (PHP parity) ─────────────────────────────────────
+    // PHP resolves the session cookie before Basic credentials on dav and
+    // OCS: Auth.php's `auth()` accepts a logged-in session immediately
+    // (Auth.php:184-186) and `validateUserPass` short-circuits on
+    // `isLoggedIn` (Auth.php:76-81); ocs/v1.php gates Basic behind
+    // `isLoggedIn` (ocs/v1.php:57-58).  The iOS client sends cookies + Basic
+    // on every request; verifying Basic first costs a bcrypt
+    // password_verify per request that PHP never pays while the session is
+    // valid, and picks the Basic identity over the session's.  Resolve the
+    // session up front when both are present.  The DAV fixation guard
+    // applies here too; a marker mismatch falls through to Basic, exactly as
+    // PHP's `auth()` falls to `parent::check()` when the cookie branch
+    // fails.
+    let session_first: Option<SessionAuth> = if !cookie_header.is_empty()
+        && auth_header.as_deref().is_some_and(|ah| ah.starts_with("Basic "))
+    {
+        match session_auth(state, &cookie_header).await {
+            Some(sa)
+                if !is_dav
+                    || dav_session_guard(
+                        &sa.identity.uid,
+                        sa.identity.dav_authenticated_uid.as_deref(),
+                    ) =>
+            {
+                Some(sa)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let auth_info: Option<AuthInfo> = match &auth_header {
         Some(ah) if ah.starts_with("Bearer ") => {
             // REQ §4.6: throttle bearer attempts the same as Basic (brute-force
@@ -291,6 +324,22 @@ pub async fn auth_check(
             }
         }
         Some(ah) if ah.starts_with("Basic ") => {
+            // Valid session present → authenticate as the session user; the
+            // Basic credentials are never verified (PHP parity — see
+            // `session_first` above).
+            if let Some(sa) = session_first {
+                pending_set_cookies = sa.set_cookies;
+                let is_admin =
+                    nc_auth::is_admin_user(&sa.identity.uid, &state.pool, &state.table_prefix)
+                        .await;
+                Some(AuthInfo {
+                    uid: sa.identity.uid,
+                    is_admin,
+                    method: AuthMethod::Session,
+                    token_id: None,
+                    raw_token: None,
+                })
+            } else {
             // Check brute-force throttle before verifying credentials (REQ §4.6).
             let throttle = nc_auth::bruteforce::check_throttle(
                 "login",
@@ -405,108 +454,25 @@ pub async fn auth_check(
                     }
                 }
             }
+            }
         }
         _ => {
-            // No Authorization header (or unrecognized scheme) — try PHP session
-            // cookie resolution (§7.9.6).
+            // No Authorization header (or unrecognized scheme) — try PHP
+            // session cookie resolution (§7.9.6).
             tracing::debug!(
                 path = %path,
                 has_cookies = !cookie_header.is_empty(),
                 "no recognized Authorization header — falling back to session cookies"
             );
-            //
             // Browser requests authenticate via the PHP login flow and carry
             // only cookies on subsequent requests; the Authorization header is
             // absent.  We ask the PHP-FPM shim's `__session_resolve` endpoint
             // to run `OC::handleLogin()` and return the resolved identity.
-            //
-            // Guard: PHP-FPM must be configured — without it there is no
-            // `__session_resolve` endpoint and no session cache to populate.
-            let (Some(fpm), Some(session_cache)) = (&state.fastcgi, &state.session_cache) else {
-                // PHP-FPM not configured — treat as anonymous.
+            let Some(sa) = session_auth(state, &cookie_header).await else {
+                // No usable session (no FPM, no session cookies, negative
+                // cache, or PHP rejected it) — anonymous; the route handler
+                // decides whether to reject with 401.
                 return Ok(Vec::new());
-            };
-
-            // Find the raw session-cookie value (PHP session cookie keyed on
-            // `{instanceid}`, or `nc_token` for the remember-me fallback).
-            // PHP's `cookieCheckRequired()` uses the same two cookies as the
-            // session trigger (Request.php:464-470).
-            let Some(raw_val) =
-                nc_auth::session::session_cookie_value(&state.instanceid, &cookie_header)
-            else {
-                // No session cookies at all — anonymous request.
-                return Ok(Vec::new());
-            };
-            let raw_val = raw_val.to_owned();
-
-            // ── Session identity cache lookup (§7.9.5) ──────────────────────
-            // Key: SHA-256(raw PHP session cookie value).
-            let cache_key = nc_auth::make_cache_key(&raw_val);
-            let positive_ttl =
-                std::time::Duration::from_secs(state.nc_config.session_cache_ttl.unwrap_or(60));
-            let identity = match nc_auth::cache_lookup(session_cache, &cache_key, positive_ttl) {
-                nc_auth::CacheLookup::Positive(cached) => cached,
-                // F3 (Wave 2.1): a fresh negative entry — a junk cookie or
-                // expired session resolved within the last 5 s — is treated
-                // exactly like a fresh failed resolution (anonymous) without
-                // touching PHP-FPM.  This is what absorbs an attacker's
-                // request burst.
-                nc_auth::CacheLookup::Negative => return Ok(Vec::new()),
-                nc_auth::CacheLookup::Miss => {
-                    // F3 concurrency cap: at most `session_resolve_concurrency`
-                    // `__session_resolve` round-trips in flight, so FPM
-                    // saturation is not reachable through resolution alone.
-                    // Excess requests wait a bounded time, then fall through
-                    // anonymous (the handler may still 401).
-                    let sem = fpm.session_resolve_semaphore.clone();
-                    match tokio::time::timeout(RESOLVE_ACQUIRE_TIMEOUT, sem.acquire_owned()).await {
-                        Ok(Ok(_permit)) => {}
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "session-resolve: semaphore closed");
-                            return Ok(Vec::new());
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                "session-resolve: concurrency cap busy for {RESOLVE_ACQUIRE_TIMEOUT:?} — \
-                                 falling through anonymous"
-                            );
-                            return Ok(Vec::new());
-                        }
-                    }
-                    // Cache miss — ask PHP-FPM to run the auth chain.
-                    match nc_fastcgi::resolve_session(fpm, &cookie_header).await {
-                        Some(result) => {
-                            nc_auth::cache_insert(
-                                session_cache,
-                                cache_key,
-                                result.identity.clone(),
-                            );
-                            // Remember-me token rotation: forward any
-                            // Set-Cookie headers the shim emitted so the
-                            // browser receives the refreshed nc_token /
-                            // nc_username / nc_session_id cookies (§7.9.3).
-                            //
-                            // NOTE (F3): rotation runs on cache miss only —
-                            // a cached identity skips PHP's
-                            // loginWithCookie(), so remember-me tokens
-                            // rotate at most once per positive-TTL window,
-                            // not per request.  Deliberate: the cache TTL
-                            // (the revocation knob) bounds it.
-                            pending_set_cookies = result.set_cookies;
-                            result.identity
-                        }
-                        None => {
-                            // PHP says the session is invalid or
-                            // unauthenticated.  Cache the negative result
-                            // (5 s TTL) so a burst of junk cookies hits
-                            // memory, not FPM (F3) — and fall through as
-                            // anonymous; the route handler decides whether
-                            // to reject with 401.
-                            nc_auth::cache_insert_negative(session_cache, cache_key);
-                            return Ok(Vec::new());
-                        }
-                    }
-                }
             };
 
             // ── DAV session-fixation guard (§7.9.6; Auth.php:184-186) ───────
@@ -524,16 +490,17 @@ pub async fn auth_check(
             // This check is scoped to DAV endpoint paths only; OCS and other
             // routes do not run through SabreDAV Auth.php.
             if is_dav
-                && !dav_session_guard(&identity.uid, identity.dav_authenticated_uid.as_deref())
+                && !dav_session_guard(&sa.identity.uid, sa.identity.dav_authenticated_uid.as_deref())
             {
                 return Err(build_401(true, is_xhr, true, false));
             }
 
+            pending_set_cookies = sa.set_cookies;
             // Build and return the resolved identity.
             let is_admin =
-                nc_auth::is_admin_user(&identity.uid, &state.pool, &state.table_prefix).await;
+                nc_auth::is_admin_user(&sa.identity.uid, &state.pool, &state.table_prefix).await;
             Some(AuthInfo {
-                uid: identity.uid,
+                uid: sa.identity.uid,
                 is_admin,
                 method: AuthMethod::Session,
                 token_id: None,
@@ -552,6 +519,107 @@ pub async fn auth_check(
     // the response after the handler runs, exactly as the former middleware
     // did.
     Ok(pending_set_cookies)
+}
+
+// ── Session resolution ────────────────────────────────────────────────────────
+
+/// Result of a PHP session-cookie resolution (§7.9.5-6).
+struct SessionAuth {
+    identity: nc_auth::SessionIdentity,
+    /// Set-Cookie headers emitted by the shim's `__session_resolve`
+    /// (remember-me token rotation) — forwarded onto the response.
+    set_cookies: Vec<String>,
+}
+
+/// Resolve the PHP session cookie via the FPM shim's `__session_resolve`
+/// endpoint, with the F3 positive/negative cache and concurrency cap.
+/// Returns `None` when there is no usable session — no FPM configured, no
+/// session cookie value, a fresh negative cache entry, or PHP rejecting
+/// the session — and `Some` on a valid session.  Callers decide the
+/// fallback (anonymous, or Basic when credentials were supplied).
+async fn session_auth(state: &AppState, cookie_header: &str) -> Option<SessionAuth> {
+    // Guard: the session cache is required to serve hits; PHP-FPM is
+    // required only on the miss path (the `__session_resolve` round-trip).
+    let Some(session_cache) = state.session_cache.as_ref() else {
+        return None;
+    };
+
+    // Find the raw session-cookie value (PHP session cookie keyed on
+    // `{instanceid}`, or `nc_token` for the remember-me fallback).
+    // PHP's `cookieCheckRequired()` uses the same two cookies as the
+    // session trigger (Request.php:464-470).
+    let raw_val = nc_auth::session::session_cookie_value(&state.instanceid, cookie_header)?
+        .to_owned();
+
+    // ── Session identity cache lookup (§7.9.5) ──────────────────────────────
+    // Key: SHA-256(raw PHP session cookie value).
+    let cache_key = nc_auth::make_cache_key(&raw_val);
+    let positive_ttl =
+        std::time::Duration::from_secs(state.nc_config.session_cache_ttl.unwrap_or(60));
+    let mut set_cookies = Vec::new();
+    let identity = match nc_auth::cache_lookup(session_cache, &cache_key, positive_ttl) {
+        nc_auth::CacheLookup::Positive(cached) => cached,
+        // F3 (Wave 2.1): a fresh negative entry — a junk cookie or
+        // expired session resolved within the last 5 s — is treated
+        // exactly like a fresh failed resolution (anonymous) without
+        // touching PHP-FPM.  This is what absorbs an attacker's
+        // request burst.
+        nc_auth::CacheLookup::Negative => return None,
+        nc_auth::CacheLookup::Miss => {
+            // No PHP-FPM configured — nothing to resolve against.
+            let Some(fpm) = state.fastcgi.as_ref() else {
+                return None;
+            };
+            // F3 concurrency cap: at most `session_resolve_concurrency`
+            // `__session_resolve` round-trips in flight, so FPM
+            // saturation is not reachable through resolution alone.
+            // Excess requests wait a bounded time, then fall through
+            // anonymous (the handler may still 401).
+            let sem = fpm.session_resolve_semaphore.clone();
+            match tokio::time::timeout(RESOLVE_ACQUIRE_TIMEOUT, sem.acquire_owned()).await {
+                Ok(Ok(_permit)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "session-resolve: semaphore closed");
+                    return None;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "session-resolve: concurrency cap busy for {RESOLVE_ACQUIRE_TIMEOUT:?} — \
+                         falling through anonymous"
+                    );
+                    return None;
+                }
+            }
+            // Cache miss — ask PHP-FPM to run the auth chain.
+            match nc_fastcgi::resolve_session(fpm, cookie_header).await {
+                Some(result) => {
+                    nc_auth::cache_insert(session_cache, cache_key, result.identity.clone());
+                    // Remember-me token rotation: forward any Set-Cookie
+                    // headers the shim emitted so the browser receives the
+                    // refreshed nc_token / nc_username / nc_session_id
+                    // cookies (§7.9.3).
+                    //
+                    // NOTE (F3): rotation runs on cache miss only — a
+                    // cached identity skips PHP's loginWithCookie(), so
+                    // remember-me tokens rotate at most once per
+                    // positive-TTL window, not per request.  Deliberate:
+                    // the cache TTL (the revocation knob) bounds it.
+                    set_cookies = result.set_cookies;
+                    result.identity
+                }
+                None => {
+                    // PHP says the session is invalid or unauthenticated.
+                    // Cache the negative result (5 s TTL) so a burst of
+                    // junk cookies hits memory, not FPM (F3) — and fall
+                    // through as anonymous; the route handler decides
+                    // whether to reject with 401.
+                    nc_auth::cache_insert_negative(session_cache, cache_key);
+                    return None;
+                }
+            }
+        }
+    };
+    Some(SessionAuth { identity, set_cookies })
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────
@@ -641,16 +709,33 @@ mod tests {
     /// `fastcgi` and `session_cache` are left as `None` — these tests exercise
     /// the middleware paths that do not require a live PHP-FPM connection.
     async fn make_test_state(instanceid: &str) -> AppState {
-        make_test_state_with_root(instanceid, std::path::PathBuf::from("."), None).await
+        make_test_state_with_root(instanceid, std::path::PathBuf::from("."), None, None).await
+    }
+
+    /// Same, with a seeded session cache — the session-over-Basic tests use
+    /// positive cache entries, which `session_auth` serves without a live
+    /// PHP-FPM connection.
+    async fn make_test_state_with_session(
+        instanceid: &str,
+        session_cache: nc_auth::SharedSessionCache,
+    ) -> AppState {
+        make_test_state_with_root(
+            instanceid,
+            std::path::PathBuf::from("."),
+            None,
+            Some(session_cache),
+        )
+        .await
     }
 
     /// Same, with an explicit `nc_root` (the static-file whitelist resolves
-    /// candidates against it) and optional `apps_paths` (config-derived
-    /// whitelist prefixes).
+    /// candidates against it), optional `apps_paths` (config-derived
+    /// whitelist prefixes) and an optional session cache.
     async fn make_test_state_with_root(
         instanceid: &str,
         nc_root: std::path::PathBuf,
         apps_paths: Option<Vec<nc_db::config::AppsPath>>,
+        session_cache: Option<nc_auth::SharedSessionCache>,
     ) -> AppState {
         let pool = DbPool::Sqlite(
             sqlx::sqlite::SqlitePoolOptions::new()
@@ -738,7 +823,7 @@ mod tests {
             table_prefix: "oc_".to_owned(),
             fastcgi: None,
             instanceid: instanceid.to_owned(),
-            session_cache: None,
+            session_cache,
             upload_state_store: Arc::new(nc_dav::UploadStateStore::new()),
             preview_registry,
             preview_gen,
@@ -747,6 +832,28 @@ mod tests {
 
     async fn ok_handler() -> StatusCode {
         StatusCode::OK
+    }
+
+    /// Echoes the resolved identity as `uid:Method` — lets tests assert WHO
+    /// authenticated (session user, not the Basic user).
+    async fn whoami_handler(
+        auth: Option<axum::extract::Extension<AuthInfo>>,
+    ) -> (StatusCode, String) {
+        match auth {
+            Some(info) => (
+                StatusCode::OK,
+                format!("{}:{}", info.uid, auth_method_name(&info.method)),
+            ),
+            None => (StatusCode::UNAUTHORIZED, "anonymous".to_owned()),
+        }
+    }
+
+    fn auth_method_name(method: &AuthMethod) -> &'static str {
+        match method {
+            AuthMethod::Basic => "Basic",
+            AuthMethod::Bearer => "Bearer",
+            AuthMethod::Session => "Session",
+        }
     }
 
     /// No `{instanceid}` cookie and no `nc_token` → the middleware treats the
@@ -871,6 +978,207 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         // No FastCGI resolver → anonymous → downstream handler returns 200.
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── Session-over-Basic (2026-08-16) ─────────────────────────────────────
+    //
+    // PHP resolves the session cookie before Basic credentials: Auth.php's
+    // `auth()` accepts a logged-in session immediately (Auth.php:184-186) and
+    // `validateUserPass` short-circuits on `isLoggedIn` (Auth.php:76-81) —
+    // Basic is never bcrypt-verified while the session is valid.  These pin
+    // the Rust reordering.  Positive cache entries are seeded directly; the
+    // middleware serves them without touching PHP-FPM.
+
+    /// Valid session + wrong Basic → authenticated via the session.  Before
+    /// the change the Basic path rejected the wrong password with 401.
+    #[tokio::test]
+    async fn session_over_basic_wins_with_valid_session() {
+        let session_cache = nc_auth::new_session_cache();
+        let state = make_test_state_with_session("oc1abc", session_cache.clone()).await;
+        nc_auth::cache_insert(
+            &session_cache,
+            nc_auth::make_cache_key("somesessionid"),
+            nc_auth::SessionIdentity {
+                uid: "alice".to_owned(),
+                dav_authenticated_uid: None,
+            },
+        );
+        let app = Router::new()
+            .route("/dav/files/alice", get(ok_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::router::http_middleware_stack,
+            ));
+
+        // alice:wrongpass — would fail Basic verification against the empty pool.
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/dav/files/alice")
+            .header("authorization", "Basic YWxpY2U6d3JvbmdwYXNz")
+            .header("cookie", "oc1abc=somesessionid")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// With both credentials present the identity follows the session, not
+    /// Basic (PHP picks the session user; the Basic user would diverge).
+    #[tokio::test]
+    async fn session_over_basic_identity_is_the_session_user() {
+        let session_cache = nc_auth::new_session_cache();
+        let state = make_test_state_with_session("oc1abc", session_cache.clone()).await;
+        nc_auth::cache_insert(
+            &session_cache,
+            nc_auth::make_cache_key("somesessionid"),
+            nc_auth::SessionIdentity {
+                uid: "alice".to_owned(),
+                dav_authenticated_uid: None,
+            },
+        );
+        let app = Router::new()
+            .route("/dav/files/alice", get(whoami_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::router::http_middleware_stack,
+            ));
+
+        // Basic bob:wrongpass — must NOT surface (session alice wins).
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/dav/files/alice")
+            .header("authorization", "Basic Ym9iOndyb25ncGFzcw==")
+            .header("cookie", "oc1abc=somesessionid")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "alice:Session");
+    }
+
+    /// The DAV fixation guard is scoped to DAV paths (Auth.php parity): a
+    /// session whose marker stores a different UID still authenticates a
+    /// non-DAV request.
+    #[tokio::test]
+    async fn session_marker_mismatch_scoped_to_dav() {
+        let session_cache = nc_auth::new_session_cache();
+        let state = make_test_state_with_session("oc1abc", session_cache.clone()).await;
+        nc_auth::cache_insert(
+            &session_cache,
+            nc_auth::make_cache_key("somesessionid"),
+            nc_auth::SessionIdentity {
+                uid: "alice".to_owned(),
+                dav_authenticated_uid: Some("bob".to_owned()),
+            },
+        );
+        let app = Router::new()
+            .route("/core/preview", get(ok_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::router::http_middleware_stack,
+            ));
+
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/core/preview")
+            .header("authorization", "Basic YWxpY2U6d3JvbmdwYXNz")
+            .header("cookie", "oc1abc=somesessionid")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// On a DAV path the marker mismatch falls through to Basic instead of
+    /// hard-401ing — PHP's `auth()` falls to `parent::check()` when the
+    /// cookie branch fails.  The Basic credentials fail against the empty
+    /// pool, so the request ends 401 (the fall-through, not a session 401).
+    #[tokio::test]
+    async fn session_marker_mismatch_on_dav_falls_through_to_basic() {
+        let session_cache = nc_auth::new_session_cache();
+        let state = make_test_state_with_session("oc1abc", session_cache.clone()).await;
+        nc_auth::cache_insert(
+            &session_cache,
+            nc_auth::make_cache_key("somesessionid"),
+            nc_auth::SessionIdentity {
+                uid: "alice".to_owned(),
+                dav_authenticated_uid: Some("bob".to_owned()),
+            },
+        );
+        let app = Router::new()
+            .route("/dav/files/alice", get(ok_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::router::http_middleware_stack,
+            ));
+
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/dav/files/alice")
+            .header("authorization", "Basic YWxpY2U6d3JvbmdwYXNz")
+            .header("cookie", "oc1abc=somesessionid")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Cookie-only (no Authorization header) with a cached session — the
+    /// `_` arm resolves through the same `session_auth` helper and
+    /// authenticates (unchanged behavior, now pinned by a test).
+    #[tokio::test]
+    async fn session_cookie_only_authenticates() {
+        let session_cache = nc_auth::new_session_cache();
+        let state = make_test_state_with_session("oc1abc", session_cache.clone()).await;
+        nc_auth::cache_insert(
+            &session_cache,
+            nc_auth::make_cache_key("somesessionid"),
+            nc_auth::SessionIdentity {
+                uid: "alice".to_owned(),
+                dav_authenticated_uid: None,
+            },
+        );
+        let app = Router::new()
+            .route("/dav/files/alice", get(ok_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::router::http_middleware_stack,
+            ));
+
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/dav/files/alice")
+            .header(
+                "cookie",
+                "oc1abc=somesessionid; nc_sameSiteCookielax=true; nc_sameSiteCookiestrict=true",
+            )
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -1001,7 +1309,7 @@ mod tests {
     /// GET `uri` through the composite middleware with `root` as `nc_root`;
     /// returns the final status.
     async fn static_request(root: &ScratchRoot, uri: &str) -> StatusCode {
-        let state = make_test_state_with_root("oc1abc", root.0.clone(), None).await;
+        let state = make_test_state_with_root("oc1abc", root.0.clone(), None, None).await;
         let app = Router::new()
             .route("/dav/files/alice", get(ok_handler))
             .layer(middleware::from_fn_with_state(
@@ -1100,7 +1408,7 @@ mod tests {
             url: Some("/wapps".into()),
             writable: Some(true),
         }]);
-        let state = make_test_state_with_root("oc1abc", root.0.clone(), apps_paths).await;
+        let state = make_test_state_with_root("oc1abc", root.0.clone(), apps_paths, None).await;
         let app = Router::new()
             .route("/dav/files/alice", get(ok_handler))
             .layer(middleware::from_fn_with_state(
