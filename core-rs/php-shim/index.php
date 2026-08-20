@@ -211,7 +211,14 @@ function route_ocs_php(): void
         $matchUrl = '/ocsapp' . $request->getRawPathInfo();
         $isLoggedIn = \OCP\Server::get(\OCP\IUserSession::class)->isLoggedIn();
         $userId = \OCP\Server::get(\OCP\IUserSession::class)->getUser()?->getUID() ?? 'null';
-        error_log("OCS DEBUG: matchUrl=$matchUrl loggedIn=" . ($isLoggedIn ? '1' : '0') . " userId=$userId SCRIPT_NAME=" . ($_SERVER['SCRIPT_NAME'] ?? 'unset') . " REQUEST_URI=" . ($_SERVER['REQUEST_URI'] ?? 'unset'));
+        // Debug-only trace of the OCS match decision — written to the FPM
+        // error log (error_log()) ONLY when config.php 'debug' is enabled;
+        // production stays silent.  (This line flooded a 494 MB log in a
+        // weekend before it was gated; it is a shim-level trace and does
+        // NOT belong in the app logger, which needs a session context.)
+        if (\OCP\Server::get(\OC\SystemConfig::class)->getValue('debug', false)) {
+            error_log("OCS DEBUG: matchUrl=$matchUrl loggedIn=" . ($isLoggedIn ? '1' : '0') . " userId=$userId SCRIPT_NAME=" . ($_SERVER['SCRIPT_NAME'] ?? 'unset') . " REQUEST_URI=" . ($_SERVER['REQUEST_URI'] ?? 'unset'));
+        }
         \OCP\Server::get(\OC\Route\Router::class)->match($matchUrl);
     } catch (\OCP\Security\Bruteforce\MaxDelayReached $ex) {
         \OC\OCS\ApiHelper::respond(\OCP\AppFramework\Http::STATUS_TOO_MANY_REQUESTS, $ex->getMessage());
