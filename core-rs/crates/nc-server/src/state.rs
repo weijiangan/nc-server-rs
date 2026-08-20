@@ -140,6 +140,7 @@ impl FromRef<AppState> for nc_dav::NcDavState {
             dir_mimepart_id: state.dir_mimepart_id,
             storage_cache: state.storage_cache.clone(),
             lazy_cache_ensured: state.lazy_cache_ensured.clone(),
+            media_mtime_ctime_fallback: state.nc_config.media_mtime_ctime_fallback,
         }
     }
 }

@@ -156,3 +156,30 @@ Option 1 is recommended. Tracked as a future task because it requires rewriting 
 - Load-bearing and confirmed present: `fs_storage_path_hash(storage, path_hash)` (every `lookup_by_path`/`load_meta` + the T9 propagation lock), `fs_parent(parent)`, `file_source_index(file_source)` (the merged share scan), `comments_object_index(object_type, object_id, creation_timestamp)` (the comments sub-select), `properties_path_index(userid, propertypath)` (custom props).
 
 **Why deferred:** the schema is Doctrine-owned — adding an index is an `occ db:add-missing-indices`-style operational change on the live system (or a new Doctrine migration), and the audit found no plan that the existing indexes cannot serve. Revisit if a production profile shows a missing-index scan.
+
+---
+
+# Intentional Divergences (implemented)
+
+Decisions where Rust deliberately behaves differently from the PHP reference, with the full mechanics recorded. The requirements specs still record what PHP does.
+
+## D.1 Media-mtime fallback (iOS Photos-tab placement)
+
+**Implemented:** 2026-08-21. Config key: `media_mtime_ctime_fallback` in `config.php`, default `true`; `false` restores strict PHP semantics.
+
+**PHP behavior:** on upload (simple PUT `apps/dav/lib/Connector/Sabre/File.php:346-366`, chunked assembly MOVE `apps/dav/lib/Upload/ChunkingV2Plugin.php:195-203`) the server stores `oc_filecache.mtime` = `X-OC-MTime` (when sent; else request time), `oc_filecache_extended.creation_time` = `X-OC-CTime` (when sent; else 0). PHP never cross-derives the two.
+
+**The client bug this fixes:** the iOS app sends `X-OC-MTime` from `PHAsset.modificationDate ?? Date()` (`NCCameraRoll.swift:237`). Photos saved by third-party apps (WhatsApp) have no `modificationDate`, so the fallback stamps the **upload instant**; `X-OC-CTime` from `PHAsset.creationDate` carries the true capture/save date. The iOS app's Photos tab (Media) filters and orders media by `d:getlastmodified` — i.e. `oc_filecache.mtime` — so such photos land on the upload day in the timeline while `creation_time` (correct) sits unused in `oc_filecache_extended`.
+
+**Rust behavior:** for uploads where *all* of the following hold, `X-OC-CTime` becomes the effective mtime (written to `oc_filecache.mtime`/`storage_mtime`, the disk file mtime where set, propagation, version rows — everything the original mtime would feed):
+- the feature switch is enabled;
+- the target mimetype is `image/*` or `video/*`;
+- the client sent **both** headers (a headerless request keeps PHP semantics);
+- the sent `X-OC-MTime` falls within 15 minutes *before* the server-observed arrival anchor — the unmistakable signature of the client's `Date()` fallback;
+- `X-OC-CTime` is strictly older than the sent mtime (the mtime is never moved forward).
+
+**Arrival anchor:** for a simple PUT, the request's open time; for a chunked MOVE, the **earliest chunk's** disk mtime (chunk PUTs carry no `X-OC-MTime`, so chunk files' disk mtimes are server-side arrival times). A wall-clock window against the MOVE's own arrival would miss slow chunked uploads whose fallback stamp predates the MOVE by hours; the chunk-anchored window does not.
+
+**Trade-off (accepted):** media genuinely modified within 15 minutes before arrival (e.g. a photo exported/edited right before upload) is also re-anchored to `X-OC-CTime` — indistinguishable from the fallback by design. For fresh media, ctime ≈ mtime anyway; for edited media the Photos tab then shows the capture day, which is the intended placement. Media uploaded with mtimes older than the window (desktop sync, camera photos synced days later) is never touched.
+
+**Scope:** simple PUT (`nc-dav/src/davfile.rs` flush) and chunked assembly MOVE (`nc-dav/src/upload_handler.rs`). Bulk upload stays at strict PHP parity. The difftest oracle cannot cover the fallback (the PHP side cannot be told to diverge) — the resolver is unit-tested in `nc-dav/src/mtime.rs`.

@@ -118,4 +118,8 @@ pub struct NcDavState {
     /// once-per-storage ensure so the steady-state read path adds no
     /// statements.
     pub lazy_cache_ensured: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
+    /// Config `media_mtime_ctime_fallback` (improvements.md): media uploads
+    /// whose `X-OC-MTime` matches the iOS client's `?? Date()` fallback get
+    /// `X-OC-CTime` as their effective mtime.  Off → strict PHP semantics.
+    pub media_mtime_ctime_fallback: bool,
 }

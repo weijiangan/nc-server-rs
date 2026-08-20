@@ -151,6 +151,15 @@ pub struct NcConfig {
     pub data_fingerprint: Option<String>,
     #[serde(default = "default_true")]
     pub bulkupload_enabled: bool,
+    /// Media-mtime fallback (intentional divergence, improvements.md):
+    /// when a media upload (image/video) sends `X-OC-MTime` that matches the
+    /// iOS client's `?? Date()` upload-instant fallback (within
+    /// `MEDIA_MTIME_FALLBACK_WINDOW_SECS` before the server-observed arrival),
+    /// `X-OC-CTime` — the true capture/save date the same client sent — is
+    /// used as the effective mtime instead.  Off → strict PHP semantics.
+    /// Key: `media_mtime_ctime_fallback` in `config.php`.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub media_mtime_ctime_fallback: bool,
 
     // ── Preview / thumbnail (§10.12) ──────────────────────────────────────────
     /// Whether the preview system is enabled.

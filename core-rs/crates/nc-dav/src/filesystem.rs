@@ -2146,6 +2146,16 @@ impl DavFileSystem for NcFileSystem {
                     ),
                     x_oc_mtime: self.x_oc_mtime,
                     x_oc_ctime: self.x_oc_ctime,
+                    // §10.5 + improvements.md: media-mtime fallback inputs.
+                    // is_media from the detected mimetype part ("image"/"video");
+                    // arrival_anchor captured at open() — the server-observed
+                    // request arrival (the fallback window anchors on it).
+                    is_media: part_str == "image" || part_str == "video",
+                    arrival_anchor: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64,
+                    media_mtime_ctime_fallback: self.state.media_mtime_ctime_fallback,
                     write_result: self.write_result.clone(),
                     put_error: self.put_error.clone(),
                     propagator: self.propagator.clone(),
@@ -4912,6 +4922,7 @@ mod tests {
             dir_mimepart_id: 1,
             storage_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             lazy_cache_ensured: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            media_mtime_ctime_fallback: true,
         };
         let write_result: SharedWriteResult = Arc::new(std::sync::Mutex::new(None::<WriteResult>));
         let put_error: crate::SharedPutError = Arc::new(std::sync::Mutex::new(None));

@@ -176,6 +176,15 @@ pub struct WriteCtx {
     pub x_oc_mtime: Option<i64>,
     /// Client-supplied `X-OC-CTime` value (Unix seconds); `None` if absent.
     pub x_oc_ctime: Option<i64>,
+    /// Whether the target's mimetype is `image/*` or `video/*` — the
+    /// media-mtime fallback (improvements.md) applies to media only.
+    pub is_media: bool,
+    /// Server-observed arrival time of the request (Unix seconds), captured
+    /// at `open()`.  Anchor for the media-mtime fallback window.
+    pub arrival_anchor: i64,
+    /// Config `media_mtime_ctime_fallback` (improvements.md) — the media-mtime
+    /// special case switch.  Off → strict PHP semantics.
+    pub media_mtime_ctime_fallback: bool,
     /// Written by `flush()` so `dav_handler` can inject response headers.
     pub write_result: crate::SharedWriteResult,
     /// Set to `Some(PutErrorKind::…)` by `flush()` when it terminates early due
@@ -455,6 +464,20 @@ impl DavFile for NcDavFile {
                 .unwrap_or_default()
                 .as_secs() as i64;
             let use_mtime        = ctx.x_oc_mtime.unwrap_or(now);
+            // §10.5 + improvements.md: the media-mtime fallback.  Media uploads
+            // whose X-OC-MTime matches the iOS client's `?? Date()` upload-instant
+            // fallback (WhatsApp-saved images have no PHAsset.modificationDate)
+            // receive X-OC-CTime — the capture/save date — as their effective
+            // mtime, so the client's Photos tab (sorted by d:getlastmodified)
+            // places them on the day they were taken/saved, not the upload day.
+            let use_mtime = crate::mtime::media_mtime_fallback(
+                use_mtime,
+                ctx.x_oc_mtime,
+                ctx.x_oc_ctime,
+                ctx.arrival_anchor,
+                ctx.is_media,
+                ctx.media_mtime_ctime_fallback,
+            );
             // PHP writes `creation_time` only when the client sent `X-OC-CTime`;
             // otherwise the column keeps its default `0` (finding #3 / phase-16.4,
             // resolved against `File.php:354-366` + `Cache::normalizeData`'s

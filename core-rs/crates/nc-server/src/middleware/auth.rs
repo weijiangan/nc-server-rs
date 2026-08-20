@@ -775,6 +775,7 @@ mod tests {
             logfile: None,
             data_fingerprint: None,
             bulkupload_enabled: true,
+            media_mtime_ctime_fallback: true,
             enable_previews: true,
             preview_ffmpeg_path: None,
             preview_libreoffice_path: None,

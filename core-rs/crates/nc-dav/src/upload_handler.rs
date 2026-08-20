@@ -598,8 +598,21 @@ async fn handle_move(
         .join(upload_id);
 
     let mut assembled_data = Vec::new();
+    // Server-observed arrival of the earliest chunk (Unix seconds).  Chunk PUTs
+    // carry no X-OC-MTime (iOS verified; PHP ChunkingV2Plugin reads headers
+    // only on the MOVE), so the chunk files' disk mtimes are arrival times —
+    // the anchor for the media-mtime fallback window (improvements.md).
+    // i64::MAX when no chunk could be stat'd → the window check never fires.
+    let mut first_chunk_mtime: i64 = i64::MAX;
     for part_id in &part_ids {
         let chunk_path = chunk_dir.join(part_id.to_string());
+        if let Ok(meta) = fs::metadata(&chunk_path).await {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    first_chunk_mtime = first_chunk_mtime.min(d.as_secs() as i64);
+                }
+            }
+        }
         match fs::read(&chunk_path).await {
             Ok(data) => assembled_data.extend(data),
             Err(e) => {
@@ -742,15 +755,15 @@ async fn handle_move(
         .as_secs() as i64;
 
     // Handle X-OC-MTime header (§10.5: validate with PHP MtimeSanitizer)
-    let mtime = match crate::mtime::sanitize_mtime(
+    let mtime_header = match crate::mtime::sanitize_mtime(
         req.headers()
             .get("x-oc-mtime")
             .and_then(|v| v.to_str().ok()),
     ) {
-        Ok(Some(t)) => t,
-        Ok(None) => now,
+        Ok(v) => v,
         Err(msg) => return bad_request_response(&msg),
     };
+    let mtime = mtime_header.unwrap_or(now);
 
     // Handle X-OC-CTime header (§10.5: validate with PHP MtimeSanitizer)
     let ctime = match crate::mtime::sanitize_mtime(
@@ -761,6 +774,21 @@ async fn handle_move(
         Ok(v) => v,
         Err(msg) => return bad_request_response(&msg),
     };
+
+    // improvements.md: the media-mtime fallback — media uploads whose
+    // X-OC-MTime matches the iOS client's `?? Date()` upload-instant fallback
+    // receive X-OC-CTime (the capture/save date) as their effective mtime.
+    // Anchor: the earliest chunk's server-side arrival (chunk PUTs carry no
+    // X-OC-MTime, so the chunk files' disk mtimes are arrival times) — this
+    // survives multi-hour chunked uploads that a wall-clock window would miss.
+    let mtime = crate::mtime::media_mtime_fallback(
+        mtime,
+        mtime_header,
+        ctime,
+        first_chunk_mtime,
+        part_str == "image" || part_str == "video",
+        state.media_mtime_ctime_fallback,
+    );
 
     // Set file mtime using filetime
     let t = filetime::FileTime::from_unix_time(mtime, 0);
