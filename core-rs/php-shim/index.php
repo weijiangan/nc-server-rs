@@ -598,7 +598,7 @@ function session_resolve_handler(): void
     require_once $ncRoot . '/lib/versioncheck.php';
     require_once $ncRoot . '/lib/base.php';
 
-    // ── Run the PHP auth chain ───────────────────────────────────────────────
+    // ── Run the PHP auth chain (gated) ───────────────────────────────────────
     // OC::handleLogin() mirrors base.php:1225-1255 (PHP source of truth):
     //   1. tryTokenLogin    — reads {instanceid} cookie value as session_id(),
     //                         computes SHA-512(id || server_secret), looks up
@@ -608,10 +608,25 @@ function session_resolve_handler(): void
     //                         oc_preferences; rotates the token; calls
     //                         session_regenerate_id(); emits Set-Cookie headers.
     //   3. tryBasicAuthLogin — no Authorization header present → skipped.
-    // We do NOT call setVolatileActiveUser() here; the whole point is to let
-    // PHP authenticate the user from the cookies it received.
-    $request = \OCP\Server::get(\OCP\IRequest::class);
-    OC::handleLogin($request);
+    //
+    // Gated on NC_SESSION_RESOLVE_LOGIN=1, which Rust sets ONLY when it will
+    // serve the request itself (the native DAV files tree) — there the resolve
+    // is the only login opportunity, mirroring PHP's remote.php.  For requests
+    // Rust proxies to PHP (index.php pages, OCS, non-files DAV), the real
+    // request runs OC::handleLogin() itself via base.php; running it here as
+    // well performs the remember-me login TWICE per request.  The second
+    // loginWithCookie() regenerates the PHP session id (deleting the old
+    // session file — session_regenerate_id(true)) and rotates nc_token between
+    // the resolve and the real request, so a session written by the real
+    // request is gone by the time the NEXT request starts.  That destroys the
+    // user_oidc state stored on /apps/user_oidc/login/1 before the IdP
+    // callback reads it — "Access forbidden — The received state has expired."
+    // PHP itself never double-logs-in: one session_start per request, and the
+    // in-memory $_SESSION survives its own regeneration.
+    if (($_SERVER['NC_SESSION_RESOLVE_LOGIN'] ?? '') === '1') {
+        $request = \OCP\Server::get(\OCP\IRequest::class);
+        OC::handleLogin($request);
+    }
 
     // ── Read resolved identity ───────────────────────────────────────────────
     $userSession = \OCP\Server::get(\OCP\IUserSession::class);

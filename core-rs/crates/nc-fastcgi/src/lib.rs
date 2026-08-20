@@ -1260,7 +1260,16 @@ pub async fn fetch_php_public_capabilities(fpm: &FastCgiState) -> Option<serde_j
 /// ```
 ///
 /// The shim intercepts `NC_ORIGINAL_SCRIPT == "__session_resolve"` before any
-/// other handling and runs the full PHP auth chain from cookies.
+/// other handling and runs the full PHP auth chain from cookies — **only when
+/// `login` is true**.  `login` is true for requests Rust serves itself (the
+/// native DAV files tree), where the resolve is the only login opportunity;
+/// it is false for requests that are proxied to PHP afterwards, whose real
+/// request runs `OC::handleLogin()` itself.  Running the auth chain twice per
+/// request makes `loginWithCookie()` regenerate the PHP session id (deleting
+/// the old session file) between the resolve and the real request, which
+/// destroys cross-request session state — e.g. the user_oidc state stored on
+/// `/apps/user_oidc/login/1` is gone before the IdP callback reads it
+/// ("The received state has expired.").
 ///
 /// # Response
 ///
@@ -1268,7 +1277,8 @@ pub async fn fetch_php_public_capabilities(fpm: &FastCgiState) -> Option<serde_j
 /// - `Content-Type: application/json; charset=UTF-8`
 /// - JSON body: `{"uid":"alice","dav_authenticated_uid":"alice"}` or
 ///   `{"uid":null}` when no auth path succeeded.
-/// - `Set-Cookie` headers when the remember-me path rotated `nc_token`.
+/// - `Set-Cookie` headers when the remember-me path rotated `nc_token` (only
+///   on the `login` path).
 ///
 /// # Return value
 ///
@@ -1284,6 +1294,7 @@ pub async fn fetch_php_public_capabilities(fpm: &FastCgiState) -> Option<serde_j
 pub async fn resolve_session(
     fpm: &FastCgiState,
     raw_cookie_header: &str,
+    login: bool,
 ) -> Option<nc_auth::SessionResolveResult> {
     const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1338,7 +1349,13 @@ pub async fn resolve_session(
         .custom("PATH_INFO", "")
         .custom("NC_ROOT", document_root)
         .custom("HTTP_COOKIE", raw_cookie_header.to_owned())
-        .custom("HTTP_X_NC_PROXIED", "1");
+        .custom("HTTP_X_NC_PROXIED", "1")
+        // Gate the shim's OC::handleLogin(): set ONLY when Rust serves the
+        // request itself (no real PHP request follows).  For proxied requests
+        // the real request runs handleLogin itself — doing it here too
+        // regenerates the session id between resolve and real request and
+        // destroys the user_oidc state (login → "state has expired" 403).
+        .custom("NC_SESSION_RESOLVE_LOGIN", if login { "1" } else { "0" });
     // Deliberately omit HTTP_X_NC_USER — the shim resolves identity from cookies.
 
     let stdin = StreamReader::new(futures::stream::once(std::future::ready(Ok::<

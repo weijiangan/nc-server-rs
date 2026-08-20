@@ -262,11 +262,14 @@ const PROXIED_DAV_SUBTREES: [&str; 10] = [
     "/access-control",
 ];
 
-/// DAV arbiter handler — the single classified entry for both mount roots
-/// (`/remote.php/dav`, `/dav`).
+/// DAV classification — `true` when Rust serves the path itself (no real
+/// PHP request follows), `false` when it is proxied to PHP-FPM.
 ///
-/// Phase 18: replaced the ~30 explicit mount routes with one wildcard pair
-/// per root; classification happens here:
+/// Single source of truth for BOTH the arbiter dispatch below and the auth
+/// middleware's session-resolve gating (middleware/auth.rs): a session
+/// resolve for a proxied path must stay read-only, because the real request
+/// runs `OC::handleLogin()` itself.
+///
 ///   SEARCH/REPORT          → PHP-FPM (DASL search, sync-collection)
 ///   proxied subtree prefix → PHP-FPM (versions, comments, trashbin, …)
 ///   /uploads               → native upload handler (Phase 5.5)
@@ -278,15 +281,12 @@ const PROXIED_DAV_SUBTREES: [&str; 10] = [
 ///                             can never be complete; PHP is the registrar
 ///                             of its own root (phase-18.md Changes
 ///                             2026-08-16).
-async fn dav_arbiter_handler(State(state): State<AppState>, req: Request<Body>) -> Response {
+pub(crate) fn dav_served_by_rust(path: &str, method: &str) -> bool {
     // Path remainder after the mount root.  Trim in this order so a
     // "/dav/…" path cannot consume the "/remote.php/dav" prefix.
-    let remainder = req
-        .uri()
-        .path()
+    let remainder = path
         .trim_start_matches("/remote.php/dav")
         .trim_start_matches("/dav");
-    let method = req.method().as_str();
 
     // Proxied subtrees take precedence over the SEARCH/REPORT rule so a
     // SEARCH against e.g. /remote.php/dav/versions behaves as it did with
@@ -296,22 +296,17 @@ async fn dav_arbiter_handler(State(state): State<AppState>, req: Request<Body>) 
         .any(|p| remainder.starts_with(p))
         || matches!(method, "SEARCH" | "REPORT")
     {
-        if let Some(ref fpm) = state.fastcgi {
-            return nc_fastcgi::proxy_handler(fpm, req).await;
-        }
-        // No PHP-FPM configured → fall through; the native handler
-        // will return 405 / 501.
-        return nc_dav::dav_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await;
+        return false;
     }
 
     if remainder.starts_with("/uploads") {
-        return nc_dav::upload_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await;
+        return true;
     }
     // Non-POST /bulk falls through to the files tree (404) — sabreDAV treats
     // "bulk" as an ordinary resource path, so this is PHP-faithful (the old
     // post-only route returned an axum 405).
     if remainder == "/bulk" && method == "POST" {
-        return nc_dav::bulk_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await;
+        return true;
     }
 
     // ── The native files tree — the hot path ───────────────────────────────
@@ -324,16 +319,41 @@ async fn dav_arbiter_handler(State(state): State<AppState>, req: Request<Body>) 
     // never enumerate them, and the native files tree 404s anything that is
     // not a filecache path (the live Photos Places PROPFIND
     // /photos/{uid}/places/ died this way with an empty body).
-    if remainder.starts_with("/files/") || remainder == "/files" {
+    remainder.starts_with("/files/") || remainder == "/files"
+}
+
+/// DAV arbiter handler — the single classified entry for both mount roots
+/// (`/remote.php/dav`, `/dav`).
+///
+/// Phase 18: replaced the ~30 explicit mount routes with one wildcard pair
+/// per root; the classification itself lives in [`dav_served_by_rust`].
+async fn dav_arbiter_handler(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let path = req.uri().path();
+    let method = req.method().as_str();
+
+    // Everything else → PHP-FPM; PHP decides whether the path exists.
+    if !dav_served_by_rust(path, method) {
+        if let Some(ref fpm) = state.fastcgi {
+            return nc_fastcgi::proxy_handler(fpm, req).await;
+        }
+        // No PHP-FPM configured → fall through; the native handler
+        // will return 405 / 501.
         return nc_dav::dav_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await;
     }
 
-    // Everything else → PHP-FPM; PHP decides whether the path exists.
-    if let Some(ref fpm) = state.fastcgi {
-        return nc_fastcgi::proxy_handler(fpm, req).await;
+    // ── Native handlers ─────────────────────────────────────────────────────
+    // /uploads → upload handler; /bulk (POST) → bulk handler; /files → files tree.
+    let remainder = path
+        .trim_start_matches("/remote.php/dav")
+        .trim_start_matches("/dav");
+
+    if remainder.starts_with("/uploads") {
+        return nc_dav::upload_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await;
     }
-    // No PHP-FPM configured (standalone dev) → native files tree, which
-    // returns its empty 404 for unknown subtrees.
+    if remainder == "/bulk" && method == "POST" {
+        return nc_dav::bulk_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await;
+    }
+
     nc_dav::dav_handler(State(nc_dav::NcDavState::from_ref(&state)), req).await
 }
 
@@ -499,6 +519,47 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The DAV classification is load-bearing for BOTH the arbiter dispatch
+    /// and the auth middleware's session-resolve login gating — a regression
+    /// here silently changes which requests get a PHP-side login in the
+    /// resolve (and which proxy instead of being served natively).
+    #[test]
+    fn dav_served_by_rust_files_tree_is_native() {
+        assert!(dav_served_by_rust("/dav/files", "GET"));
+        assert!(dav_served_by_rust("/dav/files/", "PROPFIND"));
+        assert!(dav_served_by_rust("/dav/files/admin/test.txt", "GET"));
+        assert!(dav_served_by_rust("/remote.php/dav/files/admin/", "PROPFIND"));
+        assert!(dav_served_by_rust("/remote.php/dav/files", "GET"));
+    }
+
+    #[test]
+    fn dav_served_by_rust_uploads_and_bulk_are_native() {
+        assert!(dav_served_by_rust("/dav/uploads/admin", "PUT"));
+        assert!(dav_served_by_rust("/dav/uploads/admin/chunk-1", "PUT"));
+        assert!(dav_served_by_rust("/dav/bulk", "POST"));
+        // Non-POST /bulk is an ordinary resource path → PHP-faithful 404.
+        assert!(!dav_served_by_rust("/dav/bulk", "GET"));
+    }
+
+    #[test]
+    fn dav_served_by_rust_proxied_cases() {
+        // Proxied subtrees (versions, comments, trashbin, …) → PHP.
+        assert!(!dav_served_by_rust("/dav/versions/admin", "GET"));
+        assert!(!dav_served_by_rust("/remote.php/dav/trashbin/admin", "GET"));
+        assert!(!dav_served_by_rust("/dav/comments/1", "PROPFIND"));
+        // SEARCH/REPORT always → PHP (DASL search, sync-collection).
+        assert!(!dav_served_by_rust("/dav/files/admin", "SEARCH"));
+        assert!(!dav_served_by_rust("/dav/files/admin", "REPORT"));
+        // DAV root + app-registered collections → PHP (sabre registrar).
+        assert!(!dav_served_by_rust("/dav", "PROPFIND"));
+        assert!(!dav_served_by_rust("/dav/", "PROPFIND"));
+        assert!(!dav_served_by_rust("/dav/photos/admin", "PROPFIND"));
+        assert!(!dav_served_by_rust("/dav/systemtags", "PROPFIND"));
+        // Non-files remote.php paths (webdav alias etc.) → PHP.
+        assert!(!dav_served_by_rust("/remote.php/webdav/test.txt", "GET"));
+        assert!(!dav_served_by_rust("/index.php/apps/files", "GET"));
+    }
 
     /// Build a config whose `apps_paths` contains one entry per url.
     fn cfg_with_apps_paths(urls: &[&str]) -> NcConfig {

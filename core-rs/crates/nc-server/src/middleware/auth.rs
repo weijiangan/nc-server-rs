@@ -54,7 +54,7 @@ pub async fn auth_check(
     req: &mut Request<Body>,
 ) -> Result<Vec<String>, Response> {
     let path = req.uri().path().to_string();
-    let _method = req.method().as_str().to_string();
+    let method = req.method().as_str().to_string();
 
     // Skip auth processing for /status.php and /heartbeat entirely.
     if matches!(path.as_str(), "/status.php" | "/heartbeat") {
@@ -106,6 +106,14 @@ pub async fn auth_check(
         .unwrap_or(false);
 
     let is_dav = is_dav_path(&path);
+    // True when Rust serves this request itself (no real PHP request
+    // follows) — see `router::dav_served_by_rust`.  Session resolves for
+    // proxied paths must stay read-only: the real request runs
+    // `OC::handleLogin()` itself, and a second auth chain in the resolve
+    // regenerates the session id between resolve and real request,
+    // destroying cross-request session state (user_oidc → "state has
+    // expired").
+    let serve_self = crate::router::dav_served_by_rust(&path, &method);
     // Phase 15 F2: the composite resolved the client identity (trusted-proxy
     // XFF walk); the throttle key must use it, not the raw header.
     let client_ip = match req
@@ -203,7 +211,7 @@ pub async fn auth_check(
     let session_first: Option<SessionAuth> = if !cookie_header.is_empty()
         && auth_header.as_deref().is_some_and(|ah| ah.starts_with("Basic "))
     {
-        match session_auth(state, &cookie_header).await {
+        match session_auth(state, &cookie_header, serve_self).await {
             Some(sa)
                 if !is_dav
                     || dav_session_guard(
@@ -468,7 +476,19 @@ pub async fn auth_check(
             // only cookies on subsequent requests; the Authorization header is
             // absent.  We ask the PHP-FPM shim's `__session_resolve` endpoint
             // to run `OC::handleLogin()` and return the resolved identity.
-            let Some(sa) = session_auth(state, &cookie_header).await else {
+            //
+            // `handleLogin()` runs in the resolve ONLY when Rust serves the
+            // request itself (native DAV files tree) — there it is the only
+            // login opportunity, mirroring PHP's remote.php.  For paths that
+            // are proxied to PHP afterwards, the real request runs
+            // `OC::handleLogin()` itself; running it here as well regenerates
+            // the session id between resolve and real request
+            // (session_regenerate_id(true) deletes the old session file), so
+            // state written by the real request — e.g. the user_oidc flow
+            // state on /apps/user_oidc/login/1 — is gone before the next
+            // request (the IdP callback) reads it: "Access forbidden — The
+            // received state has expired." on the Rust vhost, but not on PHP.
+            let Some(sa) = session_auth(state, &cookie_header, serve_self).await else {
                 // No usable session (no FPM, no session cookies, negative
                 // cache, or PHP rejected it) — anonymous; the route handler
                 // decides whether to reject with 401.
@@ -537,7 +557,11 @@ struct SessionAuth {
 /// session cookie value, a fresh negative cache entry, or PHP rejecting
 /// the session — and `Some` on a valid session.  Callers decide the
 /// fallback (anonymous, or Basic when credentials were supplied).
-async fn session_auth(state: &AppState, cookie_header: &str) -> Option<SessionAuth> {
+///
+/// `login` gates the shim's `OC::handleLogin()`: true only for paths Rust
+/// serves itself (no real PHP request follows); false for proxied paths,
+/// whose real request runs the auth chain exactly once (PHP parity).
+async fn session_auth(state: &AppState, cookie_header: &str, login: bool) -> Option<SessionAuth> {
     // Guard: the session cache is required to serve hits; PHP-FPM is
     // required only on the miss path (the `__session_resolve` round-trip).
     let Some(session_cache) = state.session_cache.as_ref() else {
@@ -590,8 +614,9 @@ async fn session_auth(state: &AppState, cookie_header: &str) -> Option<SessionAu
                     return None;
                 }
             }
-            // Cache miss — ask PHP-FPM to run the auth chain.
-            match nc_fastcgi::resolve_session(fpm, cookie_header).await {
+            // Cache miss — ask PHP-FPM to resolve the session identity
+            // (running the auth chain only when `login` — see session_auth).
+            match nc_fastcgi::resolve_session(fpm, cookie_header, login).await {
                 Some(result) => {
                     nc_auth::cache_insert(session_cache, cache_key, result.identity.clone());
                     // Remember-me token rotation: forward any Set-Cookie
