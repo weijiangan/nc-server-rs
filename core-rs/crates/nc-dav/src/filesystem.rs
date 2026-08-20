@@ -2489,6 +2489,7 @@ impl DavFileSystem for NcFileSystem {
                 &self.state.table_prefix,
                 &self.state.data_directory,
                 &self.uid,
+                self.storage_id,
                 &from_fc,
                 &to_fc,
             )
@@ -2807,6 +2808,7 @@ impl DavFileSystem for NcFileSystem {
                 &self.state.table_prefix,
                 &self.state.data_directory,
                 &self.uid,
+                self.storage_id,
                 &from_fc,
                 &to_fc,
             )

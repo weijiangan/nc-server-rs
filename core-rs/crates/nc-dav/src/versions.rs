@@ -9,6 +9,7 @@
 //! - `apps/files_versions/lib/Versions/LegacyVersionsBackend.php` (createVersion)
 //! - `apps/files_versions/lib/Listener/FileEventsListener.php` (rename/copy hooks)
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -165,10 +166,11 @@ pub async fn store_version(
 /// For files: moves all `files_versions/{oldRel}.v*` to `files_versions/{newRel}.v*`.
 /// For directories: moves the entire `files_versions/{oldRel}/` subtree.
 pub async fn rename_versions(
-    _pool: &DbPool,
-    _prefix: &str,
+    pool: &DbPool,
+    prefix: &str,
     data_dir: &Path,
     uid: &str,
+    storage_id: i64,
     old_fc_path: &str,
     new_fc_path: &str,
 ) {
@@ -185,6 +187,8 @@ pub async fn rename_versions(
         crate::row::disk_path(data_dir, uid, &format!("files_versions/{old_rel}"));
     let new_versions_dir =
         crate::row::disk_path(data_dir, uid, &format!("files_versions/{new_rel}"));
+    let old_versions_fc = format!("files_versions/{old_rel}");
+    let new_versions_fc = format!("files_versions/{new_rel}");
 
     // Check if the old path is a directory or a file (by checking disk).
     if old_versions_dir.is_dir() {
@@ -197,6 +201,8 @@ pub async fn rename_versions(
         if let Err(e) = tokio::fs::rename(&old_versions_dir, &new_versions_dir).await {
             warn!("rename_versions: directory rename failed {old_versions_dir:?} → {new_versions_dir:?}: {e}");
         }
+        // PHP `View::move` → `Cache::move`: repath the whole cache subtree.
+        repath_version_subtree(pool, prefix, storage_id, &old_versions_fc, &new_versions_fc).await;
     } else {
         // File: find and rename individual version files matching .v{ts}.
         if let Some(parent) = old_versions_dir.parent() {
@@ -206,6 +212,7 @@ pub async fn rename_versions(
                 .unwrap_or_default();
 
             if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
+                let mut renamed: Vec<(String, String)> = Vec::new();
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy();
@@ -223,9 +230,196 @@ pub async fn rename_versions(
                         }
                         if let Err(e) = tokio::fs::rename(&entry.path(), &new_disk).await {
                             warn!("rename_versions: file rename failed {name_str}: {e}");
+                        } else {
+                            renamed.push((name_str.to_string(), new_name));
                         }
                     }
                 }
+                for (old_name, new_name) in renamed {
+                    repath_version_row(
+                        pool,
+                        prefix,
+                        storage_id,
+                        &format!("files_versions/{old_name}"),
+                        &format!("files_versions/{new_name}"),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+/// Repath the `oc_filecache` rows of a whole `files_versions/{old}/...` subtree
+/// to `files_versions/{new}/...`, matching PHP's `Cache::move` for a directory
+/// move (path/path_hash updated for every row; the moved node's `name` is also
+/// rewritten, while descendants keep theirs).
+async fn repath_version_subtree(
+    pool: &DbPool,
+    prefix: &str,
+    storage_id: i64,
+    old_fc: &str,
+    new_fc: &str,
+) {
+    if old_fc == new_fc {
+        return;
+    }
+    let like = format!("{old_fc}/%");
+    let sql_fetch = format!(
+        "SELECT fileid, path FROM {prefix}filecache \
+         WHERE storage = $1 AND (path = $2 OR path LIKE $3)"
+    );
+    let rows: Vec<(i64, String)> = match pool {
+        DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (i64, String)>(&sql_fetch)
+            .bind(storage_id)
+            .bind(old_fc)
+            .bind(&like)
+            .fetch_all(p)
+            .await
+            .unwrap_or_default(),
+        DbPool::Sqlite(p) => sqlx::query_as::<sqlx::Sqlite, (i64, String)>(&sql_fetch)
+            .bind(storage_id)
+            .bind(old_fc)
+            .bind(&like)
+            .fetch_all(p)
+            .await
+            .unwrap_or_default(),
+    };
+
+    // The moved node's new parent path (same parent dir for a rename within the
+    // versions tree, but recompute so a nested rename lands under the right dir).
+    let moved_parent_fc = {
+        let mut parts: Vec<&str> = new_fc.split('/').collect();
+        parts.pop();
+        parts.join("/")
+    };
+    let moved_parent_id =
+        row::lookup_by_path(pool, prefix, storage_id, &moved_parent_fc).await.map(|r| r.fileid);
+
+    for (fileid, old_path) in rows {
+        let new_path = if old_path == old_fc {
+            new_fc.to_string()
+        } else {
+            format!("{new_fc}{}", &old_path[old_fc.len()..])
+        };
+        let new_hash = row::path_hash(&new_path);
+        if old_path == old_fc {
+            // The moved node itself: PHP `Cache::move` rewrites path, path_hash,
+            // name AND parent.
+            let new_name = new_fc.rsplit('/').next().unwrap_or("").to_string();
+            match moved_parent_id {
+                Some(pid) => {
+                    let sql = format!(
+                        "UPDATE {prefix}filecache SET path=$1, path_hash=$2, name=$3, parent=$4 WHERE fileid=$5"
+                    );
+                    let r = match pool {
+                        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+                            .bind(&new_path).bind(&new_hash).bind(&new_name).bind(pid).bind(fileid)
+                            .execute(p).await.map(|_| ()),
+                        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
+                            .bind(&new_path).bind(&new_hash).bind(&new_name).bind(pid).bind(fileid)
+                            .execute(p).await.map(|_| ()),
+                    };
+                    if let Err(e) = r {
+                        warn!(fileid, error = %e, "rename_versions: failed to repath cache row {old_path}");
+                    }
+                }
+                None => {
+                    warn!(new_path, "rename_versions: moved version dir parent not found; leaving parent unchanged");
+                    let sql = format!(
+                        "UPDATE {prefix}filecache SET path=$1, path_hash=$2, name=$3 WHERE fileid=$4"
+                    );
+                    let r = match pool {
+                        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+                            .bind(&new_path).bind(&new_hash).bind(&new_name).bind(fileid)
+                            .execute(p).await.map(|_| ()),
+                        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
+                            .bind(&new_path).bind(&new_hash).bind(&new_name).bind(fileid)
+                            .execute(p).await.map(|_| ()),
+                    };
+                    if let Err(e) = r {
+                        warn!(fileid, error = %e, "rename_versions: failed to repath cache row {old_path}");
+                    }
+                }
+            }
+        } else {
+            // Descendants: path/path_hash only (parents move with the subtree).
+            let sql = format!(
+                "UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3"
+            );
+            let r = match pool {
+                DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+                    .bind(&new_path).bind(&new_hash).bind(fileid)
+                    .execute(p).await.map(|_| ()),
+                DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
+                    .bind(&new_path).bind(&new_hash).bind(fileid)
+                    .execute(p).await.map(|_| ()),
+            };
+            if let Err(e) = r {
+                warn!(fileid, error = %e, "rename_versions: failed to repath cache row {old_path}");
+            }
+        }
+    }
+}
+
+/// Repath a single version FILE's `oc_filecache` row, matching PHP's
+/// `Cache::move` for a single file (path/path_hash/name/parent rewritten).
+async fn repath_version_row(
+    pool: &DbPool,
+    prefix: &str,
+    storage_id: i64,
+    old_fc: &str,
+    new_fc: &str,
+) {
+    if old_fc == new_fc {
+        return;
+    }
+    let new_hash = row::path_hash(new_fc);
+    let new_name = new_fc.rsplit('/').next().unwrap_or("").to_string();
+    let new_parent_fc = {
+        let mut parts: Vec<&str> = new_fc.split('/').collect();
+        parts.pop();
+        parts.join("/")
+    };
+    // PHP `Cache::move` recomputes the moved node's parent from the target path.
+    match row::lookup_by_path(pool, prefix, storage_id, &new_parent_fc).await {
+        Some(parent) => {
+            let sql = format!(
+                "UPDATE {prefix}filecache SET path=$1, path_hash=$2, name=$3, parent=$4 \
+                 WHERE storage=$5 AND path=$6"
+            );
+            let result = match pool {
+                DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+                    .bind(new_fc).bind(&new_hash).bind(&new_name).bind(parent.fileid)
+                    .bind(storage_id).bind(old_fc)
+                    .execute(p).await.map(|_| ()),
+                DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
+                    .bind(new_fc).bind(&new_hash).bind(&new_name).bind(parent.fileid)
+                    .bind(storage_id).bind(old_fc)
+                    .execute(p).await.map(|_| ()),
+            };
+            if let Err(e) = result {
+                warn!(old_fc, new_fc, error = %e, "rename_versions: failed to repath version row");
+            }
+        }
+        None => {
+            warn!(new_fc, "rename_versions: new parent not found for version row; leaving parent unchanged");
+            let sql = format!(
+                "UPDATE {prefix}filecache SET path=$1, path_hash=$2, name=$3 \
+                 WHERE storage=$4 AND path=$5"
+            );
+            let result = match pool {
+                DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+                    .bind(new_fc).bind(&new_hash).bind(&new_name)
+                    .bind(storage_id).bind(old_fc)
+                    .execute(p).await.map(|_| ()),
+                DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
+                    .bind(new_fc).bind(&new_hash).bind(&new_name)
+                    .bind(storage_id).bind(old_fc)
+                    .execute(p).await.map(|_| ()),
+            };
+            if let Err(e) = result {
+                warn!(old_fc, new_fc, error = %e, "rename_versions: failed to repath version row");
             }
         }
     }
@@ -234,11 +428,18 @@ pub async fn rename_versions(
 /// Copy versions when a file is copied.
 ///
 /// For files: copies all `files_versions/{oldRel}.v*` to `files_versions/{newRel}.v*`.
+/// For directories: copies the entire `files_versions/{oldRel}/` subtree.
+///
+/// Mirrors PHP `Storage::renameOrCopy` (copy) → `View::copy` → `Cache::copyFromCache`:
+/// besides copying the version FILES on disk, each copied version's `oc_filecache`
+/// row is CLONED to the target path (new fileid, cloned fields) so the versions
+/// PROPFIND can enumerate the copies.
 pub async fn copy_versions(
-    _pool: &DbPool,
-    _prefix: &str,
+    pool: &DbPool,
+    prefix: &str,
     data_dir: &Path,
     uid: &str,
+    storage_id: i64,
     old_fc_path: &str,
     new_fc_path: &str,
 ) {
@@ -253,30 +454,266 @@ pub async fn copy_versions(
 
     let old_versions_dir =
         crate::row::disk_path(data_dir, uid, &format!("files_versions/{old_rel}"));
-    let parent_of_versions = old_versions_dir.parent();
-    let base_name = old_versions_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let new_versions_dir =
+        crate::row::disk_path(data_dir, uid, &format!("files_versions/{new_rel}"));
+    let old_versions_fc = format!("files_versions/{old_rel}");
+    let new_versions_fc = format!("files_versions/{new_rel}");
 
-    if let Some(parent) = parent_of_versions {
-        if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with(&base_name) && name_str[base_name.len()..].starts_with(".v")
-                {
-                    let new_name = format!("{}{}", new_rel, &name_str[base_name.len()..]);
-                    let new_disk =
-                        crate::row::disk_path(data_dir, uid, &format!("files_versions/{new_name}"));
-                    if let Some(np) = new_disk.parent() {
-                        let _ = tokio::fs::create_dir_all(np).await;
-                    }
-                    if let Err(e) = tokio::fs::copy(&entry.path(), &new_disk).await {
-                        warn!("copy_versions: file copy failed {name_str}: {e}");
+    if old_versions_dir.is_dir() {
+        // Directory: copy the whole versions subdirectory on disk, then clone
+        // the cache subtree (PHP `View::copy` → `Cache::copyFromCache` recursion).
+        if let Some(parent) = new_versions_dir.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                debug!(parent = %parent.display(), error = %e, "Failed to create version parent dir");
+            }
+        }
+        copy_version_tree(&old_versions_dir, &new_versions_dir);
+        clone_version_subtree(pool, prefix, storage_id, &old_versions_fc, &new_versions_fc).await;
+    } else {
+        // File: copy each .v{ts} version file and clone its cache row.
+        if let Some(parent) = old_versions_dir.parent() {
+            let prefix_pattern = old_versions_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
+                let mut copied: Vec<(String, String)> = Vec::new();
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with(&prefix_pattern)
+                        && name_str[prefix_pattern.len()..].starts_with(".v")
+                    {
+                        let new_name = format!("{}{}", new_rel, &name_str[prefix_pattern.len()..]);
+                        let new_disk = crate::row::disk_path(
+                            data_dir,
+                            uid,
+                            &format!("files_versions/{new_name}"),
+                        );
+                        if let Some(np) = new_disk.parent() {
+                            let _ = tokio::fs::create_dir_all(np).await;
+                        }
+                        if let Err(e) = tokio::fs::copy(&entry.path(), &new_disk).await {
+                            warn!("copy_versions: file copy failed {name_str}: {e}");
+                        } else {
+                            copied.push((name_str.to_string(), new_name));
+                        }
                     }
                 }
+                for (old_name, new_name) in copied {
+                    clone_version_file(
+                        pool,
+                        prefix,
+                        storage_id,
+                        &format!("files_versions/{old_name}"),
+                        &format!("files_versions/{new_name}"),
+                    )
+                    .await;
+                }
             }
+        }
+    }
+}
+
+/// Recursively copy a version directory tree on disk.
+fn copy_version_tree(src: &Path, dst: &Path) {
+    if let Err(e) = std::fs::create_dir_all(dst) {
+        warn!(src = %src.display(), dst = %dst.display(), error = %e, "copy_versions: create dir failed");
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(src) {
+        for entry in entries.flatten() {
+            let from = entry.path();
+            let to = dst.join(entry.file_name());
+            if from.is_dir() {
+                copy_version_tree(&from, &to);
+            } else if let Err(e) = std::fs::copy(&from, &to) {
+                warn!(src = %from.display(), dst = %to.display(), error = %e, "copy_versions: file copy failed");
+            }
+        }
+    }
+}
+
+/// Clone a single version FILE's `oc_filecache` row to a new path (new fileid,
+/// cloned fields), matching PHP `Cache::copyFromCache` for a file entry.
+async fn clone_version_file(
+    pool: &DbPool,
+    prefix: &str,
+    storage_id: i64,
+    old_fc: &str,
+    new_fc: &str,
+) {
+    if old_fc == new_fc {
+        return;
+    }
+    let Some(src) = row::lookup_by_path(pool, prefix, storage_id, old_fc).await else {
+        return;
+    };
+    let parent_fc = {
+        let mut parts: Vec<&str> = new_fc.split('/').collect();
+        parts.pop();
+        parts.join("/")
+    };
+    let Some(parent) = row::lookup_by_path(pool, prefix, storage_id, &parent_fc).await else {
+        warn!(new_fc, "copy_versions: target parent not found");
+        return;
+    };
+    insert_version_clone(pool, prefix, storage_id, new_fc, parent.fileid, &src).await;
+}
+
+/// Insert a new `oc_filecache` row cloning `src` (and its `oc_filecache_extended`
+/// row) at `new_fc` under `parent_id`.  Returns the new fileid (0 on failure).
+async fn insert_version_clone(
+    pool: &DbPool,
+    prefix: &str,
+    storage_id: i64,
+    new_fc: &str,
+    parent_id: i64,
+    src: &row::FileCacheRow,
+) -> i64 {
+    let hash = row::path_hash(new_fc);
+    let name = new_fc.rsplit('/').next().unwrap_or("").to_string();
+    let sql = format!(
+        "INSERT INTO {prefix}filecache \
+         (storage, path, path_hash, parent, name, mimetype, mimepart, size, mtime, \
+          storage_mtime, etag, permissions, checksum) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING fileid"
+    );
+    let fetched: Result<i64, sqlx::Error> = match pool {
+        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
+            .bind(storage_id)
+            .bind(new_fc)
+            .bind(&hash)
+            .bind(parent_id)
+            .bind(&name)
+            .bind(src.mimetype)
+            .bind(src.mimepart)
+            .bind(src.size)
+            .bind(src.mtime)
+            .bind(src.storage_mtime)
+            .bind(src.etag.as_deref().unwrap_or(""))
+            .bind(src.permissions)
+            .bind(src.checksum.as_deref().unwrap_or(""))
+            .fetch_one(p)
+            .await,
+        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
+            .bind(storage_id)
+            .bind(new_fc)
+            .bind(&hash)
+            .bind(parent_id)
+            .bind(&name)
+            .bind(src.mimetype)
+            .bind(src.mimepart)
+            .bind(src.size)
+            .bind(src.mtime)
+            .bind(src.storage_mtime)
+            .bind(src.etag.as_deref().unwrap_or(""))
+            .bind(src.permissions)
+            .bind(src.checksum.as_deref().unwrap_or(""))
+            .fetch_one(p)
+            .await,
+    };
+    let new_id = match fetched {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(new_fc, error = %e, "copy_versions: insert clone failed");
+            return 0;
+        }
+    };
+
+    // Clone the extended (creation_time/upload_time/metadata_etag) row too.
+    let ext = row::get_extended(pool, prefix, src.fileid).await;
+    let sql_ext = format!(
+        "INSERT INTO {prefix}filecache_extended (fileid, metadata_etag, creation_time, upload_time) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT(fileid) DO NOTHING"
+    );
+    let _ = match pool {
+        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql_ext)
+            .bind(new_id)
+            .bind(ext.metadata_etag.as_deref().unwrap_or(""))
+            .bind(ext.creation_time)
+            .bind(ext.upload_time)
+            .execute(p)
+            .await
+            .map(|_| ()),
+        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql_ext)
+            .bind(new_id)
+            .bind(ext.metadata_etag.as_deref().unwrap_or(""))
+            .bind(ext.creation_time)
+            .bind(ext.upload_time)
+            .execute(p)
+            .await
+            .map(|_| ()),
+    };
+    new_id
+}
+
+/// Clone the whole `files_versions/{old}/...` cache subtree to `files_versions/{new}/...`,
+/// matching PHP `Cache::copyFromCache` recursion (parents before children, so the
+/// new parent ids are known when each child is cloned).
+async fn clone_version_subtree(
+    pool: &DbPool,
+    prefix: &str,
+    storage_id: i64,
+    old_fc: &str,
+    new_fc: &str,
+) {
+    if old_fc == new_fc {
+        return;
+    }
+    let like = format!("{old_fc}/%");
+    let sql_fetch = format!(
+        "SELECT fileid, path, parent FROM {prefix}filecache \
+         WHERE storage = $1 AND (path = $2 OR path LIKE $3) \
+         ORDER BY length(path) ASC"
+    );
+    let rows: Vec<(i64, String, i64)> = match pool {
+        DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (i64, String, i64)>(&sql_fetch)
+            .bind(storage_id)
+            .bind(old_fc)
+            .bind(&like)
+            .fetch_all(p)
+            .await
+            .unwrap_or_default(),
+        DbPool::Sqlite(p) => sqlx::query_as::<sqlx::Sqlite, (i64, String, i64)>(&sql_fetch)
+            .bind(storage_id)
+            .bind(old_fc)
+            .bind(&like)
+            .fetch_all(p)
+            .await
+            .unwrap_or_default(),
+    };
+
+    let mut remap: HashMap<i64, i64> = HashMap::new();
+    for (old_id, old_path, old_parent) in rows {
+        let new_path = if old_path == old_fc {
+            new_fc.to_string()
+        } else {
+            format!("{new_fc}{}", &old_path[old_fc.len()..])
+        };
+        let parent_id = if let Some(p) = remap.get(&old_parent) {
+            *p
+        } else {
+            let parent_fc = {
+                let mut parts: Vec<&str> = new_path.split('/').collect();
+                parts.pop();
+                parts.join("/")
+            };
+            match row::lookup_by_path(pool, prefix, storage_id, &parent_fc).await {
+                Some(p) => p.fileid,
+                None => {
+                    warn!(new_path, "copy_versions: subtree target parent not found");
+                    continue;
+                }
+            }
+        };
+        let Some(src) = row::lookup_by_path(pool, prefix, storage_id, &old_path).await else {
+            continue;
+        };
+        let new_id = insert_version_clone(pool, prefix, storage_id, &new_path, parent_id, &src).await;
+        if new_id != 0 {
+            remap.insert(old_id, new_id);
         }
     }
 }
@@ -934,4 +1371,149 @@ mod tests {
             "the new entity must reflect the post-write file size"
         );
     }
+
+    #[tokio::test]
+    async fn rename_versions_repaths_directory_subtree() {
+        let (pool, prefix, storage_id) = fresh_db().await;
+        let data_dir = fresh_data_dir();
+        // On-disk version subtree under files_versions/Photos/2024/.
+        let vdir = data_dir.join("admin/files_versions/Photos/2024");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(vdir.join("photo.jpg.v100"), vec![b'x'; 26]).unwrap();
+
+        // Seed the version filecache subtree.
+        for (fid, path, parent, name) in [
+            (6i64, "files_versions", 1i64, "files_versions"),
+            (7, "files_versions/Photos", 6, "Photos"),
+            (8, "files_versions/Photos/2024", 7, "2024"),
+            (9, "files_versions/Photos/2024/photo.jpg.v100", 8, "photo.jpg.v100"),
+        ] {
+            sqlx::query::<sqlx::Sqlite>(&format!(
+                "INSERT INTO {prefix}filecache \
+                 (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+                  size, mtime, storage_mtime, etag, permissions, checksum) \
+                 VALUES ($1, $2, $3, $4, $5, $6, 0, 0, $7, 100, 100, 'etag', 27, '')"
+            ))
+            .bind(fid)
+            .bind(storage_id)
+            .bind(path)
+            .bind(row::path_hash(path))
+            .bind(parent)
+            .bind(name)
+            .bind(26i64)
+            .execute(test_pool(&pool))
+            .await
+            .unwrap();
+        }
+
+        rename_versions(
+            &pool,
+            &prefix,
+            &data_dir,
+            "admin",
+            storage_id,
+            "files/Photos",
+            "files/Photos2",
+        )
+        .await;
+
+        // Old subtree is gone from the cache.
+        assert!(
+            row::lookup_by_path(&pool, &prefix, storage_id, "files_versions/Photos")
+                .await
+                .is_none(),
+            "old files_versions/Photos subtree must be repathed away"
+        );
+        // The moved directory node was repathed, with its name rewritten.
+        let photos2 = row::lookup_by_path(&pool, &prefix, storage_id, "files_versions/Photos2")
+            .await
+            .expect("moved version dir must exist");
+        assert_eq!(photos2.name.as_deref(), Some("Photos2"));
+        // PHP `Cache::move` recomputes the moved node's parent: it must point
+        // at the new parent dir (files_versions root = id 6), not the old one.
+        assert_eq!(
+            photos2.parent, 6,
+            "moved version dir's parent must be repointed to its new parent"
+        );
+        // An intermediate dir and the deep version file followed the move,
+        // keeping their fileids.
+        assert!(
+            row::lookup_by_path(&pool, &prefix, storage_id, "files_versions/Photos2/2024")
+                .await
+                .is_some(),
+            "intermediate version dir must follow the rename"
+        );
+        let v = row::lookup_by_path(
+            &pool,
+            &prefix,
+            storage_id,
+            "files_versions/Photos2/2024/photo.jpg.v100",
+        )
+        .await
+        .expect("version file row must follow the rename");
+        assert_eq!(v.fileid, 9, "fileid must be preserved across the move");
+        assert_eq!(v.name.as_deref(), Some("photo.jpg.v100"));
+    }
+
+
+    #[tokio::test]
+    async fn copy_versions_clones_version_row() {
+        let (pool, prefix, storage_id) = fresh_db().await;
+        let data_dir = fresh_data_dir();
+        // On-disk version file for files/hello.txt + the files_versions dir.
+        let vdir = data_dir.join("admin/files_versions");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(vdir.join("hello.txt.v100"), vec![b'x'; 26]).unwrap();
+
+        // Seed files_versions (id 6) and the source version file row (id 7).
+        for (fid, path, parent, name) in [
+            (6i64, "files_versions", 1i64, "files_versions"),
+            (7, "files_versions/hello.txt.v100", 6, "hello.txt.v100"),
+        ] {
+            sqlx::query::<sqlx::Sqlite>(&format!(
+                "INSERT INTO {prefix}filecache \
+                 (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+                  size, mtime, storage_mtime, etag, permissions, checksum) \
+                 VALUES ($1, $2, $3, $4, $5, $6, 0, 0, $7, 100, 100, 'src-etag', 27, '')"
+            ))
+            .bind(fid)
+            .bind(storage_id)
+            .bind(path)
+            .bind(row::path_hash(path))
+            .bind(parent)
+            .bind(name)
+            .bind(26i64)
+            .execute(test_pool(&pool))
+            .await
+            .unwrap();
+        }
+
+        copy_versions(
+            &pool,
+            &prefix,
+            &data_dir,
+            "admin",
+            storage_id,
+            "files/hello.txt",
+            "files/hello2.txt",
+        )
+        .await;
+
+        // A NEW row (new fileid, not id 7) must exist for the copy, with the
+        // cloned etag and correct parent.
+        let src = row::lookup_by_path(&pool, &prefix, storage_id, "files_versions/hello.txt.v100")
+            .await
+            .expect("source version row");
+        let copy =
+            row::lookup_by_path(&pool, &prefix, storage_id, "files_versions/hello2.txt.v100")
+                .await
+                .expect("copied version row must exist");
+        assert_ne!(copy.fileid, src.fileid, "copy must get a brand-new fileid");
+        assert_eq!(copy.parent, 6, "copied row's parent is files_versions root");
+        assert_eq!(copy.size, 26);
+        assert_eq!(copy.mtime, 100);
+        assert_eq!(copy.etag.as_deref(), Some("src-etag"), "clone must keep the source etag");
+        assert!(data_dir.join("admin/files_versions/hello2.txt.v100").exists());
+    }
+
 }
