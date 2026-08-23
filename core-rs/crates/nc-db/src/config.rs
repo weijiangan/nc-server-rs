@@ -151,12 +151,13 @@ pub struct NcConfig {
     pub data_fingerprint: Option<String>,
     #[serde(default = "default_true")]
     pub bulkupload_enabled: bool,
-    /// Media-mtime fallback (intentional divergence, improvements.md):
-    /// when a media upload (image/video) sends `X-OC-MTime` that matches the
-    /// iOS client's `?? Date()` upload-instant fallback (within
-    /// `MEDIA_MTIME_FALLBACK_WINDOW_SECS` before the server-observed arrival),
-    /// `X-OC-CTime` — the true capture/save date the same client sent — is
-    /// used as the effective mtime instead.  Off → strict PHP semantics.
+    /// Media-mtime override (intentional divergence, improvements.md):
+    /// for a media upload (image/video) that sends `X-OC-CTime`, that value
+    /// — the capture/save date the client also sent — is used as the
+    /// effective mtime unconditionally, so the iOS client's Photos tab
+    /// (sorted by `d:getlastmodified`) places such photos on the day they
+    /// were taken/saved instead of the upload day.  Off → strict PHP
+    /// semantics.
     /// Key: `media_mtime_ctime_fallback` in `config.php`.  Default: `true`.
     #[serde(default = "default_true")]
     pub media_mtime_ctime_fallback: bool,

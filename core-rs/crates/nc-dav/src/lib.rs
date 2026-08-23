@@ -127,7 +127,7 @@ pub struct NcDavState {
     /// statements.
     pub lazy_cache_ensured: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
     /// Config `media_mtime_ctime_fallback` (improvements.md): media uploads
-    /// whose `X-OC-MTime` matches the iOS client's `?? Date()` fallback get
-    /// `X-OC-CTime` as their effective mtime.  Off → strict PHP semantics.
+    /// that send `X-OC-CTime` get it as their effective mtime (flat override).
+    /// Off → strict PHP semantics.
     pub media_mtime_ctime_fallback: bool,
 }

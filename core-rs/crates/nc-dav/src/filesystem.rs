@@ -35,7 +35,6 @@ use crate::{
     row::{self, dav_to_fc_path, disk_path},
     NcDavState,
 };
-use nc_db::now_secs;
 
 // ─── NcFileSystem ─────────────────────────────────────────────────────────────
 
@@ -489,12 +488,9 @@ impl DavFileSystem for NcFileSystem {
                     ),
                     x_oc_mtime: self.x_oc_mtime,
                     x_oc_ctime: self.x_oc_ctime,
-                    // §10.5 + improvements.md: media-mtime fallback inputs.
-                    // is_media from the detected mimetype part ("image"/"video");
-                    // arrival_anchor captured at open() — the server-observed
-                    // request arrival (the fallback window anchors on it).
+                    // §10.5 + improvements.md: media-mtime override inputs.
+                    // is_media from the detected mimetype part ("image"/"video").
                     is_media: part_str == "image" || part_str == "video",
-                    arrival_anchor: now_secs(),
                     media_mtime_ctime_fallback: self.state.media_mtime_ctime_fallback,
                     write_result: self.write_result.clone(),
                     put_error: self.put_error.clone(),

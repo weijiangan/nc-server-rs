@@ -163,23 +163,18 @@ Option 1 is recommended. Tracked as a future task because it requires rewriting 
 
 Decisions where Rust deliberately behaves differently from the PHP reference, with the full mechanics recorded. The requirements specs still record what PHP does.
 
-## D.1 Media-mtime fallback (iOS Photos-tab placement)
+## D.1 Media-mtime override (iOS Photos-tab placement)
 
-**Implemented:** 2026-08-21. Config key: `media_mtime_ctime_fallback` in `config.php`, default `true`; `false` restores strict PHP semantics.
+**Implemented:** 2026-08-21 (windowed fallback, commit 0563441); **2026-08-23 (flat override).** Config key: `media_mtime_ctime_fallback` in `config.php`, default `true`; `false` restores strict PHP semantics.
 
 **PHP behavior:** on upload (simple PUT `apps/dav/lib/Connector/Sabre/File.php:346-366`, chunked assembly MOVE `apps/dav/lib/Upload/ChunkingV2Plugin.php:195-203`) the server stores `oc_filecache.mtime` = `X-OC-MTime` (when sent; else request time), `oc_filecache_extended.creation_time` = `X-OC-CTime` (when sent; else 0). PHP never cross-derives the two.
 
 **The client bug this fixes:** the iOS app sends `X-OC-MTime` from `PHAsset.modificationDate ?? Date()` (`NCCameraRoll.swift:237`). Photos saved by third-party apps (WhatsApp) have no `modificationDate`, so the fallback stamps the **upload instant**; `X-OC-CTime` from `PHAsset.creationDate` carries the true capture/save date. The iOS app's Photos tab (Media) filters and orders media by `d:getlastmodified` — i.e. `oc_filecache.mtime` — so such photos land on the upload day in the timeline while `creation_time` (correct) sits unused in `oc_filecache_extended`.
 
-**Rust behavior:** for uploads where *all* of the following hold, `X-OC-CTime` becomes the effective mtime (written to `oc_filecache.mtime`/`storage_mtime`, the disk file mtime where set, propagation, version rows — everything the original mtime would feed):
-- the feature switch is enabled;
-- the target mimetype is `image/*` or `video/*`;
-- the client sent **both** headers (a headerless request keeps PHP semantics);
-- the sent `X-OC-MTime` falls within 15 minutes *before* the server-observed arrival anchor — the unmistakable signature of the client's `Date()` fallback;
-- `X-OC-CTime` is strictly older than the sent mtime (the mtime is never moved forward).
+**Rust behavior (flat override):** for media uploads (`image/*` or `video/*`) where the client sent a valid `X-OC-CTime`, that value becomes the effective mtime **unconditionally** (written to `oc_filecache.mtime`/`storage_mtime`, the disk file mtime where set, propagation, version rows — everything the original mtime would feed). No arrival-window check, no "both headers" requirement, no mtime/ctime ordering constraint. `false` → strict PHP semantics.
 
-**Arrival anchor:** for a simple PUT, the request's open time; for a chunked MOVE, the **earliest chunk's** disk mtime (chunk PUTs carry no `X-OC-MTime`, so chunk files' disk mtimes are server-side arrival times). A wall-clock window against the MOVE's own arrival would miss slow chunked uploads whose fallback stamp predates the MOVE by hours; the chunk-anchored window does not.
+**Why flat (supersedes the windowed heuristic):** the original 15-minute window anchored on the server-observed arrival (request open time for a simple PUT; the **earliest chunk's** disk mtime for a chunked MOVE — chunk PUTs carry no `X-OC-MTime`) and additionally required both headers plus `X-OC-CTime` strictly older than the sent mtime. It still missed real uploads: the iOS client stamps `?? Date()` at **extraction**, and a deferred/background session can land the first chunk more than 15 minutes later, placing the sent mtime outside the window. The flat rule removes every heuristic — media + ctime always wins.
 
-**Trade-off (accepted):** media genuinely modified within 15 minutes before arrival (e.g. a photo exported/edited right before upload) is also re-anchored to `X-OC-CTime` — indistinguishable from the fallback by design. For fresh media, ctime ≈ mtime anyway; for edited media the Photos tab then shows the capture day, which is the intended placement. Media uploaded with mtimes older than the window (desktop sync, camera photos synced days later) is never touched.
+**Trade-off (accepted):** any media carrying a ctime is re-anchored to its capture/save date, including media genuinely edited right before upload (the Photos tab then shows the capture day, the intended placement) and the pathological case of a future ctime (which would move the mtime forward; `PHAsset.creationDate` is never future in practice). For media the capture/save date is the placement the client's Photos tab wants.
 
-**Scope:** simple PUT (`nc-dav/src/davfile.rs` flush) and chunked assembly MOVE (`nc-dav/src/upload_handler.rs`). Bulk upload stays at strict PHP parity. The difftest oracle cannot cover the fallback (the PHP side cannot be told to diverge) — the resolver is unit-tested in `nc-dav/src/mtime.rs`.
+**Scope:** simple PUT (`nc-dav/src/davfile.rs` flush) and chunked assembly MOVE (`nc-dav/src/upload_handler.rs`). Bulk upload stays at strict PHP parity. The difftest oracle cannot cover the override (the PHP side cannot be told to diverge) — the resolver is unit-tested in `nc-dav/src/mtime.rs`.

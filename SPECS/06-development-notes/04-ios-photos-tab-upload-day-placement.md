@@ -112,6 +112,26 @@ ctime ≈ mtime, and for edited media the tab then shows the capture day.
   `X-OC-MTime: accepted` is still returned on both.
 - The simple-PUT disk-mtime gap (finding 5) — decide whether Rust should
   `set_file_times` from the effective mtime like PHP's `View::touch()`.
-- Edge: a >15-minute client-side split of a giant video before the first
-  chunk lands would miss the window — acceptable, but worth re-checking if
-  the live A/B shows it.
+
+### Follow-up (2026-08-23): windowed fallback → flat override
+
+The windowed fallback above still missed real uploads, so it was replaced
+with a flat override ([improvements.md D.1](../02-specifications/improvements.md)
+updated accordingly).  Why it missed: the client stamps `?? Date()` at
+**extraction**, and a deferred/background session can land the first chunk
+more than 15 minutes later — the sent `X-OC-MTime` then fell outside the
+anchor window and the fallback never fired, leaving the photo on the upload
+day again.
+
+New rule (same `media_mtime_ctime_fallback` config, default `true`): for a
+media upload (`image/*`/`video/*`) that sends a valid `X-OC-CTime`, that
+value is the effective mtime **unconditionally** — no arrival window, no
+"both headers" requirement, no ordering constraint.  The chunk-mtime anchor
+scan and the `arrival_anchor` plumbing were deleted (dead).  `mtime.rs`'s
+`media_mtime_fallback` → `media_mtime_ctime_override`; tests rewritten
+(deferred background upload, old-mtime sync, future ctime, switch off,
+non-media, missing ctime).  Verification: `cargo test -p nc-dav --lib` green.
+
+Replaced the ">15-minute split" follow-up: the flat rule now covers that case
+by construction.  The live A/B and the simple-PUT disk-mtime gap (finding 5)
+remain open.
