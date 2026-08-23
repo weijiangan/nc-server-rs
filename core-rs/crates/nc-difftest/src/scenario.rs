@@ -729,7 +729,7 @@ pub async fn run_cleanup(
 
 #[cfg(test)]
 mod tests {
-    use super::{propfind_shape, PropfindShape};
+    use super::{propfind_shape, PropfindShape, Scenario};
 
     #[test]
     fn shape_counts_responses_and_hrefs() {
@@ -796,5 +796,31 @@ mod tests {
         let s = propfind_shape(body);
         assert_eq!(s.responses, 1);
         assert_eq!(s.hrefs, vec!["/a"]);
+    }
+
+    #[test]
+    fn scenario_28_move_versioned_file_parses() {
+        let p = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scenarios/28_move_versioned_file.yaml"
+        );
+        let sc = Scenario::load(p).unwrap();
+        assert_eq!(sc.name, "28_move_versioned_file");
+        assert_eq!(sc.ops.len(), 3, "put, put, move");
+        assert_eq!(sc.cleanup.len(), 1, "delete the moved file");
+        assert!(sc.stable_overrides.contains(&"oc_filecache.mtime".to_string()));
+    }
+
+    #[test]
+    fn scenario_29_copy_versioned_file_parses() {
+        let p = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scenarios/29_copy_versioned_file.yaml"
+        );
+        let sc = Scenario::load(p).unwrap();
+        assert_eq!(sc.name, "29_copy_versioned_file");
+        assert_eq!(sc.ops.len(), 3, "put, put, copy");
+        assert_eq!(sc.cleanup.len(), 2, "delete src + copied");
+        assert!(sc.stable_overrides.contains(&"oc_filecache.mtime".to_string()));
     }
 }

@@ -1,0 +1,33 @@
+# Copy a file that already has a version. The second PUT (with an explicit
+# X-OC-Mtime) creates a version at files_versions/{name}.v1700000000 plus its
+# oc_files_versions row and oc_filecache entry. The COPY then clones the
+# version file on disk and its oc_filecache row (new fileid) to the target
+# (Cache::copyFromCache); oc_files_versions is NOT copied (PHP creates those
+# on the target's next write). Rust must match — leaving the target without
+# a version filecache row is the bug fixed in 30ebccb.
+#
+# The X-OC-Mtime on the first PUT makes the version filename deterministic
+# so the row identity is stable across sides.
+name: 29_copy_versioned_file
+stable_overrides:
+  - oc_filecache.mtime
+  - oc_filecache.storage_mtime
+ops:
+  - op: put
+    path: /remote.php/dav/files/admin/ver-copy-src.txt
+    body: "version one\n"
+    headers:
+      X-OC-Mtime: "1700000000"
+  - op: put
+    path: /remote.php/dav/files/admin/ver-copy-src.txt
+    body: "version two — longer content\n"
+    headers:
+      X-OC-Mtime: "1700000123"
+  - op: copy
+    from: /remote.php/dav/files/admin/ver-copy-src.txt
+    to: /remote.php/dav/files/admin/ver-copied.txt
+cleanup:
+  - op: delete
+    path: /remote.php/dav/files/admin/ver-copy-src.txt
+  - op: delete
+    path: /remote.php/dav/files/admin/ver-copied.txt

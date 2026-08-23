@@ -1,0 +1,33 @@
+# Move a file that already has a version. The second PUT (with an explicit
+# X-OC-Mtime) creates a version file at files_versions/{name}.v1700000000
+# (deterministic name) plus its oc_files_versions row and oc_filecache entry.
+# The MOVE then repaths the file; Rust must also repath the files_versions/
+# subtree (Cache::move on the versions storage) — leaving rows stranded at the
+# old path is the bug fixed in 30ebccb.
+#
+# The X-OC-Mtime on the first PUT makes the version filename deterministic
+# (the .v{ts} suffix is the old mtime); without it the wall-clock mtime makes
+# the row identity non-comparable (the canonicalizer strips the suffix, but
+# two sides replaying sequentially can straddle a second boundary and create
+# different version counts if the mtime is request-time).
+name: 28_move_versioned_file
+stable_overrides:
+  - oc_filecache.mtime
+  - oc_filecache.storage_mtime
+ops:
+  - op: put
+    path: /remote.php/dav/files/admin/ver-move-src.txt
+    body: "version one\n"
+    headers:
+      X-OC-Mtime: "1700000000"
+  - op: put
+    path: /remote.php/dav/files/admin/ver-move-src.txt
+    body: "version two — longer content\n"
+    headers:
+      X-OC-Mtime: "1700000123"
+  - op: move
+    from: /remote.php/dav/files/admin/ver-move-src.txt
+    to: /remote.php/dav/files/admin/ver-moved.txt
+cleanup:
+  - op: delete
+    path: /remote.php/dav/files/admin/ver-moved.txt
