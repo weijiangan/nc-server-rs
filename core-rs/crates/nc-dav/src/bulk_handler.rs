@@ -16,11 +16,11 @@
 use axum::{body::Body, extract::State, response::Response};
 use http::{HeaderName, HeaderValue, StatusCode};
 use nc_auth::AuthInfo;
-use nc_db::pool::DbPool;
 use tokio::fs;
 use tracing::warn;
 
 use crate::{propagator::Propagator, row, versions, NcDavState};
+use nc_db::{db_dispatch, db_execute};
 
 static H_CSP: HeaderName = HeaderName::from_static("content-security-policy");
 static H_JSON: HeaderName = HeaderName::from_static("content-type");
@@ -410,30 +410,17 @@ async fn write_file(
             "UPDATE {prefix}filecache SET size=$1, mtime=$2, storage_mtime=$3, etag=$4, mimetype=$5, mimepart=$6 WHERE fileid=$7",
             prefix = state.table_prefix
         );
-        let result = match &state.pool {
-            DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
-                .bind(data.len() as i64)
-                .bind(file_mtime)
-                .bind(file_mtime)
-                .bind(&etag_raw)
-                .bind(mime_type_id)
-                .bind(mimepart_id)
-                .bind(fid)
-                .execute(p)
-                .await
-                .map(|_| ()),
-            DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-                .bind(data.len() as i64)
-                .bind(file_mtime)
-                .bind(file_mtime)
-                .bind(&etag_raw)
-                .bind(mime_type_id)
-                .bind(mimepart_id)
-                .bind(fid)
-                .execute(p)
-                .await
-                .map(|_| ()),
-        };
+        let result = db_execute!(
+            &state.pool,
+            &sql,
+            data.len() as i64,
+            file_mtime,
+            file_mtime,
+            &etag_raw,
+            mime_type_id,
+            mimepart_id,
+            fid
+        );
         if let Err(e) = result {
             warn!(fileid = fid, error = %e, "Bulk upload: failed to update filecache row");
         }
@@ -446,8 +433,8 @@ async fn write_file(
             RETURNING fileid",
             prefix = state.table_prefix
         );
-        let inserted: Result<i64, sqlx::Error> = match &state.pool {
-            DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
+        let inserted: Result<i64, sqlx::Error> = db_dispatch!(&state.pool, |Db, c| {
+            sqlx::query_scalar::<Db, _>(&sql)
                 .bind(storage_id)
                 .bind(&fc_path)
                 .bind(&hash)
@@ -461,25 +448,9 @@ async fn write_file(
                 .bind(&etag_raw)
                 .bind(27i32) // CRUDS permissions (READ|UPDATE|DELETE|SHARE)
                 .bind("")
-                .fetch_one(p)
-                .await,
-            DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
-                .bind(storage_id)
-                .bind(&fc_path)
-                .bind(&hash)
-                .bind(parent_row.fileid)
-                .bind(&file_name)
-                .bind(mime_type_id)
-                .bind(mimepart_id)
-                .bind(data.len() as i64)
-                .bind(file_mtime)
-                .bind(file_mtime)
-                .bind(&etag_raw)
-                .bind(27i32) // CRUDS permissions (READ|UPDATE|DELETE|SHARE)
-                .bind("")
-                .fetch_one(p)
-                .await,
-        };
+                .fetch_one(c)
+                .await
+        });
         fid = inserted.map_err(|e| format!("Failed to insert filecache: {}", e))?;
     }
 
@@ -492,24 +463,16 @@ async fn write_file(
                 upload_time = COALESCE(EXCLUDED.upload_time, {prefix}filecache_extended.upload_time)",
             prefix = state.table_prefix
         );
-        let result = match &state.pool {
-            DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+        let result = db_dispatch!(&state.pool, |Db, c| {
+            sqlx::query::<Db>(&sql)
                 .bind(fid)
                 .bind("") // metadata_etag
                 .bind(file_mtime) // creation_time
                 .bind(now) // upload_time
-                .execute(p)
+                .execute(c)
                 .await
-                .map(|_| ()),
-            DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-                .bind(fid)
-                .bind("") // metadata_etag
-                .bind(file_mtime) // creation_time
-                .bind(now) // upload_time
-                .execute(p)
-                .await
-                .map(|_| ()),
-        };
+                .map(|_| ())
+        });
         if let Err(e) = result {
             warn!(fileid = fid, error = %e, "Bulk upload: failed to upsert filecache_extended");
         }

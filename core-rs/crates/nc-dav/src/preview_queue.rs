@@ -64,6 +64,7 @@ pub(crate) async fn queue_preview_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nc_db::db_dispatch;
 
     /// In-memory SQLite with the `oc_preview_generation` shape the app migrations
     /// produce (`id` PK autoincrement, `uid`, `file_id`, `queued_at`).
@@ -75,52 +76,29 @@ mod tests {
                 .await
                 .expect("in-memory SQLite"),
         );
-        match &pool {
-            DbPool::Pg(p) => {
-                sqlx::query::<sqlx::Postgres>(
-                    "CREATE TABLE oc_preview_generation (
+        db_dispatch!(&pool, |Db, c| {
+            sqlx::query::<Db>(
+                "CREATE TABLE oc_preview_generation (
                         id        INTEGER NOT NULL PRIMARY KEY,
                         uid       VARCHAR(256) NOT NULL,
                         file_id   BIGINT NOT NULL,
                         queued_at BIGINT NOT NULL
                     )",
-                )
-                .execute(p)
-                .await
-                .expect("create table");
-            }
-            DbPool::Sqlite(p) => {
-                sqlx::query::<sqlx::Sqlite>(
-                    "CREATE TABLE oc_preview_generation (
-                        id        INTEGER NOT NULL PRIMARY KEY,
-                        uid       VARCHAR(256) NOT NULL,
-                        file_id   BIGINT NOT NULL,
-                        queued_at BIGINT NOT NULL
-                    )",
-                )
-                .execute(p)
-                .await
-                .expect("create table");
-            }
-        }
+            )
+            .execute(c)
+            .await
+            .expect("create table");
+        });
         pool
     }
 
     async fn count(pool: &DbPool) -> i64 {
-        match pool {
-            DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(
-                "SELECT COUNT(*) FROM oc_preview_generation",
-            )
-            .fetch_one(p)
-            .await
-            .expect("count"),
-            DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(
-                "SELECT COUNT(*) FROM oc_preview_generation",
-            )
-            .fetch_one(p)
-            .await
-            .expect("count"),
-        }
+        db_dispatch!(pool, |Db, c| {
+            sqlx::query_scalar::<Db, _>("SELECT COUNT(*) FROM oc_preview_generation")
+                .fetch_one(c)
+                .await
+                .expect("count")
+        })
     }
 
     #[tokio::test]

@@ -24,8 +24,8 @@ use http::{HeaderName, HeaderValue, Method, StatusCode};
 use nc_auth::AuthInfo;
 
 use crate::{filesystem::NcFileSystem, locksystem::NcLockSystem, row, NcDavState};
+use nc_db::db_dispatch;
 use nc_db::FilenameError;
-use nc_db::pool::DbPool;
 
 // ─── Header name constants ───────────────────────────────────────────────────
 
@@ -552,14 +552,11 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
                          WHERE appid = 'files_trashbin' AND configkey = 'enabled'",
                         prefix = prefix_ref
                     );
-                    let trash_enabled_val = match &pool_ref {
-                        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, String>(&sql)
-                            .fetch_optional(p)
-                            .await,
-                        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, String>(&sql)
-                            .fetch_optional(p)
-                            .await,
-                    };
+                    let trash_enabled_val = db_dispatch!(&pool_ref, |Db, c| {
+                        sqlx::query_scalar::<Db, String>(&sql)
+                            .fetch_optional(c)
+                            .await
+                    });
                     match trash_enabled_val {
                         Ok(Some(val)) => val == "yes" || val == "true",
                         _ => false,

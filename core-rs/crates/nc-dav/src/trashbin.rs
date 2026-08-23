@@ -6,16 +6,16 @@
 //! The trash move itself replicates `Trashbin::move2trash()` plus the
 //! `retainVersions()` / delete-hook cascade.
 
-use sqlx::{Postgres, Row, Sqlite};
+use sqlx::Row;
 use tracing::warn;
 
 use dav_server::fs::FsError;
-use nc_db::pool::DbPool;
 
 use crate::cache_rows::ensure_lazy_dir_row;
 use crate::filesystem::{blocking, io_to_fs};
 use crate::row;
 use crate::NcFileSystem;
+use nc_db::{db_dispatch, db_execute};
 
 impl NcFileSystem {
     /// Apply PHP's `Storage::doDelete` trashbin eligibility gates.
@@ -39,18 +39,11 @@ impl NcFileSystem {
              WHERE appid = 'files_trashbin' AND configkey = 'enabled'",
             prefix = self.state.table_prefix
         );
-        let enabled = match &self.state.pool {
-            DbPool::Pg(p) => {
-                sqlx::query_scalar::<Postgres, String>(&sql)
-                    .fetch_optional(p)
-                    .await
-            }
-            DbPool::Sqlite(p) => {
-                sqlx::query_scalar::<Sqlite, String>(&sql)
-                    .fetch_optional(p)
-                    .await
-            }
-        };
+        let enabled = db_dispatch!(&self.state.pool, |Db, c| {
+            sqlx::query_scalar::<Db, String>(&sql)
+                .fetch_optional(c)
+                .await
+        });
         match enabled {
             Ok(Some(value)) => value == "yes" || value == "true",
             Ok(None) => {
@@ -121,22 +114,13 @@ impl NcFileSystem {
                      WHERE storage = $1 AND (path = $2 OR path LIKE $3)\
                  )"
             );
-            let result = match &self.state.pool {
-                DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_ext)
-                    .bind(self.storage_id)
-                    .bind(fc_path)
-                    .bind(&like_pat)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-                DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_ext)
-                    .bind(self.storage_id)
-                    .bind(fc_path)
-                    .bind(&like_pat)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-            };
+            let result = db_execute!(
+                &self.state.pool,
+                &sql_ext,
+                self.storage_id,
+                fc_path,
+                &like_pat
+            );
             if let Err(e) = result {
                 tracing::warn!(fc_path = fc_path, error = %e, "Failed to delete filecache_extended rows for directory");
             }
@@ -144,24 +128,16 @@ impl NcFileSystem {
             let sql_subtree = format!(
                 "DELETE FROM {prefix}filecache WHERE storage = $1 AND (path = $2 OR path LIKE $3)"
             );
-            match &self.state.pool {
-                DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_subtree)
+            db_dispatch!(&self.state.pool, |Db, c| {
+                sqlx::query::<Db>(&sql_subtree)
                     .bind(self.storage_id)
                     .bind(fc_path)
                     .bind(&like_pat)
-                    .execute(p)
+                    .execute(c)
                     .await
                     .map(|_| ())
-                    .map_err(|_| FsError::GeneralFailure)?,
-                DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_subtree)
-                    .bind(self.storage_id)
-                    .bind(fc_path)
-                    .bind(&like_pat)
-                    .execute(p)
-                    .await
-                    .map(|_| ())
-                    .map_err(|_| FsError::GeneralFailure)?,
-            }
+                    .map_err(|_| FsError::GeneralFailure)?
+            })
         }
 
         // §9.2: always propagate — matching PHP's View::rmdir() calling
@@ -234,37 +210,20 @@ impl NcFileSystem {
                 "DELETE FROM {prefix}filecache WHERE fileid = $1",
                 prefix = self.state.table_prefix
             );
-            match &self.state.pool {
-                DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+            db_dispatch!(&self.state.pool, |Db, c| {
+                sqlx::query::<Db>(&sql)
                     .bind(frow.fileid)
-                    .execute(p)
+                    .execute(c)
                     .await
                     .map(|_| ())
-                    .map_err(|_| FsError::GeneralFailure)?,
-                DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-                    .bind(frow.fileid)
-                    .execute(p)
-                    .await
-                    .map(|_| ())
-                    .map_err(|_| FsError::GeneralFailure)?,
-            }
+                    .map_err(|_| FsError::GeneralFailure)?
+            });
 
             let sql_ext = format!(
                 "DELETE FROM {prefix}filecache_extended WHERE fileid = $1",
                 prefix = self.state.table_prefix
             );
-            let result = match &self.state.pool {
-                DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_ext)
-                    .bind(frow.fileid)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-                DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_ext)
-                    .bind(frow.fileid)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-            };
+            let result = db_execute!(&self.state.pool, &sql_ext, frow.fileid);
             if let Err(e) = result {
                 tracing::warn!(fileid = frow.fileid, error = %e, "Failed to delete filecache_extended row");
             }
@@ -357,26 +316,17 @@ impl NcFileSystem {
              WHERE storage = $1 AND path LIKE $2",
             prefix = self.state.table_prefix
         );
-        let descendants: Vec<(i64, String)> = match &self.state.pool {
-            DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_desc)
+        let descendants: Vec<(i64, String)> = db_dispatch!(&self.state.pool, |Db, c| {
+            sqlx::query::<Db>(&sql_desc)
                 .bind(self.storage_id)
                 .bind(&like_pat)
-                .fetch_all(p)
+                .fetch_all(c)
                 .await
                 .map_err(|_| FsError::GeneralFailure)?
                 .into_iter()
                 .map(|r| (r.get::<i64, _>("fileid"), r.get::<String, _>("path")))
-                .collect(),
-            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_desc)
-                .bind(self.storage_id)
-                .bind(&like_pat)
-                .fetch_all(p)
-                .await
-                .map_err(|_| FsError::GeneralFailure)?
-                .into_iter()
-                .map(|r| (r.get::<i64, _>("fileid"), r.get::<String, _>("path")))
-                .collect(),
-        };
+                .collect()
+        });
 
         // Move the directory itself to trash.
         let old_fc_path = fc_path.to_string();
@@ -391,22 +341,7 @@ impl NcFileSystem {
                 "UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3",
                 prefix = self.state.table_prefix
             );
-            let result = match &self.state.pool {
-                DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_upd)
-                    .bind(&new_path)
-                    .bind(&new_hash)
-                    .bind(fid)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-                DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_upd)
-                    .bind(&new_path)
-                    .bind(&new_hash)
-                    .bind(fid)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-            };
+            let result = db_execute!(&self.state.pool, &sql_upd, &new_path, &new_hash, fid);
             if let Err(e) = result {
                 tracing::warn!(fileid = fid, error = %e, "Failed to update descendant path in trash");
             }
@@ -557,28 +492,18 @@ impl NcFileSystem {
              WHERE fileid=$5",
             prefix = self.state.table_prefix
         );
-        match &self.state.pool {
-            DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+        db_dispatch!(&self.state.pool, |Db, c| {
+            sqlx::query::<Db>(&sql)
                 .bind(&trash_fc)
                 .bind(&new_hash)
                 .bind(&new_name)
                 .bind(trash_parent.fileid)
                 .bind(row.fileid)
-                .execute(p)
+                .execute(c)
                 .await
                 .map(|_| ())
-                .map_err(|_| FsError::GeneralFailure)?,
-            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-                .bind(&trash_fc)
-                .bind(&new_hash)
-                .bind(&new_name)
-                .bind(trash_parent.fileid)
-                .bind(row.fileid)
-                .execute(p)
-                .await
-                .map(|_| ())
-                .map_err(|_| FsError::GeneralFailure)?,
-        }
+                .map_err(|_| FsError::GeneralFailure)?
+        });
 
         // PHP `updateStorageMTimeOnly($target)` (Updater.php:207-220): the
         // moved file's own `storage_mtime` ← its disk mtime (mtime untouched).
@@ -592,20 +517,7 @@ impl NcFileSystem {
             "UPDATE {prefix}filecache SET storage_mtime = $1 WHERE fileid = $2",
             prefix = self.state.table_prefix
         );
-        let result = match &self.state.pool {
-            DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_sm)
-                .bind(disk_mtime)
-                .bind(row.fileid)
-                .execute(p)
-                .await
-                .map(|_| ()),
-            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_sm)
-                .bind(disk_mtime)
-                .bind(row.fileid)
-                .execute(p)
-                .await
-                .map(|_| ()),
-        };
+        let result = db_execute!(&self.state.pool, &sql_sm, disk_mtime, row.fileid);
         if let Err(e) = result {
             tracing::warn!(fileid = row.fileid, error = %e, "move_to_trash: storage_mtime update failed");
         }
@@ -636,26 +548,15 @@ impl NcFileSystem {
              VALUES ($1, $2, $3, $4, $5)",
             prefix = self.state.table_prefix
         );
-        let result = match &self.state.pool {
-            DbPool::Pg(p) => sqlx::query::<Postgres>(&trash_sql)
-                .bind(&trash_basename)
-                .bind(&self.uid)
-                .bind(now.to_string())
-                .bind(&trash_location)
-                .bind(&self.uid)
-                .execute(p)
-                .await
-                .map(|_| ()),
-            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&trash_sql)
-                .bind(&trash_basename)
-                .bind(&self.uid)
-                .bind(now.to_string())
-                .bind(&trash_location)
-                .bind(&self.uid)
-                .execute(p)
-                .await
-                .map(|_| ()),
-        };
+        let result = db_execute!(
+            &self.state.pool,
+            &trash_sql,
+            &trash_basename,
+            &self.uid,
+            now.to_string(),
+            &trash_location,
+            &self.uid
+        );
         if let Err(e) = result {
             // Non-fatal: the file is already trashed on disk and in the
             // filecache, so it still lists in the web UI. But without this row
@@ -743,18 +644,7 @@ impl NcFileSystem {
             "DELETE FROM {prefix}files_versions WHERE file_id = $1",
             prefix = prefix
         );
-        let result = match pool {
-            DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_del)
-                .bind(fileid)
-                .execute(p)
-                .await
-                .map(|_| ()),
-            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_del)
-                .bind(fileid)
-                .execute(p)
-                .await
-                .map(|_| ()),
-        };
+        let result = db_execute!(pool, &sql_del, fileid);
         if let Err(e) = result {
             warn!(fileid = fileid, error = %e, "trash_versions: oc_files_versions DELETE failed");
         }
@@ -769,13 +659,13 @@ impl NcFileSystem {
              ORDER BY path",
             prefix = prefix
         );
-        let rows: Vec<(i64, String)> = match pool {
-            DbPool::Pg(p) => match sqlx::query::<Postgres>(&sql)
+        let rows: Vec<(i64, String)> = db_dispatch!(pool, |Db, c| {
+            match sqlx::query::<Db>(&sql)
                 .bind(self.storage_id)
                 .bind(&versions_base)
                 .bind(&base_like)
                 .bind(&file_like)
-                .fetch_all(p)
+                .fetch_all(c)
                 .await
             {
                 Ok(rs) => rs
@@ -786,25 +676,8 @@ impl NcFileSystem {
                     warn!(error = %e, "trash_versions: version-row query failed");
                     return;
                 }
-            },
-            DbPool::Sqlite(p) => match sqlx::query::<Sqlite>(&sql)
-                .bind(self.storage_id)
-                .bind(&versions_base)
-                .bind(&base_like)
-                .bind(&file_like)
-                .fetch_all(p)
-                .await
-            {
-                Ok(rs) => rs
-                    .into_iter()
-                    .map(|r| (r.get::<i64, _>("fileid"), r.get::<String, _>("path")))
-                    .collect(),
-                Err(e) => {
-                    warn!(error = %e, "trash_versions: version-row query failed");
-                    return;
-                }
-            },
-        };
+            }
+        });
         if rows.is_empty() {
             return;
         }
@@ -857,22 +730,7 @@ impl NcFileSystem {
                     "UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3",
                     prefix = prefix
                 );
-                let result = match pool {
-                    DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_upd)
-                        .bind(&target)
-                        .bind(&new_hash)
-                        .bind(fid)
-                        .execute(p)
-                        .await
-                        .map(|_| ()),
-                    DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_upd)
-                        .bind(&target)
-                        .bind(&new_hash)
-                        .bind(fid)
-                        .execute(p)
-                        .await
-                        .map(|_| ()),
-                };
+                let result = db_execute!(pool, &sql_upd, &target, &new_hash, fid);
                 if let Err(e) = result {
                     warn!(fileid = fid, error = %e, "trash_versions: child path update failed");
                 }
@@ -903,26 +761,15 @@ impl NcFileSystem {
                      WHERE fileid=$5",
                     prefix = prefix
                 );
-                let result = match pool {
-                    DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_upd)
-                        .bind(&target)
-                        .bind(&new_hash)
-                        .bind(&new_name)
-                        .bind(trash_versions_parent.fileid)
-                        .bind(fid)
-                        .execute(p)
-                        .await
-                        .map(|_| ()),
-                    DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_upd)
-                        .bind(&target)
-                        .bind(&new_hash)
-                        .bind(&new_name)
-                        .bind(trash_versions_parent.fileid)
-                        .bind(fid)
-                        .execute(p)
-                        .await
-                        .map(|_| ()),
-                };
+                let result = db_execute!(
+                    pool,
+                    &sql_upd,
+                    &target,
+                    &new_hash,
+                    &new_name,
+                    trash_versions_parent.fileid,
+                    fid
+                );
                 if let Err(e) = result {
                     warn!(fileid = fid, error = %e, "trash_versions: row update failed");
                 }

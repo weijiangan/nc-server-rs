@@ -3,6 +3,7 @@ use sha2::{Digest, Sha512};
 use nc_db::pool::DbPool;
 
 use crate::token::{CachedToken, SharedTokenCache};
+use nc_db::db_execute;
 
 // ── Hashing ───────────────────────────────────────────────────────────────────
 
@@ -98,12 +99,12 @@ pub async fn lookup_bearer(
     );
     let fetched: Result<Option<(i64, String, i16, String, Option<i64>, i64)>, sqlx::Error> =
         match pool {
-            DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (i64, String, i16, String, Option<i64>, i64)>(
-                &sql,
-            )
-            .bind(&hash_hex)
-            .fetch_optional(p)
-            .await,
+            DbPool::Pg(p) => {
+                sqlx::query_as::<sqlx::Postgres, (i64, String, i16, String, Option<i64>, i64)>(&sql)
+                    .bind(&hash_hex)
+                    .fetch_optional(p)
+                    .await
+            }
             DbPool::Sqlite(p) => {
                 sqlx::query_as::<sqlx::Sqlite, (i64, String, i16, String, Option<i64>, i64)>(&sql)
                     .bind(&hash_hex)
@@ -194,20 +195,7 @@ pub async fn update_last_activity(token_id: i64, pool: &DbPool, prefix: &str) {
         .as_secs() as i64;
     let table = format!("{prefix}authtoken");
     let sql = format!("UPDATE {table} SET last_activity = $1 WHERE id = $2");
-    let result = match pool {
-        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
-            .bind(now)
-            .bind(token_id)
-            .execute(p)
-            .await
-            .map(|_| ()),
-        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-            .bind(now)
-            .bind(token_id)
-            .execute(p)
-            .await
-            .map(|_| ()),
-    };
+    let result = db_execute!(pool, &sql, now, token_id);
     if let Err(e) = result {
         tracing::warn!(
             token_id,

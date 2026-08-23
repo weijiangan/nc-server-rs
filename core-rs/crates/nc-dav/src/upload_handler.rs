@@ -18,12 +18,12 @@ use axum::{
 use http::{HeaderName, HeaderValue, StatusCode};
 use md5::Digest;
 use nc_auth::AuthInfo;
-use nc_db::pool::DbPool;
 use std::time::SystemTime;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::{propagator::Propagator, row, NcDavState};
+use nc_db::{db_dispatch, db_execute};
 
 static H_CSP: HeaderName = HeaderName::from_static("content-security-policy");
 
@@ -128,8 +128,7 @@ async fn handle_propfind(state: NcDavState, upload_id: Option<&str>, path: &str)
                 format!(
                     "<d:getlastmodified>{}</d:getlastmodified>",
                     httpdate::fmt_http_date(
-                        dir_mtime_or_now(&state.data_directory.join("uploads").join(user_id))
-                            .await
+                        dir_mtime_or_now(&state.data_directory.join("uploads").join(user_id)).await
                     )
                 ),
                 "<d:resourcetype><d:collection/></d:resourcetype>".to_string(),
@@ -179,7 +178,10 @@ async fn handle_propfind(state: NcDavState, upload_id: Option<&str>, path: &str)
         .join(user_id)
         .join(upload_id);
     let slot_exists = state.upload_state_store.session_exists(upload_id).await
-        || fs::metadata(&slot_dir).await.map(|m| m.is_dir()).unwrap_or(false);
+        || fs::metadata(&slot_dir)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
     if !slot_exists {
         return not_found_response();
     }
@@ -237,7 +239,9 @@ fn propfind_href(path: &str, is_collection: bool) -> String {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// mtime of a directory if it exists, otherwise `now` — PHP's upload home
@@ -809,30 +813,17 @@ async fn handle_move(
             WHERE fileid=$7",
             prefix = state.table_prefix
         );
-        let result = match &state.pool {
-            DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
-                .bind(total_size as i64)
-                .bind(mtime)
-                .bind(mtime)
-                .bind(&etag)
-                .bind(mime_type_id)
-                .bind(mimepart_id)
-                .bind(existing.fileid)
-                .execute(p)
-                .await
-                .map(|_| ()),
-            DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-                .bind(total_size as i64)
-                .bind(mtime)
-                .bind(mtime)
-                .bind(&etag)
-                .bind(mime_type_id)
-                .bind(mimepart_id)
-                .bind(existing.fileid)
-                .execute(p)
-                .await
-                .map(|_| ()),
-        };
+        let result = db_execute!(
+            &state.pool,
+            &sql,
+            total_size as i64,
+            mtime,
+            mtime,
+            &etag,
+            mime_type_id,
+            mimepart_id,
+            existing.fileid
+        );
         if let Err(e) = result {
             tracing::error!(error = %e, "Failed to update filecache");
         }
@@ -846,8 +837,8 @@ async fn handle_move(
             RETURNING fileid",
             prefix = state.table_prefix
         );
-        let fetched: Result<i64, sqlx::Error> = match &state.pool {
-            DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
+        let fetched: Result<i64, sqlx::Error> = db_dispatch!(&state.pool, |Db, c| {
+            sqlx::query_scalar::<Db, _>(&sql)
                 .bind(storage_id)
                 .bind(&fc_path_full)
                 .bind(&hash)
@@ -861,25 +852,9 @@ async fn handle_move(
                 .bind(&etag)
                 .bind(27i32) // CRUDS permissions (READ|UPDATE|DELETE|SHARE)
                 .bind("")
-                .fetch_one(p)
-                .await,
-            DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
-                .bind(storage_id)
-                .bind(&fc_path_full)
-                .bind(&hash)
-                .bind(parent_row.fileid)
-                .bind(&file_name)
-                .bind(mime_type_id)
-                .bind(mimepart_id)
-                .bind(total_size as i64)
-                .bind(mtime)
-                .bind(mtime)
-                .bind(&etag)
-                .bind(27i32) // CRUDS permissions (READ|UPDATE|DELETE|SHARE)
-                .bind("")
-                .fetch_one(p)
-                .await,
-        };
+                .fetch_one(c)
+                .await
+        });
         fid = match fetched {
             Ok(id) => id,
             Err(e) => {
@@ -906,24 +881,16 @@ async fn handle_move(
         // client sent X-OC-CTime (PHP writes it only when dictated).
         let creation_time_val = ctime.unwrap_or(0);
         let upload_time_val = now; // always set upload_time for new/uploads
-        let result = match &state.pool {
-            DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
+        let result = db_dispatch!(&state.pool, |Db, c| {
+            sqlx::query::<Db>(&sql)
                 .bind(fid)
                 .bind("") // metadata_etag
                 .bind(creation_time_val)
                 .bind(upload_time_val)
-                .execute(p)
+                .execute(c)
                 .await
-                .map(|_| ()),
-            DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-                .bind(fid)
-                .bind("") // metadata_etag
-                .bind(creation_time_val)
-                .bind(upload_time_val)
-                .execute(p)
-                .await
-                .map(|_| ()),
-        };
+                .map(|_| ())
+        });
         if let Err(e) = result {
             tracing::warn!(fileid = fid, error = %e, "Chunked upload: failed to upsert oc_filecache_extended");
         }
@@ -997,18 +964,7 @@ async fn handle_move(
             "DELETE FROM {prefix}previews WHERE file_id = $1",
             prefix = state.table_prefix
         );
-        let result = match &state.pool {
-            DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
-                .bind(fid)
-                .execute(p)
-                .await
-                .map(|_| ()),
-            DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-                .bind(fid)
-                .execute(p)
-                .await
-                .map(|_| ()),
-        };
+        let result = db_execute!(&state.pool, &sql, fid);
         if let Err(e) = result {
             tracing::warn!(fileid = fid, error = %e, "Chunked upload: failed to delete stale oc_previews rows");
         }
@@ -1330,7 +1286,9 @@ mod tests {
             .unwrap();
         assert!(body.contains("<d:multistatus"));
         assert!(body.contains("<d:href>/remote.php/dav/uploads/admin/slot123/</d:href>"));
-        assert!(body.contains("<d:getlastmodified>Sun, 16 Aug 2026 11:30:07 GMT</d:getlastmodified>"));
+        assert!(
+            body.contains("<d:getlastmodified>Sun, 16 Aug 2026 11:30:07 GMT</d:getlastmodified>")
+        );
         assert!(body.contains("<d:resourcetype><d:collection/></d:resourcetype>"));
         assert!(body.contains("<d:status>HTTP/1.1 200 OK</d:status>"));
     }

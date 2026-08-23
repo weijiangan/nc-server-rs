@@ -7,6 +7,9 @@ pub mod migrate;
 pub mod mime;
 pub mod pool;
 
+#[macro_use]
+pub mod dispatch;
+
 pub use config::NcConfig;
 pub use filename_validator::{FilenameError, FilenameValidator, SharedFilenameValidator};
 pub use pool::{build_pool, DbPool};

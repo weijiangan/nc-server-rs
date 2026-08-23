@@ -6,14 +6,12 @@
 //! tag store; everything else is stored verbatim in `oc_properties`.
 
 use dav_server::fs::{DavProp, FsError};
-use sqlx::{Postgres, Sqlite};
-
-use nc_db::pool::DbPool;
 
 use crate::cache_rows::ensure_files_metadata_appconfig;
 use crate::path_utils::{extract_text_from_prop_xml, parse_iso8601};
 use crate::row;
 use crate::NcFileSystem;
+use nc_db::{db_dispatch, db_execute};
 
 impl NcFileSystem {
     /// PROPPATCH.
@@ -43,24 +41,16 @@ impl NcFileSystem {
                                  WHERE storage=$2 AND path_hash=$3",
                                 prefix = self.state.table_prefix
                             );
-                            let ok = match &self.state.pool {
-                                DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+                            let ok = db_dispatch!(&self.state.pool, |Db, c| {
+                                sqlx::query::<Db>(&sql)
                                     .bind(&etag)
                                     .bind(self.storage_id)
                                     .bind(&hash)
-                                    .execute(p)
+                                    .execute(c)
                                     .await
                                     .map(|_| ())
-                                    .is_ok(),
-                                DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-                                    .bind(&etag)
-                                    .bind(self.storage_id)
-                                    .bind(&hash)
-                                    .execute(p)
-                                    .await
-                                    .map(|_| ())
-                                    .is_ok(),
-                            };
+                                    .is_ok()
+                            });
                             if ok {
                                 http::StatusCode::OK
                             } else {
@@ -88,24 +78,14 @@ impl NcFileSystem {
                                      WHERE storage=$3 AND path_hash=$4",
                                     prefix = self.state.table_prefix
                                 );
-                                let result = match &self.state.pool {
-                                    DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
-                                        .bind(ts)
-                                        .bind(ts)
-                                        .bind(self.storage_id)
-                                        .bind(&hash)
-                                        .execute(p)
-                                        .await
-                                        .map(|_| ()),
-                                    DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-                                        .bind(ts)
-                                        .bind(ts)
-                                        .bind(self.storage_id)
-                                        .bind(&hash)
-                                        .execute(p)
-                                        .await
-                                        .map(|_| ()),
-                                };
+                                let result = db_execute!(
+                                    &self.state.pool,
+                                    &sql,
+                                    ts,
+                                    ts,
+                                    self.storage_id,
+                                    &hash
+                                );
                                 if let Err(e) = result {
                                     tracing::warn!(path_hash = hash, error = %e, "PROPPATCH: failed to update mtime");
                                 }
@@ -134,22 +114,8 @@ impl NcFileSystem {
                                      ON CONFLICT(fileid) DO UPDATE SET creation_time=excluded.creation_time",
                                     prefix = self.state.table_prefix
                                 );
-                                let result = match &self.state.pool {
-                                    DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
-                                        .bind(ts)
-                                        .bind(self.storage_id)
-                                        .bind(&hash)
-                                        .execute(p)
-                                        .await
-                                        .map(|_| ()),
-                                    DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-                                        .bind(ts)
-                                        .bind(self.storage_id)
-                                        .bind(&hash)
-                                        .execute(p)
-                                        .await
-                                        .map(|_| ()),
-                                };
+                                let result =
+                                    db_execute!(&self.state.pool, &sql, ts, self.storage_id, &hash);
                                 if let Err(e) = result {
                                     tracing::warn!(path_hash = hash, error = %e, "PROPPATCH: failed to update creationdate");
                                 }
@@ -181,22 +147,13 @@ impl NcFileSystem {
                                      ON CONFLICT(fileid) DO UPDATE SET creation_time = excluded.creation_time",
                                     prefix = self.state.table_prefix,
                                 );
-                                let result = match &self.state.pool {
-                                    DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_upsert)
-                                        .bind(ts)
-                                        .bind(self.storage_id)
-                                        .bind(&hash)
-                                        .execute(p)
-                                        .await
-                                        .map(|_| ()),
-                                    DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_upsert)
-                                        .bind(ts)
-                                        .bind(self.storage_id)
-                                        .bind(&hash)
-                                        .execute(p)
-                                        .await
-                                        .map(|_| ()),
-                                };
+                                let result = db_execute!(
+                                    &self.state.pool,
+                                    &sql_upsert,
+                                    ts,
+                                    self.storage_id,
+                                    &hash
+                                );
                                 if let Err(e) = result {
                                     tracing::warn!(path_hash = hash, error = %e, "PROPPATCH: failed to update timestamp");
                                 }
@@ -223,22 +180,13 @@ impl NcFileSystem {
                                      ON CONFLICT(fileid) DO UPDATE SET upload_time = excluded.upload_time",
                                     prefix = self.state.table_prefix,
                                 );
-                                let result = match &self.state.pool {
-                                    DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_upsert)
-                                        .bind(ts)
-                                        .bind(self.storage_id)
-                                        .bind(&hash)
-                                        .execute(p)
-                                        .await
-                                        .map(|_| ()),
-                                    DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_upsert)
-                                        .bind(ts)
-                                        .bind(self.storage_id)
-                                        .bind(&hash)
-                                        .execute(p)
-                                        .await
-                                        .map(|_| ()),
-                                };
+                                let result = db_execute!(
+                                    &self.state.pool,
+                                    &sql_upsert,
+                                    ts,
+                                    self.storage_id,
+                                    &hash
+                                );
                                 if let Err(e) = result {
                                     tracing::warn!(path_hash = hash, error = %e, "PROPPATCH: failed to update timestamp");
                                 }

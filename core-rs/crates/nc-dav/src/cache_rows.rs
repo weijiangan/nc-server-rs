@@ -1,5 +1,6 @@
 use crate::row;
 use crate::NcDavState;
+use nc_db::db_execute;
 use nc_db::mime::SharedMimeCache;
 use nc_db::pool::DbPool;
 
@@ -42,22 +43,7 @@ pub(crate) async fn ensure_lazy_cache_row(state: &NcDavState, storage_id: i64, n
          WHERE storage = $3 AND path = ''",
         prefix = state.table_prefix,
     );
-    let result = match &state.pool {
-        DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
-            .bind(&etag)
-            .bind(now)
-            .bind(storage_id)
-            .execute(p)
-            .await
-            .map(|_| ()),
-        DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-            .bind(&etag)
-            .bind(now)
-            .bind(storage_id)
-            .execute(p)
-            .await
-            .map(|_| ()),
-    };
+    let result = db_execute!(&state.pool, &sql, &etag, now, storage_id);
     if let Err(e) = result {
         tracing::warn!(error = %e, "lazy cache row: storage-root bump failed");
     }
@@ -67,7 +53,6 @@ pub(crate) async fn ensure_lazy_cache_row(state: &NcDavState, storage_id: i64, n
         .expect("lazy cache set")
         .insert(storage_id);
 }
-use sqlx::{Postgres, Sqlite};
 
 /// Lazily register the `core | files_metadata` appconfig row.
 pub(crate) async fn ensure_files_metadata_appconfig(pool: &DbPool, prefix: &str) {
@@ -80,18 +65,7 @@ pub(crate) async fn ensure_files_metadata_appconfig(pool: &DbPool, prefix: &str)
          ON CONFLICT DO NOTHING",
         prefix = prefix
     );
-    let result = match pool {
-        DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
-            .bind(&config_value)
-            .execute(p)
-            .await
-            .map(|_| ()),
-        DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-            .bind(&config_value)
-            .execute(p)
-            .await
-            .map(|_| ()),
-    };
+    let result = db_execute!(pool, &sql, &config_value);
     if let Err(e) = result {
         tracing::warn!(error = %e, "files_metadata appconfig registration failed");
     }
@@ -130,42 +104,23 @@ pub(crate) async fn ensure_lazy_dir_row(
          ON CONFLICT DO NOTHING",
         prefix = prefix
     );
-    let result = match pool {
-        DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
-            .bind(storage_id)
-            .bind(dir_name)
-            .bind(&dir_hash)
-            .bind(parent_id)
-            .bind(dir_name)
-            .bind(dir_mime_id)
-            .bind(dir_mimepart_id)
-            .bind(0i64)
-            .bind(now)
-            .bind(now)
-            .bind(&dir_etag)
-            .bind(31i32)
-            .bind("")
-            .execute(p)
-            .await
-            .map(|_| ()),
-        DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-            .bind(storage_id)
-            .bind(dir_name)
-            .bind(&dir_hash)
-            .bind(parent_id)
-            .bind(dir_name)
-            .bind(dir_mime_id)
-            .bind(dir_mimepart_id)
-            .bind(0i64)
-            .bind(now)
-            .bind(now)
-            .bind(&dir_etag)
-            .bind(31i32)
-            .bind("")
-            .execute(p)
-            .await
-            .map(|_| ()),
-    };
+    let result = db_execute!(
+        pool,
+        &sql,
+        storage_id,
+        dir_name,
+        &dir_hash,
+        parent_id,
+        dir_name,
+        dir_mime_id,
+        dir_mimepart_id,
+        0i64,
+        now,
+        now,
+        &dir_etag,
+        31i32,
+        ""
+    );
     if let Err(e) = result {
         tracing::warn!(dir = dir_name, error = %e, "lazy dir row materialization failed");
     }

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use nc_db::{appconfig::SharedAppConfigCache, pool::DbPool};
+use nc_db::{db_execute, db_scalar_one};
 
 /// Result of a brute-force throttle check.
 pub struct ThrottleResult {
@@ -109,20 +110,8 @@ pub async fn check_throttle(
             "SELECT COUNT(*) FROM {table} \
              WHERE action = $1 AND subnet = $2 AND occurred >= $3"
         );
-        let short_fetched: Result<i64, sqlx::Error> = match pool {
-            DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&count_sql)
-                .bind(action)
-                .bind(&subnet)
-                .bind(short_cutoff)
-                .fetch_one(p)
-                .await,
-            DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&count_sql)
-                .bind(action)
-                .bind(&subnet)
-                .bind(short_cutoff)
-                .fetch_one(p)
-                .await,
-        };
+        let short_fetched: Result<i64, sqlx::Error> =
+            db_scalar_one!(pool, &count_sql, action, &subnet, short_cutoff);
         let short_count: i64 = match short_fetched {
             Ok(c) => c,
             Err(e) => {
@@ -150,20 +139,8 @@ pub async fn check_throttle(
 
         // Count attempts in long window (12 h) for delay calculation.
         // REQ §4.6: over-threshold in 12 h → throttle (sleep), not 429.
-        let long_fetched: Result<i64, sqlx::Error> = match pool {
-            DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&count_sql)
-                .bind(action)
-                .bind(&subnet)
-                .bind(long_cutoff)
-                .fetch_one(p)
-                .await,
-            DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&count_sql)
-                .bind(action)
-                .bind(&subnet)
-                .bind(long_cutoff)
-                .fetch_one(p)
-                .await,
-        };
+        let long_fetched: Result<i64, sqlx::Error> =
+            db_scalar_one!(pool, &count_sql, action, &subnet, long_cutoff);
         let long_count: i64 = match long_fetched {
             Ok(c) => c,
             Err(e) => {
@@ -226,26 +203,7 @@ pub async fn record_attempt(action: &str, client_ip: &str, pool: &DbPool, prefix
         "INSERT INTO {table}(action, occurred, ip, subnet, metadata) \
          VALUES($1, $2, $3, $4, $5)"
     );
-    let result = match pool {
-        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
-            .bind(action)
-            .bind(now)
-            .bind(client_ip)
-            .bind(&subnet)
-            .bind("{}")
-            .execute(p)
-            .await
-            .map(|_| ()),
-        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-            .bind(action)
-            .bind(now)
-            .bind(client_ip)
-            .bind(&subnet)
-            .bind("{}")
-            .execute(p)
-            .await
-            .map(|_| ()),
-    };
+    let result = db_execute!(pool, &sql, action, now, client_ip, &subnet, "{}");
     if let Err(e) = result {
         tracing::warn!(
             action,

@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use nc_db::pool::DbPool;
+use nc_db::{db_dispatch, db_execute, db_scalar_opt};
 use sqlx::Row;
 
 /// Sentinel tag name that marks a file as favorited.
@@ -104,44 +105,24 @@ pub async fn get_tags_batch(
            AND vco.objid IN ({ph_str})"
     );
 
-    let fetched: Result<Vec<(i64, String)>, sqlx::Error> = match pool {
-        DbPool::Pg(p) => {
-            let mut query = sqlx::query::<sqlx::Postgres>(&sql)
-                .bind(uid)
-                .bind(OBJ_TYPE)
-                .bind(OBJ_TYPE);
-            for id in fileids {
-                query = query.bind(*id);
-            }
-            query.fetch_all(p).await.map(|rows| {
-                rows.iter()
-                    .map(|r| {
-                        let objid: i64 = r.get("objid");
-                        let category: String = r.get("category");
-                        (objid, category)
-                    })
-                    .collect()
-            })
+    let fetched: Result<Vec<(i64, String)>, sqlx::Error> = db_dispatch!(pool, |Db, c| {
+        let mut query = sqlx::query::<Db>(&sql)
+            .bind(uid)
+            .bind(OBJ_TYPE)
+            .bind(OBJ_TYPE);
+        for id in fileids {
+            query = query.bind(*id);
         }
-        DbPool::Sqlite(p) => {
-            let mut query = sqlx::query::<sqlx::Sqlite>(&sql)
-                .bind(uid)
-                .bind(OBJ_TYPE)
-                .bind(OBJ_TYPE);
-            for id in fileids {
-                query = query.bind(*id);
-            }
-            query.fetch_all(p).await.map(|rows| {
-                rows.iter()
-                    .map(|r| {
-                        let objid: i64 = r.get("objid");
-                        let category: String = r.get("category");
-                        (objid, category)
-                    })
-                    .collect()
-            })
-        }
-    };
+        query.fetch_all(c).await.map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    let objid: i64 = r.get("objid");
+                    let category: String = r.get("category");
+                    (objid, category)
+                })
+                .collect()
+        })
+    });
 
     let rows = match fetched {
         Ok(r) => r,
@@ -255,22 +236,7 @@ async fn get_or_create_category(
          VALUES ($1, $2, $3) \
          ON CONFLICT (uid, type, category) DO NOTHING",
     );
-    let result = match pool {
-        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&insert_sql)
-            .bind(uid)
-            .bind(OBJ_TYPE)
-            .bind(name)
-            .execute(p)
-            .await
-            .map(|_| ()),
-        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&insert_sql)
-            .bind(uid)
-            .bind(OBJ_TYPE)
-            .bind(name)
-            .execute(p)
-            .await
-            .map(|_| ()),
-    };
+    let result = db_execute!(pool, &insert_sql, uid, OBJ_TYPE, name);
     if let Err(e) = result {
         tracing::warn!(error = %e, uid = %uid, tag = %name, "Failed to insert vcategory row");
     }
@@ -278,20 +244,7 @@ async fn get_or_create_category(
     // Read back the ID (whether we inserted it or it already existed).
     let select_sql =
         format!("SELECT id FROM {prefix}vcategory WHERE uid = $1 AND type = $2 AND category = $3");
-    let fetched = match pool {
-        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&select_sql)
-            .bind(uid)
-            .bind(OBJ_TYPE)
-            .bind(name)
-            .fetch_optional(p)
-            .await,
-        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&select_sql)
-            .bind(uid)
-            .bind(OBJ_TYPE)
-            .bind(name)
-            .fetch_optional(p)
-            .await,
-    };
+    let fetched = db_scalar_opt!(pool, &select_sql, uid, OBJ_TYPE, name);
     match fetched {
         Ok(Some(id)) => Some(id),
         Ok(None) => {
@@ -325,22 +278,7 @@ pub async fn tag_as(
          VALUES ($1, $2, $3) \
          ON CONFLICT (categoryid, objid, type) DO NOTHING"
     );
-    let result = match pool {
-        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&insert_sql)
-            .bind(fileid)
-            .bind(category_id)
-            .bind(OBJ_TYPE)
-            .execute(p)
-            .await
-            .map(|_| ()),
-        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&insert_sql)
-            .bind(fileid)
-            .bind(category_id)
-            .bind(OBJ_TYPE)
-            .execute(p)
-            .await
-            .map(|_| ()),
-    };
+    let result = db_execute!(pool, &insert_sql, fileid, category_id, OBJ_TYPE);
     if let Err(e) = result {
         tracing::warn!(error = %e, fileid = fileid, tag = %tag, "Failed to insert vcategory_to_object row");
         return Err(());
@@ -373,26 +311,7 @@ pub async fn un_tag(
              WHERE uid = $3 AND type = $4 AND category = $5\
          )"
     );
-    let fetched = match pool {
-        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&delete_sql)
-            .bind(fileid)
-            .bind(OBJ_TYPE)
-            .bind(uid)
-            .bind(OBJ_TYPE)
-            .bind(name)
-            .execute(p)
-            .await
-            .map(|_| ()),
-        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&delete_sql)
-            .bind(fileid)
-            .bind(OBJ_TYPE)
-            .bind(uid)
-            .bind(OBJ_TYPE)
-            .bind(name)
-            .execute(p)
-            .await
-            .map(|_| ()),
-    };
+    let fetched = db_execute!(pool, &delete_sql, fileid, OBJ_TYPE, uid, OBJ_TYPE, name);
     match fetched {
         Ok(()) => Ok(()),
         Err(e) => {

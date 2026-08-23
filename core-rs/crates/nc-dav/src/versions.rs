@@ -18,6 +18,7 @@ use nc_db::pool::DbPool;
 use tracing::{debug, warn};
 
 use crate::row;
+use nc_db::{db_dispatch, db_execute, db_scalar_one};
 
 /// Save the pre-overwrite file content as a version.
 ///
@@ -269,22 +270,15 @@ async fn repath_version_subtree(
         "SELECT fileid, path FROM {prefix}filecache \
          WHERE storage = $1 AND (path = $2 OR path LIKE $3)"
     );
-    let rows: Vec<(i64, String)> = match pool {
-        DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (i64, String)>(&sql_fetch)
+    let rows: Vec<(i64, String)> = db_dispatch!(pool, |Db, c| {
+        sqlx::query_as::<Db, (i64, String)>(&sql_fetch)
             .bind(storage_id)
             .bind(old_fc)
             .bind(&like)
-            .fetch_all(p)
+            .fetch_all(c)
             .await
-            .unwrap_or_default(),
-        DbPool::Sqlite(p) => sqlx::query_as::<sqlx::Sqlite, (i64, String)>(&sql_fetch)
-            .bind(storage_id)
-            .bind(old_fc)
-            .bind(&like)
-            .fetch_all(p)
-            .await
-            .unwrap_or_default(),
-    };
+            .unwrap_or_default()
+    });
 
     // The moved node's new parent path (same parent dir for a rename within the
     // versions tree, but recompute so a nested rename lands under the right dir).
@@ -293,8 +287,9 @@ async fn repath_version_subtree(
         parts.pop();
         parts.join("/")
     };
-    let moved_parent_id =
-        row::lookup_by_path(pool, prefix, storage_id, &moved_parent_fc).await.map(|r| r.fileid);
+    let moved_parent_id = row::lookup_by_path(pool, prefix, storage_id, &moved_parent_fc)
+        .await
+        .map(|r| r.fileid);
 
     for (fileid, old_path) in rows {
         let new_path = if old_path == old_fc {
@@ -312,14 +307,17 @@ async fn repath_version_subtree(
                     let sql = format!(
                         "UPDATE {prefix}filecache SET path=$1, path_hash=$2, name=$3, parent=$4 WHERE fileid=$5"
                     );
-                    let r = match pool {
-                        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
-                            .bind(&new_path).bind(&new_hash).bind(&new_name).bind(pid).bind(fileid)
-                            .execute(p).await.map(|_| ()),
-                        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-                            .bind(&new_path).bind(&new_hash).bind(&new_name).bind(pid).bind(fileid)
-                            .execute(p).await.map(|_| ()),
-                    };
+                    let r = db_dispatch!(pool, |Db, c| {
+                        sqlx::query::<Db>(&sql)
+                            .bind(&new_path)
+                            .bind(&new_hash)
+                            .bind(&new_name)
+                            .bind(pid)
+                            .bind(fileid)
+                            .execute(c)
+                            .await
+                            .map(|_| ())
+                    });
                     if let Err(e) = r {
                         warn!(fileid, error = %e, "rename_versions: failed to repath cache row {old_path}");
                     }
@@ -329,14 +327,16 @@ async fn repath_version_subtree(
                     let sql = format!(
                         "UPDATE {prefix}filecache SET path=$1, path_hash=$2, name=$3 WHERE fileid=$4"
                     );
-                    let r = match pool {
-                        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
-                            .bind(&new_path).bind(&new_hash).bind(&new_name).bind(fileid)
-                            .execute(p).await.map(|_| ()),
-                        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-                            .bind(&new_path).bind(&new_hash).bind(&new_name).bind(fileid)
-                            .execute(p).await.map(|_| ()),
-                    };
+                    let r = db_dispatch!(pool, |Db, c| {
+                        sqlx::query::<Db>(&sql)
+                            .bind(&new_path)
+                            .bind(&new_hash)
+                            .bind(&new_name)
+                            .bind(fileid)
+                            .execute(c)
+                            .await
+                            .map(|_| ())
+                    });
                     if let Err(e) = r {
                         warn!(fileid, error = %e, "rename_versions: failed to repath cache row {old_path}");
                     }
@@ -344,17 +344,16 @@ async fn repath_version_subtree(
             }
         } else {
             // Descendants: path/path_hash only (parents move with the subtree).
-            let sql = format!(
-                "UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3"
-            );
-            let r = match pool {
-                DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
-                    .bind(&new_path).bind(&new_hash).bind(fileid)
-                    .execute(p).await.map(|_| ()),
-                DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-                    .bind(&new_path).bind(&new_hash).bind(fileid)
-                    .execute(p).await.map(|_| ()),
-            };
+            let sql = format!("UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3");
+            let r = db_dispatch!(pool, |Db, c| {
+                sqlx::query::<Db>(&sql)
+                    .bind(&new_path)
+                    .bind(&new_hash)
+                    .bind(fileid)
+                    .execute(c)
+                    .await
+                    .map(|_| ())
+            });
             if let Err(e) = r {
                 warn!(fileid, error = %e, "rename_versions: failed to repath cache row {old_path}");
             }
@@ -388,36 +387,42 @@ async fn repath_version_row(
                 "UPDATE {prefix}filecache SET path=$1, path_hash=$2, name=$3, parent=$4 \
                  WHERE storage=$5 AND path=$6"
             );
-            let result = match pool {
-                DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
-                    .bind(new_fc).bind(&new_hash).bind(&new_name).bind(parent.fileid)
-                    .bind(storage_id).bind(old_fc)
-                    .execute(p).await.map(|_| ()),
-                DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-                    .bind(new_fc).bind(&new_hash).bind(&new_name).bind(parent.fileid)
-                    .bind(storage_id).bind(old_fc)
-                    .execute(p).await.map(|_| ()),
-            };
+            let result = db_dispatch!(pool, |Db, c| {
+                sqlx::query::<Db>(&sql)
+                    .bind(new_fc)
+                    .bind(&new_hash)
+                    .bind(&new_name)
+                    .bind(parent.fileid)
+                    .bind(storage_id)
+                    .bind(old_fc)
+                    .execute(c)
+                    .await
+                    .map(|_| ())
+            });
             if let Err(e) = result {
                 warn!(old_fc, new_fc, error = %e, "rename_versions: failed to repath version row");
             }
         }
         None => {
-            warn!(new_fc, "rename_versions: new parent not found for version row; leaving parent unchanged");
+            warn!(
+                new_fc,
+                "rename_versions: new parent not found for version row; leaving parent unchanged"
+            );
             let sql = format!(
                 "UPDATE {prefix}filecache SET path=$1, path_hash=$2, name=$3 \
                  WHERE storage=$4 AND path=$5"
             );
-            let result = match pool {
-                DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
-                    .bind(new_fc).bind(&new_hash).bind(&new_name)
-                    .bind(storage_id).bind(old_fc)
-                    .execute(p).await.map(|_| ()),
-                DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-                    .bind(new_fc).bind(&new_hash).bind(&new_name)
-                    .bind(storage_id).bind(old_fc)
-                    .execute(p).await.map(|_| ()),
-            };
+            let result = db_dispatch!(pool, |Db, c| {
+                sqlx::query::<Db>(&sql)
+                    .bind(new_fc)
+                    .bind(&new_hash)
+                    .bind(&new_name)
+                    .bind(storage_id)
+                    .bind(old_fc)
+                    .execute(c)
+                    .await
+                    .map(|_| ())
+            });
             if let Err(e) = result {
                 warn!(old_fc, new_fc, error = %e, "rename_versions: failed to repath version row");
             }
@@ -580,40 +585,23 @@ async fn insert_version_clone(
           storage_mtime, etag, permissions, checksum) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING fileid"
     );
-    let fetched: Result<i64, sqlx::Error> = match pool {
-        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
-            .bind(storage_id)
-            .bind(new_fc)
-            .bind(&hash)
-            .bind(parent_id)
-            .bind(&name)
-            .bind(src.mimetype)
-            .bind(src.mimepart)
-            .bind(src.size)
-            .bind(src.mtime)
-            .bind(src.storage_mtime)
-            .bind(src.etag.as_deref().unwrap_or(""))
-            .bind(src.permissions)
-            .bind(src.checksum.as_deref().unwrap_or(""))
-            .fetch_one(p)
-            .await,
-        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
-            .bind(storage_id)
-            .bind(new_fc)
-            .bind(&hash)
-            .bind(parent_id)
-            .bind(&name)
-            .bind(src.mimetype)
-            .bind(src.mimepart)
-            .bind(src.size)
-            .bind(src.mtime)
-            .bind(src.storage_mtime)
-            .bind(src.etag.as_deref().unwrap_or(""))
-            .bind(src.permissions)
-            .bind(src.checksum.as_deref().unwrap_or(""))
-            .fetch_one(p)
-            .await,
-    };
+    let fetched: Result<i64, sqlx::Error> = db_scalar_one!(
+        pool,
+        &sql,
+        storage_id,
+        new_fc,
+        &hash,
+        parent_id,
+        &name,
+        src.mimetype,
+        src.mimepart,
+        src.size,
+        src.mtime,
+        src.storage_mtime,
+        src.etag.as_deref().unwrap_or(""),
+        src.permissions,
+        src.checksum.as_deref().unwrap_or("")
+    );
     let new_id = match fetched {
         Ok(id) => id,
         Err(e) => {
@@ -628,24 +616,14 @@ async fn insert_version_clone(
         "INSERT INTO {prefix}filecache_extended (fileid, metadata_etag, creation_time, upload_time) \
          VALUES ($1, $2, $3, $4) ON CONFLICT(fileid) DO NOTHING"
     );
-    let _ = match pool {
-        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql_ext)
-            .bind(new_id)
-            .bind(ext.metadata_etag.as_deref().unwrap_or(""))
-            .bind(ext.creation_time)
-            .bind(ext.upload_time)
-            .execute(p)
-            .await
-            .map(|_| ()),
-        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql_ext)
-            .bind(new_id)
-            .bind(ext.metadata_etag.as_deref().unwrap_or(""))
-            .bind(ext.creation_time)
-            .bind(ext.upload_time)
-            .execute(p)
-            .await
-            .map(|_| ()),
-    };
+    let _ = db_execute!(
+        pool,
+        &sql_ext,
+        new_id,
+        ext.metadata_etag.as_deref().unwrap_or(""),
+        ext.creation_time,
+        ext.upload_time
+    );
     new_id
 }
 
@@ -668,22 +646,15 @@ async fn clone_version_subtree(
          WHERE storage = $1 AND (path = $2 OR path LIKE $3) \
          ORDER BY length(path) ASC"
     );
-    let rows: Vec<(i64, String, i64)> = match pool {
-        DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (i64, String, i64)>(&sql_fetch)
+    let rows: Vec<(i64, String, i64)> = db_dispatch!(pool, |Db, c| {
+        sqlx::query_as::<Db, (i64, String, i64)>(&sql_fetch)
             .bind(storage_id)
             .bind(old_fc)
             .bind(&like)
-            .fetch_all(p)
+            .fetch_all(c)
             .await
-            .unwrap_or_default(),
-        DbPool::Sqlite(p) => sqlx::query_as::<sqlx::Sqlite, (i64, String, i64)>(&sql_fetch)
-            .bind(storage_id)
-            .bind(old_fc)
-            .bind(&like)
-            .fetch_all(p)
-            .await
-            .unwrap_or_default(),
-    };
+            .unwrap_or_default()
+    });
 
     let mut remap: HashMap<i64, i64> = HashMap::new();
     for (old_id, old_path, old_parent) in rows {
@@ -711,7 +682,8 @@ async fn clone_version_subtree(
         let Some(src) = row::lookup_by_path(pool, prefix, storage_id, &old_path).await else {
             continue;
         };
-        let new_id = insert_version_clone(pool, prefix, storage_id, &new_path, parent_id, &src).await;
+        let new_id =
+            insert_version_clone(pool, prefix, storage_id, &new_path, parent_id, &src).await;
         if new_id != 0 {
             remap.insert(old_id, new_id);
         }
@@ -803,8 +775,8 @@ async fn ensure_version_parents(
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
              RETURNING fileid"
         );
-        let _fid: i64 = match pool {
-            DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
+        let _fid: i64 = db_dispatch!(pool, |Db, c| {
+            sqlx::query_scalar::<Db, _>(&sql)
                 .bind(storage_id)
                 .bind(&built)
                 .bind(&hash)
@@ -818,27 +790,10 @@ async fn ensure_version_parents(
                 .bind(&etag)
                 .bind(31i32)
                 .bind("")
-                .fetch_one(p)
+                .fetch_one(c)
                 .await
-                .map_err(|e| format!("insert ancestor {built}: {e}"))?,
-            DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
-                .bind(storage_id)
-                .bind(&built)
-                .bind(&hash)
-                .bind(parent_fileid)
-                .bind(&name)
-                .bind(dir_mime_id)
-                .bind(dir_mimepart_id)
-                .bind(0i64)
-                .bind(now)
-                .bind(now)
-                .bind(&etag)
-                .bind(31i32)
-                .bind("")
-                .fetch_one(p)
-                .await
-                .map_err(|e| format!("insert ancestor {built}: {e}"))?,
-        };
+                .map_err(|e| format!("insert ancestor {built}: {e}"))?
+        });
 
         // No oc_filecache_extended row — PHP's `View::mkdir` → `Cache::insert`
         // never writes extension fields for directories (same class as finding
@@ -949,38 +904,22 @@ async fn insert_version_row(
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
          RETURNING fileid"
     );
-    let fetched: Result<i64, sqlx::Error> = match pool {
-        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
-            .bind(storage_id)
-            .bind(version_fc)
-            .bind(&hash)
-            .bind(parent_id)
-            .bind(&name)
-            .bind(mimetype)
-            .bind(mimepart_id)
-            .bind(size)
-            .bind(mtime)
-            .bind(storage_mtime)
-            .bind(etag)
-            .bind(permissions)
-            .fetch_one(p)
-            .await,
-        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
-            .bind(storage_id)
-            .bind(version_fc)
-            .bind(&hash)
-            .bind(parent_id)
-            .bind(&name)
-            .bind(mimetype)
-            .bind(mimepart_id)
-            .bind(size)
-            .bind(mtime)
-            .bind(storage_mtime)
-            .bind(etag)
-            .bind(permissions)
-            .fetch_one(p)
-            .await,
-    };
+    let fetched: Result<i64, sqlx::Error> = db_scalar_one!(
+        pool,
+        &sql,
+        storage_id,
+        version_fc,
+        &hash,
+        parent_id,
+        &name,
+        mimetype,
+        mimepart_id,
+        size,
+        mtime,
+        storage_mtime,
+        etag,
+        permissions
+    );
     let fid: i64 = match fetched {
         Ok(id) => id,
         Err(e) => {
@@ -996,22 +935,7 @@ async fn insert_version_row(
          VALUES ($1, '', $2, $3) \
          ON CONFLICT(fileid) DO NOTHING"
     );
-    let _ = match pool {
-        DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql_ext)
-            .bind(fid)
-            .bind(creation_time)
-            .bind(upload_time)
-            .execute(p)
-            .await
-            .map(|_| ()),
-        DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql_ext)
-            .bind(fid)
-            .bind(creation_time)
-            .bind(upload_time)
-            .execute(p)
-            .await
-            .map(|_| ()),
-    };
+    let _ = db_execute!(pool, &sql_ext, fid, creation_time, upload_time);
 }
 
 /// Insert a row into `oc_files_versions` so PHP-FPM's version PROPFIND can
@@ -1049,26 +973,15 @@ pub(crate) async fn insert_version_entity(
             "INSERT INTO {prefix}files_versions (file_id, \"timestamp\", size, mimetype, metadata) \
              VALUES ($1, $2, $3, $4, $5::json)"
         );
-        let result = match pool {
-            DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&insert_sql)
-                .bind(source_fileid)
-                .bind(ts)
-                .bind(size)
-                .bind(mimetype)
-                .bind(&metadata_json)
-                .execute(p)
-                .await
-                .map(|_| ()),
-            DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&insert_sql)
-                .bind(source_fileid)
-                .bind(ts)
-                .bind(size)
-                .bind(mimetype)
-                .bind(&metadata_json)
-                .execute(p)
-                .await
-                .map(|_| ()),
-        };
+        let result = db_execute!(
+            pool,
+            &insert_sql,
+            source_fileid,
+            ts,
+            size,
+            mimetype,
+            &metadata_json
+        );
         match result {
             Ok(()) => return,
             Err(e) => {
@@ -1331,12 +1244,13 @@ mod tests {
             "files_versions dir mtime {} should be bumped by the propagation",
             dir.mtime
         );
-        let dir_ext: i64 =
-            sqlx::query_scalar::<sqlx::Sqlite, _>("SELECT COUNT(*) FROM oc_filecache_extended WHERE fileid = $1")
-                .bind(dir.fileid)
-                .fetch_one(test_pool(&pool))
-                .await
-                .unwrap();
+        let dir_ext: i64 = sqlx::query_scalar::<sqlx::Sqlite, _>(
+            "SELECT COUNT(*) FROM oc_filecache_extended WHERE fileid = $1",
+        )
+        .bind(dir.fileid)
+        .fetch_one(test_pool(&pool))
+        .await
+        .unwrap();
         assert_eq!(dir_ext, 0, "version dirs must have no extended rows");
     }
 
@@ -1386,7 +1300,12 @@ mod tests {
             (6i64, "files_versions", 1i64, "files_versions"),
             (7, "files_versions/Photos", 6, "Photos"),
             (8, "files_versions/Photos/2024", 7, "2024"),
-            (9, "files_versions/Photos/2024/photo.jpg.v100", 8, "photo.jpg.v100"),
+            (
+                9,
+                "files_versions/Photos/2024/photo.jpg.v100",
+                8,
+                "photo.jpg.v100",
+            ),
         ] {
             sqlx::query::<sqlx::Sqlite>(&format!(
                 "INSERT INTO {prefix}filecache \
@@ -1455,7 +1374,6 @@ mod tests {
         assert_eq!(v.name.as_deref(), Some("photo.jpg.v100"));
     }
 
-
     #[tokio::test]
     async fn copy_versions_clones_version_row() {
         let (pool, prefix, storage_id) = fresh_db().await;
@@ -1512,8 +1430,13 @@ mod tests {
         assert_eq!(copy.parent, 6, "copied row's parent is files_versions root");
         assert_eq!(copy.size, 26);
         assert_eq!(copy.mtime, 100);
-        assert_eq!(copy.etag.as_deref(), Some("src-etag"), "clone must keep the source etag");
-        assert!(data_dir.join("admin/files_versions/hello2.txt.v100").exists());
+        assert_eq!(
+            copy.etag.as_deref(),
+            Some("src-etag"),
+            "clone must keep the source etag"
+        );
+        assert!(data_dir
+            .join("admin/files_versions/hello2.txt.v100")
+            .exists());
     }
-
 }

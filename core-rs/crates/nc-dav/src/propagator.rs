@@ -14,6 +14,7 @@ use sqlx::{Postgres, Row as _, Sqlite};
 use tracing::warn;
 
 use crate::row;
+use nc_db::db_dispatch;
 
 /// Drives cache propagation for a single storage.
 ///
@@ -332,20 +333,14 @@ impl Propagator {
              WHERE parent = $1 AND storage = $2 AND size > -1",
             prefix = self.prefix
         );
-        let new_size: i64 = match &self.pool {
-            DbPool::Pg(p) => sqlx::query_scalar::<Postgres, _>(&sql)
+        let new_size: i64 = db_dispatch!(&self.pool, |Db, c| {
+            sqlx::query_scalar::<Db, _>(&sql)
                 .bind(folder.fileid)
                 .bind(self.storage_id)
-                .fetch_one(p)
+                .fetch_one(c)
                 .await
-                .map_err(|e| format!("correct_folder_size SUM query failed: {e}"))?,
-            DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, _>(&sql)
-                .bind(folder.fileid)
-                .bind(self.storage_id)
-                .fetch_one(p)
-                .await
-                .map_err(|e| format!("correct_folder_size SUM query failed: {e}"))?,
-        };
+                .map_err(|e| format!("correct_folder_size SUM query failed: {e}"))?
+        });
 
         if new_size == old_size {
             return Ok(());
@@ -356,22 +351,15 @@ impl Propagator {
             "UPDATE {prefix}filecache SET size = $1 WHERE fileid = $2",
             prefix = self.prefix
         );
-        match &self.pool {
-            DbPool::Pg(p) => sqlx::query::<Postgres>(&update_sql)
+        db_dispatch!(&self.pool, |Db, c| {
+            sqlx::query::<Db>(&update_sql)
                 .bind(new_size)
                 .bind(folder.fileid)
-                .execute(p)
+                .execute(c)
                 .await
                 .map(|_| ())
-                .map_err(|e| format!("correct_folder_size UPDATE failed: {e}"))?,
-            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&update_sql)
-                .bind(new_size)
-                .bind(folder.fileid)
-                .execute(p)
-                .await
-                .map(|_| ())
-                .map_err(|e| format!("correct_folder_size UPDATE failed: {e}"))?,
-        };
+                .map_err(|e| format!("correct_folder_size UPDATE failed: {e}"))?
+        });
 
         // Propagate the size delta up to ancestors.
         let size_delta = new_size - old_size;
@@ -424,24 +412,16 @@ impl Propagator {
              WHERE storage = $2 AND path_hash = $3",
             prefix = self.prefix
         );
-        match &self.pool {
-            DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+        db_dispatch!(&self.pool, |Db, c| {
+            sqlx::query::<Db>(&sql)
                 .bind(disk_mtime)
                 .bind(self.storage_id)
                 .bind(&hash)
-                .execute(p)
+                .execute(c)
                 .await
                 .map(|_| ())
-                .map_err(|e| format!("correct_parent_storage_mtime UPDATE failed: {e}"))?,
-            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-                .bind(disk_mtime)
-                .bind(self.storage_id)
-                .bind(&hash)
-                .execute(p)
-                .await
-                .map(|_| ())
-                .map_err(|e| format!("correct_parent_storage_mtime UPDATE failed: {e}"))?,
-        };
+                .map_err(|e| format!("correct_parent_storage_mtime UPDATE failed: {e}"))?
+        });
 
         Ok(())
     }
@@ -489,30 +469,17 @@ impl Propagator {
              WHERE parent = $1 AND storage = $2",
             prefix = self.prefix
         );
-        let (total, minsize): (i64, i64) = match &self.pool {
-            DbPool::Pg(p) => {
-                let r = sqlx::query::<Postgres>(&sql)
-                    .bind(folder.fileid)
-                    .bind(self.storage_id)
-                    .fetch_one(p)
-                    .await
-                    .map_err(|e| format!("recompute_folder_size SUM/MIN query failed: {e}"))?;
-                let total: i64 = r.get("total");
-                let minsize: i64 = r.get("minsize");
-                (total, minsize)
-            }
-            DbPool::Sqlite(p) => {
-                let r = sqlx::query::<Sqlite>(&sql)
-                    .bind(folder.fileid)
-                    .bind(self.storage_id)
-                    .fetch_one(p)
-                    .await
-                    .map_err(|e| format!("recompute_folder_size SUM/MIN query failed: {e}"))?;
-                let total: i64 = r.get("total");
-                let minsize: i64 = r.get("minsize");
-                (total, minsize)
-            }
-        };
+        let (total, minsize): (i64, i64) = db_dispatch!(&self.pool, |Db, c| {
+            let r = sqlx::query::<Db>(&sql)
+                .bind(folder.fileid)
+                .bind(self.storage_id)
+                .fetch_one(c)
+                .await
+                .map_err(|e| format!("recompute_folder_size SUM/MIN query failed: {e}"))?;
+            let total: i64 = r.get("total");
+            let minsize: i64 = r.get("minsize");
+            (total, minsize)
+        });
 
         // Any unscanned child (size = -1) marks the folder unscanned too.
         let new_size = if minsize == -1 { -1 } else { total };
@@ -525,22 +492,15 @@ impl Propagator {
             "UPDATE {prefix}filecache SET size = $1 WHERE fileid = $2",
             prefix = self.prefix
         );
-        match &self.pool {
-            DbPool::Pg(p) => sqlx::query::<Postgres>(&update_sql)
+        db_dispatch!(&self.pool, |Db, c| {
+            sqlx::query::<Db>(&update_sql)
                 .bind(new_size)
                 .bind(folder.fileid)
-                .execute(p)
+                .execute(c)
                 .await
                 .map(|_| ())
-                .map_err(|e| format!("recompute_folder_size UPDATE failed: {e}"))?,
-            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&update_sql)
-                .bind(new_size)
-                .bind(folder.fileid)
-                .execute(p)
-                .await
-                .map(|_| ())
-                .map_err(|e| format!("recompute_folder_size UPDATE failed: {e}"))?,
-        };
+                .map_err(|e| format!("recompute_folder_size UPDATE failed: {e}"))?
+        });
 
         Ok(())
     }

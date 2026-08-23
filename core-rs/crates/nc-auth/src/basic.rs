@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 
+use nc_db::db_dispatch;
 use nc_db::pool::DbPool;
 
 // ── Extraction ────────────────────────────────────────────────────────────────
@@ -66,16 +67,12 @@ pub async fn verify_basic(
 
     let sql = format!("SELECT uid, password FROM {table} WHERE uid_lower = $1");
     let login_lower = login.to_lowercase();
-    let fetched: Result<Option<(String, String)>, sqlx::Error> = match pool {
-        DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (String, String)>(&sql)
+    let fetched: Result<Option<(String, String)>, sqlx::Error> = db_dispatch!(pool, |Db, c| {
+        sqlx::query_as::<Db, (String, String)>(&sql)
             .bind(&login_lower)
-            .fetch_optional(p)
-            .await,
-        DbPool::Sqlite(p) => sqlx::query_as::<sqlx::Sqlite, (String, String)>(&sql)
-            .bind(&login_lower)
-            .fetch_optional(p)
-            .await,
-    };
+            .fetch_optional(c)
+            .await
+    });
     let row: Option<(String, String)> = match fetched {
         Ok(row) => row,
         Err(e) => {
@@ -142,12 +139,12 @@ async fn try_app_token(
          WHERE token = $1"
     );
     let fetched: Result<Option<(i64, String, i16, Option<i64>, String)>, sqlx::Error> = match pool {
-        DbPool::Pg(p) => sqlx::query_as::<sqlx::Postgres, (i64, String, i16, Option<i64>, String)>(
-            &sql,
-        )
-        .bind(&hash_hex)
-        .fetch_optional(p)
-        .await,
+        DbPool::Pg(p) => {
+            sqlx::query_as::<sqlx::Postgres, (i64, String, i16, Option<i64>, String)>(&sql)
+                .bind(&hash_hex)
+                .fetch_optional(p)
+                .await
+        }
         DbPool::Sqlite(p) => {
             sqlx::query_as::<sqlx::Sqlite, (i64, String, i16, Option<i64>, String)>(&sql)
                 .bind(&hash_hex)

@@ -1,3 +1,4 @@
+use nc_db::db_dispatch;
 use nc_db::pool::DbPool;
 
 /// 2FA enforcement gate (REQ §4.5).
@@ -39,16 +40,12 @@ pub async fn requires_2fa(
 
     let table = format!("{prefix}twofactor_providers");
     let sql = format!("SELECT COUNT(*) FROM {table} WHERE uid = $1 AND enabled = 1");
-    let count: i64 = match pool {
-        DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
+    let count: i64 = db_dispatch!(pool, |Db, c| {
+        sqlx::query_scalar::<Db, _>(&sql)
             .bind(uid)
-            .fetch_one(p)
-            .await?,
-        DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
-            .bind(uid)
-            .fetch_one(p)
-            .await?,
-    };
+            .fetch_one(c)
+            .await?
+    });
 
     Ok(count > 0)
 }

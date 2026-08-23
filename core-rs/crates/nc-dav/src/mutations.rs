@@ -7,15 +7,14 @@
 //! propagation).
 
 use dav_server::fs::FsError;
-use sqlx::{Postgres, Row, Sqlite};
+use sqlx::Row;
 use tracing::warn;
-
-use nc_db::pool::DbPool;
 
 use crate::filesystem::{blocking, io_to_fs};
 use crate::path_utils::{extension, is_trash_extension};
 use crate::row;
 use crate::NcFileSystem;
+use nc_db::{db_dispatch, db_execute};
 
 impl NcFileSystem {
     /// exists on disk but not in the filecache) fails with NotFound.
@@ -134,44 +133,24 @@ impl NcFileSystem {
                  RETURNING fileid",
                 prefix = self.state.table_prefix
             );
-            let fetched: Result<i64, sqlx::Error> = match &self.state.pool {
-                DbPool::Pg(p) => {
-                    sqlx::query_scalar::<Postgres, _>(&sql)
-                        .bind(self.storage_id)
-                        .bind(&built)
-                        .bind(&hash)
-                        .bind(parent_row.fileid)
-                        .bind(&name)
-                        .bind(dir_mime_id)
-                        .bind(dir_mimepart_id)
-                        .bind(0i64)
-                        .bind(now)
-                        .bind(now)
-                        .bind(&etag)
-                        .bind(31i32)
-                        .bind("")
-                        .fetch_one(p)
-                        .await
-                }
-                DbPool::Sqlite(p) => {
-                    sqlx::query_scalar::<Sqlite, _>(&sql)
-                        .bind(self.storage_id)
-                        .bind(&built)
-                        .bind(&hash)
-                        .bind(parent_row.fileid)
-                        .bind(&name)
-                        .bind(dir_mime_id)
-                        .bind(dir_mimepart_id)
-                        .bind(0i64)
-                        .bind(now)
-                        .bind(now)
-                        .bind(&etag)
-                        .bind(31i32)
-                        .bind("")
-                        .fetch_one(p)
-                        .await
-                }
-            };
+            let fetched: Result<i64, sqlx::Error> = db_dispatch!(&self.state.pool, |Db, c| {
+                sqlx::query_scalar::<Db, _>(&sql)
+                    .bind(self.storage_id)
+                    .bind(&built)
+                    .bind(&hash)
+                    .bind(parent_row.fileid)
+                    .bind(&name)
+                    .bind(dir_mime_id)
+                    .bind(dir_mimepart_id)
+                    .bind(0i64)
+                    .bind(now)
+                    .bind(now)
+                    .bind(&etag)
+                    .bind(31i32)
+                    .bind("")
+                    .fetch_one(c)
+                    .await
+            });
             let fid: i64 = match fetched {
                 Ok(id) => id,
                 Err(e) => {
@@ -318,8 +297,8 @@ impl NcFileSystem {
              RETURNING fileid",
             prefix = self.state.table_prefix
         );
-        let _fid: i64 = match &self.state.pool {
-            DbPool::Pg(p) => sqlx::query_scalar::<Postgres, _>(&sql)
+        let _fid: i64 = db_dispatch!(&self.state.pool, |Db, c| {
+            sqlx::query_scalar::<Db, _>(&sql)
                 .bind(self.storage_id)
                 .bind(&fc_path)
                 .bind(&hash)
@@ -333,33 +312,13 @@ impl NcFileSystem {
                 .bind(&etag)
                 .bind(31i32)
                 .bind("")
-                .fetch_one(p)
+                .fetch_one(c)
                 .await
                 .map_err(|e| {
                     warn!("create_dir DB insert failed: {e}");
                     FsError::GeneralFailure
-                })?,
-            DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, _>(&sql)
-                .bind(self.storage_id)
-                .bind(&fc_path)
-                .bind(&hash)
-                .bind(parent_row.fileid)
-                .bind(&name)
-                .bind(dir_mime_id)
-                .bind(dir_mimepart_id)
-                .bind(0i64)
-                .bind(now)
-                .bind(now)
-                .bind(&etag)
-                .bind(31i32)
-                .bind("")
-                .fetch_one(p)
-                .await
-                .map_err(|e| {
-                    warn!("create_dir DB insert failed: {e}");
-                    FsError::GeneralFailure
-                })?,
-        };
+                })?
+        });
 
         // §9.2: MKCOL propagates etag/mtime to the parent chain.
         // New directories have size 0, so sizeDifference=0.
@@ -432,28 +391,18 @@ impl NcFileSystem {
              SET path=$1, path_hash=$2, name=$3, parent=$4 \
              WHERE fileid=$5"
         );
-        match &self.state.pool {
-            DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_node)
+        db_dispatch!(&self.state.pool, |Db, c| {
+            sqlx::query::<Db>(&sql_node)
                 .bind(&to_fc)
                 .bind(&new_hash)
                 .bind(&new_name)
                 .bind(to_parent.fileid)
                 .bind(from_row.fileid)
-                .execute(p)
+                .execute(c)
                 .await
                 .map(|_| ())
-                .map_err(|_| FsError::GeneralFailure)?,
-            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_node)
-                .bind(&to_fc)
-                .bind(&new_hash)
-                .bind(&new_name)
-                .bind(to_parent.fileid)
-                .bind(from_row.fileid)
-                .execute(p)
-                .await
-                .map(|_| ())
-                .map_err(|_| FsError::GeneralFailure)?,
-        }
+                .map_err(|_| FsError::GeneralFailure)?
+        });
 
         // §10.10: recompute mimetype + mimepart on extension change.
         // Matches PHP Updater::copyOrRenameFromStorage() — when the
@@ -490,22 +439,13 @@ impl NcFileSystem {
             .await;
             let sql_mime =
                 format!("UPDATE {prefix}filecache SET mimetype=$1, mimepart=$2 WHERE fileid=$3");
-            let result = match &self.state.pool {
-                DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_mime)
-                    .bind(new_mid)
-                    .bind(new_pid)
-                    .bind(from_row.fileid)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-                DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_mime)
-                    .bind(new_mid)
-                    .bind(new_pid)
-                    .bind(from_row.fileid)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-            };
+            let result = db_execute!(
+                &self.state.pool,
+                &sql_mime,
+                new_mid,
+                new_pid,
+                from_row.fileid
+            );
             if let Err(e) = result {
                 tracing::warn!(fileid = from_row.fileid, error = %e, "Failed to update mimetype on rename");
             }
@@ -647,20 +587,12 @@ impl NcFileSystem {
              WHERE storage = $1 AND path_hash = $2",
             prefix = self.state.table_prefix
         );
-        let result = match &self.state.pool {
-            DbPool::Pg(p) => sqlx::query::<Postgres>(&copy_del_sql)
-                .bind(self.storage_id)
-                .bind(row::path_hash(&to_fc))
-                .execute(p)
-                .await
-                .map(|_| ()),
-            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&copy_del_sql)
-                .bind(self.storage_id)
-                .bind(row::path_hash(&to_fc))
-                .execute(p)
-                .await
-                .map(|_| ()),
-        };
+        let result = db_execute!(
+            &self.state.pool,
+            &copy_del_sql,
+            self.storage_id,
+            row::path_hash(&to_fc)
+        );
         if let Err(e) = result {
             tracing::warn!(to_fc = to_fc, error = %e, "Failed to delete old filecache row on copy");
         }
@@ -768,9 +700,9 @@ impl NcFileSystem {
                      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
                      RETURNING fileid"
                 );
-                let copy_fetched: Result<i64, sqlx::Error> = match &self.state.pool {
-                    DbPool::Pg(p) => {
-                        sqlx::query_scalar::<Postgres, _>(&sql)
+                let copy_fetched: Result<i64, sqlx::Error> =
+                    db_dispatch!(&self.state.pool, |Db, c| {
+                        sqlx::query_scalar::<Db, _>(&sql)
                             .bind(self.storage_id)
                             .bind(&to_fc)
                             .bind(&hash)
@@ -783,27 +715,9 @@ impl NcFileSystem {
                             .bind(now)
                             .bind(&etag)
                             .bind(from_row.permissions)
-                            .fetch_one(p)
+                            .fetch_one(c)
                             .await
-                    }
-                    DbPool::Sqlite(p) => {
-                        sqlx::query_scalar::<Sqlite, _>(&sql)
-                            .bind(self.storage_id)
-                            .bind(&to_fc)
-                            .bind(&hash)
-                            .bind(parent_row.fileid)
-                            .bind(&name)
-                            .bind(copy_mid)
-                            .bind(copy_pid)
-                            .bind(from_row.size)
-                            .bind(from_row.mtime)
-                            .bind(now)
-                            .bind(&etag)
-                            .bind(from_row.permissions)
-                            .fetch_one(p)
-                            .await
-                    }
-                };
+                    });
                 let copy_fid: Option<i64> = match copy_fetched {
                     Ok(fid) => Some(fid),
                     Err(e) => {
@@ -823,22 +737,8 @@ impl NcFileSystem {
                          ON CONFLICT(fileid) DO NOTHING",
                         prefix = self.state.table_prefix
                     );
-                    let result = match &self.state.pool {
-                        DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_ext)
-                            .bind(fid)
-                            .bind(src_creation)
-                            .bind(src_upload)
-                            .execute(p)
-                            .await
-                            .map(|_| ()),
-                        DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_ext)
-                            .bind(fid)
-                            .bind(src_creation)
-                            .bind(src_upload)
-                            .execute(p)
-                            .await
-                            .map(|_| ()),
-                    };
+                    let result =
+                        db_execute!(&self.state.pool, &sql_ext, fid, src_creation, src_upload);
                     if let Err(e) = result {
                         tracing::warn!(fileid = fid, error = %e, "Failed to insert copy extended row");
                     }
@@ -921,26 +821,17 @@ impl NcFileSystem {
             "UPDATE {prefix}filecache SET mtime=$1, storage_mtime=$2 WHERE storage=$3 AND path_hash=$4",
             prefix = self.state.table_prefix
         );
-        match &self.state.pool {
-            DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+        db_dispatch!(&self.state.pool, |Db, c| {
+            sqlx::query::<Db>(&sql)
                 .bind(mtime)
                 .bind(mtime)
                 .bind(self.storage_id)
                 .bind(row::path_hash(&fc_path))
-                .execute(p)
+                .execute(c)
                 .await
                 .map(|_| ())
-                .map_err(|_| FsError::GeneralFailure)?,
-            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-                .bind(mtime)
-                .bind(mtime)
-                .bind(self.storage_id)
-                .bind(row::path_hash(&fc_path))
-                .execute(p)
-                .await
-                .map(|_| ())
-                .map_err(|_| FsError::GeneralFailure)?,
-        }
+                .map_err(|_| FsError::GeneralFailure)?
+        });
 
         // §9.2: mtime-changing PROPPATCH propagates etag/mtime to
         // ancestors (sizeDifference=0).
@@ -966,48 +857,24 @@ impl NcFileSystem {
         let sql_fetch = format!(
             "SELECT fileid, path FROM {prefix}filecache WHERE storage = $1 AND path LIKE $2"
         );
-        let rows: Vec<(i64, String)> = match &self.state.pool {
-            DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_fetch)
+        let rows: Vec<(i64, String)> = db_dispatch!(&self.state.pool, |Db, c| {
+            sqlx::query::<Db>(&sql_fetch)
                 .bind(self.storage_id)
                 .bind(&like)
-                .fetch_all(p)
+                .fetch_all(c)
                 .await
                 .unwrap_or_default()
                 .into_iter()
                 .map(|r| (r.get::<i64, _>("fileid"), r.get::<String, _>("path")))
-                .collect(),
-            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_fetch)
-                .bind(self.storage_id)
-                .bind(&like)
-                .fetch_all(p)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| (r.get::<i64, _>("fileid"), r.get::<String, _>("path")))
-                .collect(),
-        };
+                .collect()
+        });
 
         for (fileid, old_path) in rows {
             let new_path = format!("{new_prefix}{}", &old_path[old_prefix.len()..]);
             let new_hash = row::path_hash(&new_path);
             let sql_upd =
                 format!("UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3");
-            let _ = match &self.state.pool {
-                DbPool::Pg(p) => sqlx::query::<Postgres>(&sql_upd)
-                    .bind(&new_path)
-                    .bind(&new_hash)
-                    .bind(fileid)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-                DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql_upd)
-                    .bind(&new_path)
-                    .bind(&new_hash)
-                    .bind(fileid)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-            };
+            let _ = db_execute!(&self.state.pool, &sql_upd, &new_path, &new_hash, fileid);
         }
     }
 }

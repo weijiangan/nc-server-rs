@@ -23,6 +23,7 @@
 
 use crate::snowflake::SnowflakeGenerator;
 use crate::store::{self, PreviewRow};
+use nc_db::db_dispatch;
 use nc_db::mime::SharedMimeCache;
 use nc_db::pool::DbPool;
 use std::path::Path;
@@ -248,12 +249,8 @@ pub async fn invalidate_previews(
 
     // Delete the rows first (no new hits can start serving them).
     let sql = format!("DELETE FROM {prefix}previews WHERE file_id = $1");
-    let deleted_rows = match pool {
-        DbPool::Pg(p) => match sqlx::query::<sqlx::Postgres>(&sql)
-            .bind(file_id)
-            .execute(p)
-            .await
-        {
+    let deleted_rows = db_dispatch!(pool, |Db, c| {
+        match sqlx::query::<Db>(&sql).bind(file_id).execute(c).await {
             Ok(res) => res.rows_affected(),
             Err(e) => {
                 // Leave the bytes in place — the rows still reference them, so the
@@ -261,21 +258,8 @@ pub async fn invalidate_previews(
                 tracing::error!(error = %e, file_id, "invalidate: failed to delete preview rows");
                 return 0;
             }
-        },
-        DbPool::Sqlite(p) => match sqlx::query::<sqlx::Sqlite>(&sql)
-            .bind(file_id)
-            .execute(p)
-            .await
-        {
-            Ok(res) => res.rows_affected(),
-            Err(e) => {
-                // Leave the bytes in place — the rows still reference them, so the
-                // previews keep serving.  Surface loudly (CLAUDE.md hygiene rule 1).
-                tracing::error!(error = %e, file_id, "invalidate: failed to delete preview rows");
-                return 0;
-            }
-        },
-    };
+        }
+    });
     let deleted = deleted_rows as usize;
     tracing::debug!(file_id, deleted, "invalidated preview rows on overwrite");
 

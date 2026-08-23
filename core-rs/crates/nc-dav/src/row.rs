@@ -4,6 +4,7 @@
 //! All queries are parameterised and use the table prefix from `NcDavState`.
 
 use md5::{Digest, Md5};
+use nc_db::db_dispatch;
 use nc_db::pool::DbPool;
 use sqlx::{Postgres, Row, Sqlite};
 
@@ -99,18 +100,13 @@ pub async fn lookup_storage_id(
     let sql = format!("SELECT numeric_id FROM {prefix}storages WHERE id = $1");
     for key in &candidates {
         let adjusted = adjust_storage_id(key);
-        let fetched: Result<Option<i64>, sqlx::Error> = match pool {
-            DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+        let fetched: Result<Option<i64>, sqlx::Error> = db_dispatch!(pool, |Db, c| {
+            sqlx::query::<Db>(&sql)
                 .bind(&adjusted)
-                .fetch_optional(p)
+                .fetch_optional(c)
                 .await
-                .map(|r| r.map(|row| row.get::<i64, _>("numeric_id"))),
-            DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-                .bind(&adjusted)
-                .fetch_optional(p)
-                .await
-                .map(|r| r.map(|row| row.get::<i64, _>("numeric_id"))),
-        };
+                .map(|r| r.map(|row| row.get::<i64, _>("numeric_id")))
+        });
         match fetched {
             Ok(Some(id)) => return Some(id),
             Ok(None) => { /* not this key, try next */ }
@@ -172,24 +168,16 @@ pub async fn lookup_by_path(
                     "SELECT fileid, storage, path FROM {prefix}filecache WHERE path_hash = $1",
                     prefix = prefix
                 );
-                let debug_rows: Vec<(i64, i64, Option<String>)> = match pool {
-                    DbPool::Pg(p) => sqlx::query::<Postgres>(&debug_sql)
+                let debug_rows: Vec<(i64, i64, Option<String>)> = db_dispatch!(pool, |Db, c| {
+                    sqlx::query::<Db>(&debug_sql)
                         .bind(&hash)
-                        .fetch_all(p)
+                        .fetch_all(c)
                         .await
                         .unwrap_or_default()
                         .into_iter()
                         .map(|r| (r.get(0), r.get(1), r.get(2)))
-                        .collect(),
-                    DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&debug_sql)
-                        .bind(&hash)
-                        .fetch_all(p)
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|r| (r.get(0), r.get(1), r.get(2)))
-                        .collect(),
-                };
+                        .collect()
+                });
                 tracing::trace!(
                     path = %path, hash = %hash, storage, ?debug_rows,
                     "lookup_by_path: not found (any storage)"
@@ -427,20 +415,14 @@ pub async fn quota_free_space(
         "SELECT configvalue FROM {prefix}preferences \
          WHERE userid = $1 AND appid = 'files' AND configkey = 'quota'"
     );
-    let quota = match pool {
-        DbPool::Pg(p) => sqlx::query_scalar::<Postgres, String>(&sql)
+    let quota = db_dispatch!(pool, |Db, c| {
+        sqlx::query_scalar::<Db, String>(&sql)
             .bind(uid)
-            .fetch_optional(p)
+            .fetch_optional(c)
             .await
             .ok()
-            .flatten(),
-        DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, String>(&sql)
-            .bind(uid)
-            .fetch_optional(p)
-            .await
-            .ok()
-            .flatten(),
-    };
+            .flatten()
+    });
     let quota = match quota.as_deref() {
         None | Some("none") | Some("default") => return None,
         Some(v) => parse_quota_bytes(v)?,
@@ -484,10 +466,10 @@ pub async fn get_extended(pool: &DbPool, prefix: &str, fileid: i64) -> FileCache
         "SELECT metadata_etag, creation_time, upload_time \
          FROM {prefix}filecache_extended WHERE fileid = $1"
     );
-    match pool {
-        DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+    db_dispatch!(pool, |Db, c| {
+        sqlx::query::<Db>(&sql)
             .bind(fileid)
-            .fetch_optional(p)
+            .fetch_optional(c)
             .await
             .ok()
             .flatten()
@@ -496,20 +478,8 @@ pub async fn get_extended(pool: &DbPool, prefix: &str, fileid: i64) -> FileCache
                 creation_time: r.get::<i64, _>("creation_time"),
                 upload_time: r.get::<i64, _>("upload_time"),
             })
-            .unwrap_or_default(),
-        DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-            .bind(fileid)
-            .fetch_optional(p)
-            .await
-            .ok()
-            .flatten()
-            .map(|r| FileCacheExtRow {
-                metadata_etag: r.get("metadata_etag"),
-                creation_time: r.get::<i64, _>("creation_time"),
-                upload_time: r.get::<i64, _>("upload_time"),
-            })
-            .unwrap_or_default(),
-    }
+            .unwrap_or_default()
+    })
 }
 
 /// Fetch extended metadata for a **batch** of files in a single query.
@@ -605,13 +575,13 @@ pub async fn count_children(
          SUM(CASE WHEN mimetype != $2 THEN 1 ELSE 0 END) AS files \
          FROM {prefix}filecache WHERE parent = $3 AND storage = $4"
     );
-    match pool {
-        DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+    db_dispatch!(pool, |Db, c| {
+        sqlx::query::<Db>(&sql)
             .bind(dir_mimetype_id)
             .bind(dir_mimetype_id)
             .bind(parent_id)
             .bind(storage)
-            .fetch_optional(p)
+            .fetch_optional(c)
             .await
             .ok()
             .flatten()
@@ -620,23 +590,8 @@ pub async fn count_children(
                 let files: i64 = r.get::<Option<i64>, _>("files").unwrap_or(0);
                 (dirs, files)
             })
-            .unwrap_or((0, 0)),
-        DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-            .bind(dir_mimetype_id)
-            .bind(dir_mimetype_id)
-            .bind(parent_id)
-            .bind(storage)
-            .fetch_optional(p)
-            .await
-            .ok()
-            .flatten()
-            .map(|r| {
-                let dirs: i64 = r.get::<Option<i64>, _>("dirs").unwrap_or(0);
-                let files: i64 = r.get::<Option<i64>, _>("files").unwrap_or(0);
-                (dirs, files)
-            })
-            .unwrap_or((0, 0)),
-    }
+            .unwrap_or((0, 0))
+    })
 }
 
 /// Count direct children of a **batch** of directories in a single query,
@@ -731,22 +686,15 @@ pub async fn count_children_batch(
 /// not exist.
 pub async fn get_storage_string_id(pool: &DbPool, prefix: &str, numeric_id: i64) -> Option<String> {
     let sql = format!("SELECT id FROM {prefix}storages WHERE numeric_id = $1");
-    match pool {
-        DbPool::Pg(p) => sqlx::query_scalar::<Postgres, Option<String>>(&sql)
+    db_dispatch!(pool, |Db, c| {
+        sqlx::query_scalar::<Db, Option<String>>(&sql)
             .bind(numeric_id)
-            .fetch_optional(p)
+            .fetch_optional(c)
             .await
             .ok()
             .flatten()
-            .flatten(),
-        DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, Option<String>>(&sql)
-            .bind(numeric_id)
-            .fetch_optional(p)
-            .await
-            .ok()
             .flatten()
-            .flatten(),
-    }
+    })
 }
 
 /// Shared `oc_storages` `numeric_id → string_id` cache (phase-21 S3).
@@ -834,20 +782,14 @@ pub async fn get_metadata_json(
 ) -> Option<serde_json::Value> {
     let table = format!("{prefix}files_metadata");
     let sql = format!("SELECT json FROM {table} WHERE file_id = $1");
-    let fetched: Option<String> = match pool {
-        DbPool::Pg(p) => sqlx::query_scalar::<Postgres, String>(&sql)
+    let fetched: Option<String> = db_dispatch!(pool, |Db, c| {
+        sqlx::query_scalar::<Db, String>(&sql)
             .bind(fileid)
-            .fetch_optional(p)
+            .fetch_optional(c)
             .await
             .ok()
-            .flatten(),
-        DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, String>(&sql)
-            .bind(fileid)
-            .fetch_optional(p)
-            .await
-            .ok()
-            .flatten(),
-    };
+            .flatten()
+    });
     fetched.and_then(|j| serde_json::from_str(&j).ok())
 }
 
@@ -897,8 +839,9 @@ pub async fn get_workspace_file(
     // Priority order: the localized "Readme".md first (en: "Readme.md"),
     // then the static list — first non-directory match wins.
     for n in names {
-        if let Some((fileid, path, _mimetype, _name)) =
-            rows.iter().find(|(_, _, m, nm)| m != &dir_mime_id && nm == n)
+        if let Some((fileid, path, _mimetype, _name)) = rows
+            .iter()
+            .find(|(_, _, m, nm)| m != &dir_mime_id && nm == n)
         {
             return Some((*fileid, path.clone()));
         }
@@ -919,24 +862,16 @@ pub async fn get_user_preference(
     let sql = format!(
         "SELECT configvalue FROM {table} WHERE userid = $1 AND appid = $2 AND configkey = $3"
     );
-    match pool {
-        DbPool::Pg(p) => sqlx::query_scalar::<Postgres, String>(&sql)
+    db_dispatch!(pool, |Db, c| {
+        sqlx::query_scalar::<Db, String>(&sql)
             .bind(uid)
             .bind(app)
             .bind(key)
-            .fetch_optional(p)
+            .fetch_optional(c)
             .await
             .ok()
-            .flatten(),
-        DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, String>(&sql)
-            .bind(uid)
-            .bind(app)
-            .bind(key)
-            .fetch_optional(p)
-            .await
-            .ok()
-            .flatten(),
-    }
+            .flatten()
+    })
 }
 
 /// Returns an empty string when no note exists (REQ §6.5, PHASE-7.6).
@@ -945,24 +880,16 @@ pub async fn get_share_note(pool: &DbPool, prefix: &str, fileid: i64) -> String 
         "SELECT note FROM {prefix}share WHERE file_source = $1 AND note != '' \
          ORDER BY stime DESC LIMIT 1"
     );
-    match pool {
-        DbPool::Pg(p) => sqlx::query_scalar::<Postgres, Option<String>>(&sql)
+    db_dispatch!(pool, |Db, c| {
+        sqlx::query_scalar::<Db, Option<String>>(&sql)
             .bind(fileid)
-            .fetch_optional(p)
+            .fetch_optional(c)
             .await
             .ok()
             .flatten()
             .flatten()
-            .unwrap_or_default(),
-        DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, Option<String>>(&sql)
-            .bind(fileid)
-            .fetch_optional(p)
-            .await
-            .ok()
-            .flatten()
-            .flatten()
-            .unwrap_or_default(),
-    }
+            .unwrap_or_default()
+    })
 }
 
 /// Share details + most-recent share notes for a **batch** of files in one
@@ -1004,7 +931,15 @@ pub async fn share_details_and_notes_batch(
     // Native bigint[] bind on Postgres (PHASE-22 T4); the rows decode into
     // the shared tuple (file_source, share_type, share_with, uid_owner,
     // uid_initiator, note, stime) per arm, then the split below is common.
-    let rows: Vec<(i64, i16, Option<String>, String, Option<String>, String, i64)> = match pool {
+    let rows: Vec<(
+        i64,
+        i16,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+        i64,
+    )> = match pool {
         DbPool::Pg(p) => {
             let sql = format!(
                 "SELECT file_source, share_type, share_with, uid_owner, uid_initiator, note, stime \
@@ -1012,7 +947,11 @@ pub async fn share_details_and_notes_batch(
                  WHERE file_source = ANY($1::bigint[])",
                 prefix = prefix,
             );
-            match sqlx::query::<Postgres>(&sql).bind(fileids).fetch_all(p).await {
+            match sqlx::query::<Postgres>(&sql)
+                .bind(fileids)
+                .fetch_all(p)
+                .await
+            {
                 Ok(r) => r
                     .iter()
                     .map(|r| {
@@ -1103,9 +1042,7 @@ pub async fn share_details_and_notes_batch(
             if !matches!(share_type, 0 | 1 | 3 | 4 | 6 | 7 | 10 | 12) {
                 return false;
             }
-            owner == uid
-                || initiator.as_deref() == Some(uid)
-                || share_with.as_deref() == Some(uid)
+            owner == uid || initiator.as_deref() == Some(uid) || share_with.as_deref() == Some(uid)
         })
         .collect::<Vec<_>>();
 
@@ -1203,8 +1140,9 @@ fn cached_sql(prefix: &str, build: fn(&str) -> String) -> &'static str {
     // lookups) share the table prefix, and a prefix-only key made the first
     // caller's SQL leak into the others (wrong statement + own binds → the
     // 2026-08-14 desync errors and the ColumnNotFound panic).
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<(String, fn(&str) -> String), &'static str>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<(String, fn(&str) -> String), &'static str>>,
+    > = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let key = (prefix.to_string(), build);
     if let Some(s) = cache.lock().expect("sql cache lock").get(&key) {
@@ -1397,14 +1335,8 @@ pub async fn propfind_batch_cte(
             if let Ok(Some(serde_json::Value::Object(v))) =
                 r.try_get::<Option<serde_json::Value>, _>("dir_counts")
             {
-                let dirs = v
-                    .get("dirs")
-                    .and_then(|x| x.as_i64())
-                    .unwrap_or(0);
-                let files = v
-                    .get("files")
-                    .and_then(|x| x.as_i64())
-                    .unwrap_or(0);
+                let dirs = v.get("dirs").and_then(|x| x.as_i64()).unwrap_or(0);
+                let files = v.get("files").and_then(|x| x.as_i64()).unwrap_or(0);
                 out.dir_counts.insert(fileid, (dirs, files));
             }
         }
@@ -1420,7 +1352,8 @@ pub async fn propfind_batch_cte(
         }
 
         // System tags.
-        let tags: Option<Vec<TagJson>> = match r.get::<Option<serde_json::Value>, _>("system_tags") {
+        let tags: Option<Vec<TagJson>> = match r.get::<Option<serde_json::Value>, _>("system_tags")
+        {
             Some(v) => serde_json::from_value(v).ok().flatten(),
             None => None,
         };
@@ -1623,11 +1556,11 @@ pub async fn list_custom_properties(
          FROM {prefix}properties \
          WHERE userid=$1 AND propertypath=$2"
     );
-    let fetched: Result<Vec<(String, String, i16)>, sqlx::Error> = match pool {
-        DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+    let fetched: Result<Vec<(String, String, i16)>, sqlx::Error> = db_dispatch!(pool, |Db, c| {
+        sqlx::query::<Db>(&sql)
             .bind(userid)
             .bind(&prop_path)
-            .fetch_all(p)
+            .fetch_all(c)
             .await
             .map(|rows| {
                 rows.iter()
@@ -1639,24 +1572,8 @@ pub async fn list_custom_properties(
                         )
                     })
                     .collect()
-            }),
-        DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-            .bind(userid)
-            .bind(&prop_path)
-            .fetch_all(p)
-            .await
-            .map(|rows| {
-                rows.iter()
-                    .map(|r| {
-                        (
-                            r.try_get::<String, _>("propertyname").unwrap_or_default(),
-                            r.try_get::<String, _>("propertyvalue").unwrap_or_default(),
-                            r.try_get::<i16, _>("valuetype").unwrap_or(1),
-                        )
-                    })
-                    .collect()
-            }),
-    };
+            })
+    });
     match fetched {
         Ok(rows) => rows,
         Err(e) => {
@@ -1692,11 +1609,11 @@ pub async fn custom_properties_batch(
         DbPool::Pg(p) => {
             let sql = cached_sql(prefix, |prefix| {
                 format!(
-                "SELECT propertypath, propertyname, propertyvalue, valuetype \
+                    "SELECT propertypath, propertyname, propertyvalue, valuetype \
                  FROM {prefix}properties \
                  WHERE userid = $1 AND propertypath = ANY($2::text[])",
-                prefix = prefix,
-            )
+                    prefix = prefix,
+                )
             });
             let formatted: Vec<String> = paths.iter().map(|p| format_property_path(p)).collect();
             sqlx::query::<Postgres>(&sql)
@@ -1777,47 +1694,31 @@ pub async fn upsert_custom_property(
         "DELETE FROM {prefix}properties \
          WHERE userid=$1 AND propertypath=$2 AND propertyname=$3"
     );
-    match pool {
-        DbPool::Pg(p) => sqlx::query::<Postgres>(&del_sql)
+    db_dispatch!(pool, |Db, c| {
+        sqlx::query::<Db>(&del_sql)
             .bind(userid)
             .bind(&prop_path)
             .bind(propname)
-            .execute(p)
+            .execute(c)
             .await
-            .map(|_| ())?,
-        DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&del_sql)
-            .bind(userid)
-            .bind(&prop_path)
-            .bind(propname)
-            .execute(p)
-            .await
-            .map(|_| ())?,
-    };
+            .map(|_| ())?
+    });
     let ins_sql = format!(
         "INSERT INTO {prefix}properties \
          (userid, propertypath, propertyname, propertyvalue, valuetype) \
          VALUES ($1,$2,$3,$4,$5)"
     );
-    match pool {
-        DbPool::Pg(p) => sqlx::query::<Postgres>(&ins_sql)
+    db_dispatch!(pool, |Db, c| {
+        sqlx::query::<Db>(&ins_sql)
             .bind(userid)
             .bind(&prop_path)
             .bind(propname)
             .bind(val_str)
             .bind(valuetype)
-            .execute(p)
+            .execute(c)
             .await
-            .map(|_| ())?,
-        DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&ins_sql)
-            .bind(userid)
-            .bind(&prop_path)
-            .bind(propname)
-            .bind(val_str)
-            .bind(valuetype)
-            .execute(p)
-            .await
-            .map(|_| ())?,
-    };
+            .map(|_| ())?
+    });
     Ok(())
 }
 
@@ -1834,22 +1735,15 @@ pub async fn delete_custom_property(
         "DELETE FROM {prefix}properties \
          WHERE userid=$1 AND propertypath=$2 AND propertyname=$3"
     );
-    match pool {
-        DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+    db_dispatch!(pool, |Db, c| {
+        sqlx::query::<Db>(&sql)
             .bind(userid)
             .bind(&prop_path)
             .bind(propname)
-            .execute(p)
+            .execute(c)
             .await
-            .map(|_| ())?,
-        DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-            .bind(userid)
-            .bind(&prop_path)
-            .bind(propname)
-            .execute(p)
-            .await
-            .map(|_| ())?,
-    };
+            .map(|_| ())?
+    });
     Ok(())
 }
 
@@ -1862,20 +1756,14 @@ pub async fn delete_custom_properties_for_path(
 ) -> anyhow::Result<()> {
     let prop_path = format_property_path(path);
     let sql = format!("DELETE FROM {prefix}properties WHERE userid=$1 AND propertypath=$2");
-    match pool {
-        DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+    db_dispatch!(pool, |Db, c| {
+        sqlx::query::<Db>(&sql)
             .bind(userid)
             .bind(&prop_path)
-            .execute(p)
+            .execute(c)
             .await
-            .map(|_| ())?,
-        DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-            .bind(userid)
-            .bind(&prop_path)
-            .execute(p)
-            .await
-            .map(|_| ())?,
-    };
+            .map(|_| ())?
+    });
     Ok(())
 }
 
@@ -1896,12 +1784,12 @@ pub async fn delete_custom_properties_for_dir(
         "SELECT path FROM {prefix}filecache \
          WHERE storage=$1 AND (path=$2 OR path LIKE $3)"
     );
-    let child_paths: Vec<String> = match pool {
-        DbPool::Pg(p) => match sqlx::query::<Postgres>(&sql)
+    let child_paths: Vec<String> = db_dispatch!(pool, |Db, c| {
+        match sqlx::query::<Db>(&sql)
             .bind(storage_id)
             .bind(dir_fc_path)
             .bind(&like_pat)
-            .fetch_all(p)
+            .fetch_all(c)
             .await
         {
             Ok(rows) => rows
@@ -1909,21 +1797,8 @@ pub async fn delete_custom_properties_for_dir(
                 .map(|r| r.try_get::<String, _>("path").unwrap_or_default())
                 .collect(),
             Err(_) => return,
-        },
-        DbPool::Sqlite(p) => match sqlx::query::<Sqlite>(&sql)
-            .bind(storage_id)
-            .bind(dir_fc_path)
-            .bind(&like_pat)
-            .fetch_all(p)
-            .await
-        {
-            Ok(rows) => rows
-                .iter()
-                .map(|r| r.try_get::<String, _>("path").unwrap_or_default())
-                .collect(),
-            Err(_) => return,
-        },
-    };
+        }
+    });
     for child_path in child_paths {
         let _ = delete_custom_properties_for_path(pool, prefix, userid, &child_path).await;
     }
@@ -1943,22 +1818,15 @@ pub async fn update_custom_properties_path(
         "UPDATE {prefix}properties SET propertypath=$1 \
          WHERE userid=$2 AND propertypath=$3"
     );
-    match pool {
-        DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+    db_dispatch!(pool, |Db, c| {
+        sqlx::query::<Db>(&sql)
             .bind(&new_prop)
             .bind(userid)
             .bind(&old_prop)
-            .execute(p)
+            .execute(c)
             .await
-            .map(|_| ())?,
-        DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-            .bind(&new_prop)
-            .bind(userid)
-            .bind(&old_prop)
-            .execute(p)
-            .await
-            .map(|_| ())?,
-    };
+            .map(|_| ())?
+    });
     Ok(())
 }
 
@@ -1980,11 +1848,11 @@ pub async fn update_custom_properties_path_subtree(
         "SELECT path FROM {prefix}filecache \
          WHERE storage=$1 AND path LIKE $2"
     );
-    let old_child_paths: Vec<String> = match pool {
-        DbPool::Pg(p) => match sqlx::query::<Postgres>(&sql)
+    let old_child_paths: Vec<String> = db_dispatch!(pool, |Db, c| {
+        match sqlx::query::<Db>(&sql)
             .bind(storage_id)
             .bind(&like_pat)
-            .fetch_all(p)
+            .fetch_all(c)
             .await
         {
             Ok(rows) => rows
@@ -1992,20 +1860,8 @@ pub async fn update_custom_properties_path_subtree(
                 .map(|r| r.try_get::<String, _>("path").unwrap_or_default())
                 .collect(),
             Err(_) => return,
-        },
-        DbPool::Sqlite(p) => match sqlx::query::<Sqlite>(&sql)
-            .bind(storage_id)
-            .bind(&like_pat)
-            .fetch_all(p)
-            .await
-        {
-            Ok(rows) => rows
-                .iter()
-                .map(|r| r.try_get::<String, _>("path").unwrap_or_default())
-                .collect(),
-            Err(_) => return,
-        },
-    };
+        }
+    });
     for old_child_path in old_child_paths {
         let new_child_path = old_child_path.replacen(old_prefix, new_prefix, 1);
         let _ =
@@ -2104,36 +1960,25 @@ pub async fn get_share_details(
          AND (uid_owner = $2 OR uid_initiator = $3 OR share_with = $4)",
         prefix = prefix
     );
-    let rows: Vec<(i16, Option<String>)> = match pool {
-        DbPool::Pg(p) => match sqlx::query::<Postgres>(&sql)
+    let rows: Vec<(i16, Option<String>)> = db_dispatch!(pool, |Db, c| {
+        match sqlx::query::<Db>(&sql)
             .bind(fileid)
             .bind(uid)
             .bind(uid)
             .bind(uid)
-            .fetch_all(p)
+            .fetch_all(c)
             .await
         {
-            Ok(r) => r.iter().map(|r| (r.get("share_type"), r.get("share_with"))).collect(),
+            Ok(r) => r
+                .iter()
+                .map(|r| (r.get("share_type"), r.get("share_with")))
+                .collect(),
             Err(e) => {
                 tracing::error!(fileid, uid, error = %e, "get_share_details: SQL error");
                 return vec![];
             }
-        },
-        DbPool::Sqlite(p) => match sqlx::query::<Sqlite>(&sql)
-            .bind(fileid)
-            .bind(uid)
-            .bind(uid)
-            .bind(uid)
-            .fetch_all(p)
-            .await
-        {
-            Ok(r) => r.iter().map(|r| (r.get("share_type"), r.get("share_with"))).collect(),
-            Err(e) => {
-                tracing::error!(fileid, uid, error = %e, "get_share_details: SQL error");
-                return vec![];
-            }
-        },
-    };
+        }
+    });
 
     // Batch-resolve display names for user-type shares (share_type = 0).
     let user_withs: Vec<String> = rows
@@ -2186,10 +2031,10 @@ async fn batch_lookup_display_names(
         DbPool::Pg(p) => {
             let sql = cached_sql(prefix, |prefix| {
                 format!(
-                "SELECT uid, displayname FROM {prefix}users \
+                    "SELECT uid, displayname FROM {prefix}users \
                  WHERE uid = ANY($1::text[])",
-                prefix = prefix
-            )
+                    prefix = prefix
+                )
             });
             sqlx::query::<Postgres>(&sql)
                 .bind(uids)
@@ -2245,13 +2090,12 @@ async fn batch_lookup_display_names(
             DbPool::Pg(p) => {
                 let sql = cached_sql(prefix, |prefix| {
                     format!(
-                    "SELECT uid, data FROM {prefix}accounts \
+                        "SELECT uid, data FROM {prefix}accounts \
                      WHERE uid = ANY($1::text[])",
-                    prefix = prefix
-                )
+                        prefix = prefix
+                    )
                 });
-                let uids: Vec<String> =
-                    unresolved.iter().map(|s| s.as_str().to_string()).collect();
+                let uids: Vec<String> = unresolved.iter().map(|s| s.as_str().to_string()).collect();
                 sqlx::query::<Postgres>(&sql)
                     .bind(&uids)
                     .fetch_all(p)
@@ -2378,24 +2222,16 @@ pub async fn get_comments_count(pool: &DbPool, prefix: &str, fileid: i64) -> i64
          WHERE object_type = 'files' AND object_id = $1",
         prefix = prefix
     );
-    match pool {
-        DbPool::Pg(p) => sqlx::query_scalar::<Postgres, Option<i64>>(&sql)
+    db_dispatch!(pool, |Db, c| {
+        sqlx::query_scalar::<Db, Option<i64>>(&sql)
             .bind(fileid.to_string())
-            .fetch_optional(p)
+            .fetch_optional(c)
             .await
             .ok()
             .flatten()
             .flatten()
-            .unwrap_or(0),
-        DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, Option<i64>>(&sql)
-            .bind(fileid.to_string())
-            .fetch_optional(p)
-            .await
-            .ok()
-            .flatten()
-            .flatten()
-            .unwrap_or(0),
-    }
+            .unwrap_or(0)
+    })
 }
 
 /// Return the number of unread comments for a file and user, matching PHP
@@ -2413,26 +2249,17 @@ pub async fn get_comments_unread(pool: &DbPool, prefix: &str, fileid: i64, uid: 
          AND c.creation_timestamp > COALESCE(m.marker_datetime, '1970-01-01 00:00:00')",
         prefix = prefix
     );
-    match pool {
-        DbPool::Pg(p) => sqlx::query_scalar::<Postgres, Option<i64>>(&sql)
+    db_dispatch!(pool, |Db, c| {
+        sqlx::query_scalar::<Db, Option<i64>>(&sql)
             .bind(fileid.to_string())
             .bind(uid)
-            .fetch_optional(p)
+            .fetch_optional(c)
             .await
             .ok()
             .flatten()
             .flatten()
-            .unwrap_or(0),
-        DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, Option<i64>>(&sql)
-            .bind(fileid.to_string())
-            .bind(uid)
-            .fetch_optional(p)
-            .await
-            .ok()
-            .flatten()
-            .flatten()
-            .unwrap_or(0),
-    }
+            .unwrap_or(0)
+    })
 }
 
 /// Comment counts + unread counts for a **batch** of files in one query,
@@ -2568,10 +2395,10 @@ pub async fn get_system_tags_for_file(
          ORDER BY LOWER(t.name)",
         prefix = prefix
     );
-    let fetched: Result<Vec<SystemTagRow>, sqlx::Error> = match pool {
-        DbPool::Pg(p) => sqlx::query::<Postgres>(&sql)
+    let fetched: Result<Vec<SystemTagRow>, sqlx::Error> = db_dispatch!(pool, |Db, c| {
+        sqlx::query::<Db>(&sql)
             .bind(fileid.to_string())
-            .fetch_all(p)
+            .fetch_all(c)
             .await
             .map(|rows| {
                 rows.iter()
@@ -2583,23 +2410,8 @@ pub async fn get_system_tags_for_file(
                         color: r.get("color"),
                     })
                     .collect()
-            }),
-        DbPool::Sqlite(p) => sqlx::query::<Sqlite>(&sql)
-            .bind(fileid.to_string())
-            .fetch_all(p)
-            .await
-            .map(|rows| {
-                rows.iter()
-                    .map(|r| SystemTagRow {
-                        id: r.get("id"),
-                        name: r.get("name"),
-                        user_visible: r.get::<i16, _>("visibility") == 1,
-                        user_assignable: r.get::<i16, _>("editable") == 1,
-                        color: r.get("color"),
-                    })
-                    .collect()
-            }),
-    };
+            })
+    });
     match fetched {
         Ok(rows) => rows,
         Err(e) => {
@@ -2755,18 +2567,13 @@ pub async fn get_favorite_fileids(pool: &DbPool, prefix: &str, uid: &str) -> Vec
          WHERE vc.uid = $1 AND vc.type = 'files' AND vc.category = $2",
         prefix = prefix
     );
-    let fetched = match pool {
-        DbPool::Pg(p) => sqlx::query_scalar::<Postgres, String>(&sql)
+    let fetched = db_dispatch!(pool, |Db, c| {
+        sqlx::query_scalar::<Db, String>(&sql)
             .bind(uid)
             .bind(crate::tags::TAG_FAVORITE)
-            .fetch_all(p)
-            .await,
-        DbPool::Sqlite(p) => sqlx::query_scalar::<Sqlite, String>(&sql)
-            .bind(uid)
-            .bind(crate::tags::TAG_FAVORITE)
-            .fetch_all(p)
-            .await,
-    };
+            .fetch_all(c)
+            .await
+    });
     match fetched {
         Ok(ids) => ids
             .into_iter()

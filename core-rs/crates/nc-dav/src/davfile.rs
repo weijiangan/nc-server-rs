@@ -28,6 +28,7 @@ use crate::metadata::NcMetaData;
 use crate::propagator::Propagator;
 use nc_db::mime::SharedMimeCache;
 use nc_db::pool::DbPool;
+use nc_db::{db_execute, db_scalar_one};
 
 // ─── Preview cache path ─────────────────────────────────────────────────────
 
@@ -585,28 +586,7 @@ impl DavFile for NcDavFile {
                      SET size=$1, mtime=$2, storage_mtime=$3, etag=$4, checksum=$5 \
                      WHERE fileid=$6"
                 );
-                let result = match pool {
-                    DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
-                        .bind(size as i64)
-                        .bind(use_mtime)
-                        .bind(use_mtime)
-                        .bind(&etag_value)
-                        .bind(checksum)
-                        .bind(fid)
-                        .execute(p)
-                        .await
-                        .map(|_| ()),
-                    DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-                        .bind(size as i64)
-                        .bind(use_mtime)
-                        .bind(use_mtime)
-                        .bind(&etag_value)
-                        .bind(checksum)
-                        .bind(fid)
-                        .execute(p)
-                        .await
-                        .map(|_| ()),
-                };
+                let result = db_execute!(pool, &sql, size as i64, use_mtime, use_mtime, &etag_value, checksum, fid);
                 if let Err(e) = result {
                     tracing::error!(error = %e, fileid = fid, "PUT: failed to update oc_filecache row");
                     return Err(FsError::GeneralFailure);
@@ -625,40 +605,7 @@ impl DavFile for NcDavFile {
                 // The database allocates the fileid atomically (sequence on
                 // PostgreSQL, INTEGER PRIMARY KEY auto-increment on SQLite).
                 // No retry loop needed — no MAX+1 race possible.
-                let fetched: Result<i64, sqlx::Error> = match pool {
-                    DbPool::Pg(p) => sqlx::query_scalar::<sqlx::Postgres, _>(&sql)
-                        .bind(ctx.storage_id)
-                        .bind(&ctx.fc_path)
-                        .bind(&hash)
-                        .bind(ctx.parent_id)
-                        .bind(&name)
-                        .bind(ctx.mime_type_id)
-                        .bind(ctx.mimepart_id)
-                        .bind(size as i64)
-                        .bind(use_mtime)
-                        .bind(use_mtime)
-                        .bind(&new_etag)
-                        .bind(27i32)
-                        .bind(checksum)
-                        .fetch_one(p)
-                        .await,
-                    DbPool::Sqlite(p) => sqlx::query_scalar::<sqlx::Sqlite, _>(&sql)
-                        .bind(ctx.storage_id)
-                        .bind(&ctx.fc_path)
-                        .bind(&hash)
-                        .bind(ctx.parent_id)
-                        .bind(&name)
-                        .bind(ctx.mime_type_id)
-                        .bind(ctx.mimepart_id)
-                        .bind(size as i64)
-                        .bind(use_mtime)
-                        .bind(use_mtime)
-                        .bind(&new_etag)
-                        .bind(27i32)
-                        .bind(checksum)
-                        .fetch_one(p)
-                        .await,
-                };
+                let fetched: Result<i64, sqlx::Error> = db_scalar_one!(pool, &sql, ctx.storage_id, &ctx.fc_path, &hash, ctx.parent_id, &name, ctx.mime_type_id, ctx.mimepart_id, size as i64, use_mtime, use_mtime, &new_etag, 27i32, checksum);
                 let fid: i64 = match fetched {
                     Ok(id) => id,
                     Err(e) => {
@@ -703,22 +650,7 @@ impl DavFile for NcDavFile {
                  ON CONFLICT(fileid) DO UPDATE SET upload_time = excluded.upload_time",
                 prefix = prefix
             );
-            let result = match pool {
-                DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&extended_sql)
-                    .bind(fileid)
-                    .bind(use_creation_time)
-                    .bind(now)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-                DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&extended_sql)
-                    .bind(fileid)
-                    .bind(use_creation_time)
-                    .bind(now)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-            };
+            let result = db_execute!(pool, &extended_sql, fileid, use_creation_time, now);
             if let Err(e) = result {
                 tracing::warn!(fileid = fileid, error = %e, "PUT: failed to upsert oc_filecache_extended");
             }
@@ -787,18 +719,7 @@ impl DavFile for NcDavFile {
                 "DELETE FROM {prefix}previews WHERE file_id = $1",
                 prefix = prefix
             );
-            let result = match pool {
-                DbPool::Pg(p) => sqlx::query::<sqlx::Postgres>(&sql)
-                    .bind(fileid)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-                DbPool::Sqlite(p) => sqlx::query::<sqlx::Sqlite>(&sql)
-                    .bind(fileid)
-                    .execute(p)
-                    .await
-                    .map(|_| ()),
-            };
+            let result = db_execute!(pool, &sql, fileid);
             if let Err(e) = result {
                 tracing::warn!(fileid = fileid, error = %e, "PUT: failed to delete stale oc_previews rows");
             }
