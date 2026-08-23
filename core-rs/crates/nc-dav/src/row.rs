@@ -1519,6 +1519,74 @@ pub async fn list_changed_since(
     }
 }
 
+// ─── Filecache subtree mutations (phase 24) ──────────────────────────────────
+
+/// The 1-based `SUBSTRING` offset that strips `prefix` from a path.
+///
+/// Postgres' `SUBSTRING(x FROM n)` counts **characters**, so the offset is
+/// the character length — PHP's `mb_strlen($sourcePath) + 1`
+/// (`Cache.php:751`), not the byte length that Rust slicing uses.
+fn subtree_suffix_offset(prefix: &str) -> i32 {
+    prefix.chars().count() as i32 + 1
+}
+
+/// Re-key `path`/`path_hash` for every descendant of `old_prefix` onto
+/// `new_prefix` (the subtree root itself is left to the caller).
+///
+/// Postgres does the whole subtree in one statement with DB-side `||` +
+/// `md5()`, which is exactly PHP `Cache::moveFromCache`'s child branch
+/// (`Cache.php:749-808`); Postgres' `md5(text)` digests the UTF-8 bytes, so
+/// it agrees with [`path_hash`]. SQLite has no `md5()` function, so that arm
+/// keeps the fetch-and-loop it always had.
+pub async fn rekey_subtree_paths(
+    pool: &DbPool,
+    prefix: &str,
+    storage_id: i64,
+    old_prefix: &str,
+    new_prefix: &str,
+) -> Result<(), sqlx::Error> {
+    let like = format!("{old_prefix}/%");
+    match pool {
+        DbPool::Pg(p) => {
+            let sql = format!(
+                "UPDATE {prefix}filecache \
+                 SET path = $1::text || SUBSTRING(path FROM $2::int), \
+                     path_hash = md5($1::text || SUBSTRING(path FROM $2::int)) \
+                 WHERE storage = $3 AND path LIKE $4"
+            );
+            sqlx::query::<Postgres>(&sql)
+                .bind(new_prefix)
+                .bind(subtree_suffix_offset(old_prefix))
+                .bind(storage_id)
+                .bind(&like)
+                .execute(p)
+                .await?;
+        }
+        DbPool::Sqlite(p) => {
+            let sql_fetch = format!(
+                "SELECT fileid, path FROM {prefix}filecache WHERE storage = $1 AND path LIKE $2"
+            );
+            let rows: Vec<(i64, String)> = sqlx::query_as::<Sqlite, (i64, String)>(&sql_fetch)
+                .bind(storage_id)
+                .bind(&like)
+                .fetch_all(p)
+                .await?;
+            let sql_upd =
+                format!("UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3");
+            for (fileid, old_path) in rows {
+                let new_path = format!("{new_prefix}{}", &old_path[old_prefix.len()..]);
+                sqlx::query::<Sqlite>(&sql_upd)
+                    .bind(&new_path)
+                    .bind(path_hash(&new_path))
+                    .bind(fileid)
+                    .execute(p)
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 // ─── oc_properties helpers (task §10.11) ─────────────────────────────────────
 
 /// Parse Clark notation `{namespace}name` → `("namespace", "name")`.
@@ -1769,9 +1837,11 @@ pub async fn delete_custom_properties_for_path(
 
 /// Delete custom properties for a directory and all its descendants.
 ///
-/// Queries `oc_filecache` for all paths under the directory, then deletes
-/// each one from `oc_properties`.  This avoids LIKE-based queries that would
-/// miss hashed (SHA-1) long paths.
+/// On Postgres one `DELETE … propertypath = $dir OR propertypath LIKE $dir/%`
+/// clears every raw (unhashed) descendant path; only the >250-byte paths,
+/// which `format_property_path` stores as a SHA-1 digest and so cannot be
+/// matched by prefix, still need the per-path fetch-and-delete (task 24.6).
+/// SQLite keeps the fetch-and-loop for the whole subtree.
 pub async fn delete_custom_properties_for_dir(
     pool: &DbPool,
     prefix: &str,
@@ -1780,27 +1850,68 @@ pub async fn delete_custom_properties_for_dir(
     dir_fc_path: &str,
 ) {
     let like_pat = format!("{dir_fc_path}/%");
-    let sql = format!(
-        "SELECT path FROM {prefix}filecache \
-         WHERE storage=$1 AND (path=$2 OR path LIKE $3)"
-    );
-    let child_paths: Vec<String> = db_dispatch!(pool, |Db, c| {
-        match sqlx::query::<Db>(&sql)
-            .bind(storage_id)
-            .bind(dir_fc_path)
+
+    if let DbPool::Pg(p) = pool {
+        let sql = format!(
+            "DELETE FROM {prefix}properties \
+             WHERE userid = $1 AND (propertypath = $2 OR propertypath LIKE $3)"
+        );
+        if let Err(e) = sqlx::query::<Postgres>(&sql)
+            .bind(userid)
+            .bind(format_property_path(dir_fc_path))
             .bind(&like_pat)
-            .fetch_all(c)
+            .execute(p)
             .await
         {
-            Ok(rows) => rows
-                .iter()
-                .map(|r| r.try_get::<String, _>("path").unwrap_or_default())
-                .collect(),
-            Err(_) => return,
+            tracing::warn!(dir = %dir_fc_path, error = %e, "delete_custom_properties_for_dir: bulk DELETE failed");
         }
-    });
+    }
+
+    // Postgres: only the hashed (>250-byte) descendants are left; SQLite: all
+    // of them.
+    let child_paths: Vec<String> = match pool {
+        DbPool::Pg(p) => {
+            let sql = format!(
+                "SELECT path FROM {prefix}filecache \
+                 WHERE storage = $1 AND path LIKE $2 AND octet_length(path) > 250"
+            );
+            match sqlx::query_scalar::<Postgres, String>(&sql)
+                .bind(storage_id)
+                .bind(&like_pat)
+                .fetch_all(p)
+                .await
+            {
+                Ok(paths) => paths,
+                Err(e) => {
+                    tracing::warn!(dir = %dir_fc_path, error = %e, "delete_custom_properties_for_dir: hashed-path fetch failed");
+                    return;
+                }
+            }
+        }
+        DbPool::Sqlite(p) => {
+            let sql = format!(
+                "SELECT path FROM {prefix}filecache \
+                 WHERE storage = $1 AND (path = $2 OR path LIKE $3)"
+            );
+            match sqlx::query_scalar::<Sqlite, String>(&sql)
+                .bind(storage_id)
+                .bind(dir_fc_path)
+                .bind(&like_pat)
+                .fetch_all(p)
+                .await
+            {
+                Ok(paths) => paths,
+                Err(e) => {
+                    tracing::warn!(dir = %dir_fc_path, error = %e, "delete_custom_properties_for_dir: descendant fetch failed");
+                    return;
+                }
+            }
+        }
+    };
     for child_path in child_paths {
-        let _ = delete_custom_properties_for_path(pool, prefix, userid, &child_path).await;
+        if let Err(e) = delete_custom_properties_for_path(pool, prefix, userid, &child_path).await {
+            tracing::warn!(path = %child_path, error = %e, "delete_custom_properties_for_dir: per-path DELETE failed");
+        }
     }
 }
 
@@ -1832,9 +1943,11 @@ pub async fn update_custom_properties_path(
 
 /// Update `propertypath` for a directory subtree (rename).
 ///
-/// Queries `oc_filecache` for all descendant paths, then updates each one
-/// individually to avoid LIKE-based string prefix replacement that would
-/// miss hashed (SHA-1) long paths.
+/// On Postgres one set-based UPDATE rekeys every descendant whose old **and**
+/// new `propertypath` are raw paths; rows on either side of
+/// `format_property_path`'s 250-byte SHA-1 threshold cannot be expressed in
+/// SQL (the digest is Rust-side) and fall back to the per-path update
+/// (task 24.2).  SQLite keeps the fetch-and-loop for the whole subtree.
 pub async fn update_custom_properties_path_subtree(
     pool: &DbPool,
     prefix: &str,
@@ -1844,29 +1957,76 @@ pub async fn update_custom_properties_path_subtree(
     new_prefix: &str,
 ) {
     let like_pat = format!("{old_prefix}/%");
-    let sql = format!(
-        "SELECT path FROM {prefix}filecache \
-         WHERE storage=$1 AND path LIKE $2"
-    );
-    let old_child_paths: Vec<String> = db_dispatch!(pool, |Db, c| {
-        match sqlx::query::<Db>(&sql)
-            .bind(storage_id)
-            .bind(&like_pat)
-            .fetch_all(c)
-            .await
-        {
-            Ok(rows) => rows
-                .iter()
-                .map(|r| r.try_get::<String, _>("path").unwrap_or_default())
-                .collect(),
-            Err(_) => return,
+    let offset = subtree_suffix_offset(old_prefix);
+
+    let old_child_paths: Vec<String> = match pool {
+        DbPool::Pg(p) => {
+            let sql = format!(
+                "UPDATE {prefix}properties \
+                 SET propertypath = $1::text || SUBSTRING(propertypath FROM $2::int) \
+                 WHERE userid = $3 AND propertypath LIKE $4 \
+                   AND octet_length(propertypath) <= 250 \
+                   AND octet_length($1::text || SUBSTRING(propertypath FROM $2::int)) <= 250"
+            );
+            if let Err(e) = sqlx::query::<Postgres>(&sql)
+                .bind(new_prefix)
+                .bind(offset)
+                .bind(userid)
+                .bind(&like_pat)
+                .execute(p)
+                .await
+            {
+                tracing::warn!(old_prefix, new_prefix, error = %e, "update_custom_properties_path_subtree: bulk UPDATE failed");
+            }
+            // Whatever the bulk UPDATE could not express: a descendant whose
+            // old path is hashed, or whose new path crosses the threshold.
+            let sql_rest = format!(
+                "SELECT path FROM {prefix}filecache \
+                 WHERE storage = $1 AND path LIKE $2 \
+                   AND (octet_length(path) > 250 \
+                        OR octet_length($3::text || SUBSTRING(path FROM $4::int)) > 250)"
+            );
+            match sqlx::query_scalar::<Postgres, String>(&sql_rest)
+                .bind(storage_id)
+                .bind(&like_pat)
+                .bind(new_prefix)
+                .bind(offset)
+                .fetch_all(p)
+                .await
+            {
+                Ok(paths) => paths,
+                Err(e) => {
+                    tracing::warn!(old_prefix, error = %e, "update_custom_properties_path_subtree: hashed-path fetch failed");
+                    return;
+                }
+            }
         }
-    });
+        DbPool::Sqlite(p) => {
+            let sql =
+                format!("SELECT path FROM {prefix}filecache WHERE storage = $1 AND path LIKE $2");
+            match sqlx::query_scalar::<Sqlite, String>(&sql)
+                .bind(storage_id)
+                .bind(&like_pat)
+                .fetch_all(p)
+                .await
+            {
+                Ok(paths) => paths,
+                Err(e) => {
+                    tracing::warn!(old_prefix, error = %e, "update_custom_properties_path_subtree: descendant fetch failed");
+                    return;
+                }
+            }
+        }
+    };
+
     for old_child_path in old_child_paths {
         let new_child_path = old_child_path.replacen(old_prefix, new_prefix, 1);
-        let _ =
+        if let Err(e) =
             update_custom_properties_path(pool, prefix, userid, &old_child_path, &new_child_path)
-                .await;
+                .await
+        {
+            tracing::warn!(path = %old_child_path, error = %e, "update_custom_properties_path_subtree: per-path UPDATE failed");
+        }
     }
 }
 
@@ -3652,5 +3812,175 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_workspace_file(&pool, "oc_", 1, 7, 2).await, None);
+    }
+
+    // ── Subtree rekey / property subtree ops (phase 24) ──────────────────
+    //
+    // Unit tests only ever see the SQLite arm; it is the parity pin for the
+    // set-based Postgres arm, so these assert the exact `path`/`path_hash`/
+    // `propertypath` values both arms must produce.
+
+    /// The Postgres arms strip the old prefix with `SUBSTRING(x FROM $n)`,
+    /// which counts characters — Rust slices by bytes.  For a multi-byte
+    /// prefix the two only agree because the offset is a *character* count
+    /// (PHP's `mb_strlen`), which is what this pins.
+    #[test]
+    fn subtree_suffix_offset_counts_characters() {
+        let prefix = "files/Ordner-Ü/日本";
+        let path = format!("{prefix}/child.txt");
+        let by_bytes = &path[prefix.len()..];
+        let by_chars: String = path
+            .chars()
+            .skip(subtree_suffix_offset(prefix) as usize - 1)
+            .collect();
+        assert_eq!(by_chars, by_bytes);
+        assert_ne!(subtree_suffix_offset(prefix) as usize - 1, prefix.len());
+    }
+
+    async fn seed_paths(pool: &DbPool, rows: &[(i64, &str)]) {
+        for (fid, path) in rows {
+            sqlx::query::<Sqlite>(
+                "INSERT INTO oc_filecache (fileid, storage, path, path_hash, parent, name, mimetype) \
+                 VALUES ($1, 1, $2, $3, 0, '', 0)",
+            )
+            .bind(fid)
+            .bind(path)
+            .bind(path_hash(path))
+            .execute(test_pool(pool))
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn path_of(pool: &DbPool, fileid: i64) -> (String, String) {
+        sqlx::query_as::<Sqlite, (String, String)>(
+            "SELECT path, path_hash FROM oc_filecache WHERE fileid = $1",
+        )
+        .bind(fileid)
+        .fetch_one(test_pool(pool))
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rekey_subtree_paths_rewrites_nested_descendants() {
+        let pool = fresh_batch_db().await;
+        seed_paths(
+            &pool,
+            &[
+                (1, "files/dir"),
+                (2, "files/dir/a.txt"),
+                (3, "files/dir/sub"),
+                (4, "files/dir/sub/deep"),
+                (5, "files/dir/sub/deep/b.txt"),
+                (6, "files/dirt.txt"),
+            ],
+        )
+        .await;
+
+        rekey_subtree_paths(&pool, "oc_", 1, "files/dir", "files/moved")
+            .await
+            .unwrap();
+
+        for (fid, expected) in [
+            (2i64, "files/moved/a.txt"),
+            (3, "files/moved/sub"),
+            (4, "files/moved/sub/deep"),
+            (5, "files/moved/sub/deep/b.txt"),
+        ] {
+            let (path, hash) = path_of(&pool, fid).await;
+            assert_eq!(path, expected);
+            assert_eq!(hash, path_hash(expected));
+        }
+        // The subtree root is the caller's job, and a sibling sharing the
+        // name prefix is not a descendant.
+        assert_eq!(path_of(&pool, 1).await.0, "files/dir");
+        assert_eq!(path_of(&pool, 6).await.0, "files/dirt.txt");
+    }
+
+    /// A path over `format_property_path`'s 250-byte threshold, so its
+    /// `propertypath` is a SHA-1 digest instead of the raw path.
+    fn long_child(parent: &str) -> String {
+        format!("{parent}/{}", "x".repeat(260))
+    }
+
+    async fn prop_paths(pool: &DbPool) -> Vec<String> {
+        sqlx::query_scalar::<Sqlite, String>("SELECT propertypath FROM oc_properties ORDER BY id")
+            .fetch_all(test_pool(pool))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn custom_properties_subtree_move_rekeys_hashed_and_raw_paths() {
+        let pool = fresh_batch_db().await;
+        let long_old = long_child("files/dir/sub");
+        let long_new = long_child("files/moved/sub");
+        seed_paths(
+            &pool,
+            &[
+                (1, "files/dir"),
+                (2, "files/dir/a.txt"),
+                (3, "files/dir/sub"),
+                (4, long_old.as_str()),
+                (5, "files/other.txt"),
+            ],
+        )
+        .await;
+        for p in [
+            "files/dir/a.txt",
+            "files/dir/sub",
+            &long_old,
+            "files/other.txt",
+        ] {
+            upsert_custom_property(&pool, "oc_", "alice", p, "{urn:x}p", b"<p/>", 2)
+                .await
+                .unwrap();
+        }
+
+        update_custom_properties_path_subtree(&pool, "oc_", "alice", 1, "files/dir", "files/moved")
+            .await;
+
+        assert_eq!(
+            prop_paths(&pool).await,
+            vec![
+                "files/moved/a.txt".to_string(),
+                "files/moved/sub".to_string(),
+                format_property_path(&long_new),
+                "files/other.txt".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_custom_properties_for_dir_clears_hashed_and_raw_paths() {
+        let pool = fresh_batch_db().await;
+        let long_path = long_child("files/dir/sub");
+        seed_paths(
+            &pool,
+            &[
+                (1, "files/dir"),
+                (2, "files/dir/a.txt"),
+                (3, "files/dir/sub"),
+                (4, long_path.as_str()),
+                (5, "files/other.txt"),
+            ],
+        )
+        .await;
+        for p in [
+            "files/dir",
+            "files/dir/a.txt",
+            "files/dir/sub",
+            &long_path,
+            "files/other.txt",
+        ] {
+            upsert_custom_property(&pool, "oc_", "alice", p, "{urn:x}p", b"<p/>", 2)
+                .await
+                .unwrap();
+        }
+
+        delete_custom_properties_for_dir(&pool, "oc_", "alice", 1, "files/dir").await;
+
+        assert_eq!(prop_paths(&pool).await, vec!["files/other.txt".to_string()]);
     }
 }

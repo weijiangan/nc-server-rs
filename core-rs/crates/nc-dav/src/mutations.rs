@@ -7,7 +7,6 @@
 //! propagation).
 
 use dav_server::fs::FsError;
-use sqlx::Row;
 use tracing::warn;
 
 use crate::filesystem::{blocking, io_to_fs};
@@ -447,10 +446,19 @@ impl NcFileSystem {
 
         // Update all descendants (directory move).
         if from_row.mimetype == dir_mime_id {
-            // Bulk-rename all paths under the old prefix using a Rust-side
-            // loop (avoids relying on DB-side MD5 dialect differences).
-            self.rename_subtree_paths(&from_fc, &to_fc, from_row.fileid, prefix)
-                .await;
+            // PHP `Cache::moveFromCache` child branch: one set-based rekey of
+            // the whole subtree (task 24.1).
+            if let Err(e) = row::rekey_subtree_paths(
+                &self.state.pool,
+                prefix,
+                self.storage_id,
+                &from_fc,
+                &to_fc,
+            )
+            .await
+            {
+                tracing::warn!(from_fc = from_fc, to_fc = to_fc, error = %e, "Failed to rekey subtree paths on rename");
+            }
 
             // Update custom DAV property paths for the directory subtree
             // (task §10.11).
@@ -804,42 +812,6 @@ impl NcFileSystem {
         }
 
         Ok(())
-    }
-
-    /// Rename all oc_filecache paths below `old_prefix` to `new_prefix`.
-    ///
-    /// This fetches every matching row and re-inserts the path_hash in Rust
-    /// to avoid relying on a DB-side MD5 function that may not exist in SQLite.
-    async fn rename_subtree_paths(
-        &self,
-        old_prefix: &str,
-        new_prefix: &str,
-        _dir_fileid: i64,
-        prefix: &str,
-    ) {
-        let like = format!("{old_prefix}/%");
-        let sql_fetch = format!(
-            "SELECT fileid, path FROM {prefix}filecache WHERE storage = $1 AND path LIKE $2"
-        );
-        let rows: Vec<(i64, String)> = db_dispatch!(&self.state.pool, |Db, c| {
-            sqlx::query::<Db>(&sql_fetch)
-                .bind(self.storage_id)
-                .bind(&like)
-                .fetch_all(c)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| (r.get::<i64, _>("fileid"), r.get::<String, _>("path")))
-                .collect()
-        });
-
-        for (fileid, old_path) in rows {
-            let new_path = format!("{new_prefix}{}", &old_path[old_prefix.len()..]);
-            let new_hash = row::path_hash(&new_path);
-            let sql_upd =
-                format!("UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3");
-            let _ = db_execute!(&self.state.pool, &sql_upd, &new_path, &new_hash, fileid);
-        }
     }
 }
 

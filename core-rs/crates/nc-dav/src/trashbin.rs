@@ -305,42 +305,23 @@ impl NcFileSystem {
         .await
         .ok_or(FsError::NotFound)?;
 
-        // Collect descendant (fileid, path) before moving.
-        let like_pat = format!("{fc_path}/%");
-        let sql_desc = format!(
-            "SELECT fileid, path FROM {prefix}filecache \
-             WHERE storage = $1 AND path LIKE $2",
-            prefix = self.state.table_prefix
-        );
-        let descendants: Vec<(i64, String)> = db_dispatch!(&self.state.pool, |Db, c| {
-            sqlx::query::<Db>(&sql_desc)
-                .bind(self.storage_id)
-                .bind(&like_pat)
-                .fetch_all(c)
-                .await
-                .map_err(|_| FsError::GeneralFailure)?
-                .into_iter()
-                .map(|r| (r.get::<i64, _>("fileid"), r.get::<String, _>("path")))
-                .collect()
-        });
-
         // Move the directory itself to trash.
-        let old_fc_path = fc_path.to_string();
-        let trash_fc = self.move_to_trash(&old_fc_path, &row).await?;
+        let trash_fc = self.move_to_trash(fc_path, &row).await?;
 
-        // Update filecache paths for all descendants so they appear
-        // nested inside the trashed directory.
-        for (fid, old_path) in &descendants {
-            let new_path = trash_fc.clone() + &old_path[old_fc_path.len()..];
-            let new_hash = row::path_hash(&new_path);
-            let sql_upd = format!(
-                "UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3",
-                prefix = self.state.table_prefix
-            );
-            let result = db_execute!(&self.state.pool, &sql_upd, &new_path, &new_hash, fid);
-            if let Err(e) = result {
-                tracing::warn!(fileid = fid, error = %e, "Failed to update descendant path in trash");
-            }
+        // Update filecache paths for all descendants so they appear nested
+        // inside the trashed directory — one set-based rekey on Postgres
+        // (task 24.4).  `move_to_trash` only re-keyed the directory's own row,
+        // so the descendants still carry the pre-move prefix.
+        if let Err(e) = row::rekey_subtree_paths(
+            &self.state.pool,
+            &self.state.table_prefix,
+            self.storage_id,
+            fc_path,
+            &trash_fc,
+        )
+        .await
+        {
+            tracing::warn!(fc_path = fc_path, error = %e, "Failed to rekey descendant paths into trash");
         }
 
         Ok(trash_fc)
@@ -678,98 +659,106 @@ impl NcFileSystem {
             };
 
         let versions_len = versions_base.len();
-        let mut first_target: Option<String> = None;
-        for (fid, old_path) in &rows {
-            let is_subtree_child =
-                old_path.len() > versions_len && old_path[versions_len..].starts_with('/');
-            let target = if is_subtree_child {
-                // Directory subtree child: keep the relative structure under
-                // files_trashbin/versions/{basename}.d{now}.  (Bare
-                // `{basename}.d{now}` — `trash_fc_name` would add the
-                // `files_trashbin/files/` prefix, which belongs to the main
-                // trash location only.)
-                let base = relative.rsplit('/').next().unwrap_or(relative);
-                format!(
-                    "files_trashbin/versions/{base}.d{now}{}",
-                    &old_path[versions_len..]
-                )
-            } else {
-                // The subtree root (directory case) or a `.v{ts}` sibling
-                // (file case): PHP getTrashFilename() appends `.d{now}` to the
-                // existing name.
-                let base = old_path.rsplit('/').next().unwrap_or(old_path);
-                format!("files_trashbin/versions/{base}.d{now}")
-            };
-            if first_target.is_none() {
-                first_target = Some(target.clone());
-            }
+        // Both branches below name the trash copy after the deleted node
+        // (PHP `getTrashFilename()` appends `.d{now}`).
+        let base_name = relative.rsplit('/').next().unwrap_or(relative);
+        let subtree_target_prefix = format!("files_trashbin/versions/{base_name}.d{now}");
 
-            if is_subtree_child {
-                // The subtree root's disk rename carried the whole directory —
-                // children only get their filecache paths re-keyed (PHP
-                // `moveFromCache` dir branch, Cache.php:749-768).  Parents stay
-                // the same fileids (they moved with the subtree).
-                let new_hash = row::path_hash(&target);
-                let sql_upd = format!(
-                    "UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3",
-                    prefix = prefix
-                );
-                let result = db_execute!(pool, &sql_upd, &target, &new_hash, fid);
-                if let Err(e) = result {
-                    warn!(fileid = fid, error = %e, "trash_versions: child path update failed");
+        // (fileid, old_path, target, is_subtree_child) in `ORDER BY path`
+        // order.  Children ride along with the subtree root's disk rename and
+        // only need their filecache path re-keyed.
+        let targets: Vec<(i64, String, String, bool)> = rows
+            .iter()
+            .map(|(fid, old_path)| {
+                if old_path.len() > versions_len && old_path[versions_len..].starts_with('/') {
+                    let target = format!("{subtree_target_prefix}{}", &old_path[versions_len..]);
+                    (*fid, old_path.clone(), target, true)
+                } else {
+                    // The subtree root (directory case) or a `.v{ts}` sibling
+                    // (file case).
+                    let base = old_path.rsplit('/').next().unwrap_or(old_path);
+                    let target = format!("files_trashbin/versions/{base}.d{now}");
+                    (*fid, old_path.clone(), target, false)
                 }
-            } else {
-                // Move on disk (the subtree root or a `.v{ts}` sibling).
-                let from_disk = self.disk_path(old_path);
-                let to_disk = self.disk_path(&target);
-                if let Some(parent) = to_disk.parent() {
-                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                        warn!("trash_versions: mkdir {} failed: {e}", parent.display());
-                        continue;
-                    }
-                }
-                let f = from_disk.clone();
-                let t = to_disk.clone();
-                if let Err(e) = blocking(move || std::fs::rename(&f, &t)).await {
-                    warn!("trash_versions: rename {old_path} → {target} failed: {e}");
+            })
+            .collect();
+        let first_target = targets.first().map(|(_, _, t, _)| t.clone());
+
+        // Children: PHP `moveFromCache` dir branch (Cache.php:749-768) — one
+        // set-based rekey on Postgres (task 24.5).  Parents stay the same
+        // fileids (they moved with the subtree).
+        if targets.iter().any(|(_, _, _, is_child)| *is_child) {
+            if let Err(e) = row::rekey_subtree_paths(
+                pool,
+                prefix,
+                self.storage_id,
+                &versions_base,
+                &subtree_target_prefix,
+            )
+            .await
+            {
+                warn!(error = %e, "trash_versions: child path rekey failed");
+            }
+        }
+
+        // The moved nodes: disk rename per row (each version file lands at a
+        // distinct path), then ONE re-key of every row that made it across
+        // (PHP `moveFromCache` single-row branch, Cache.php:809-831).
+        let mut renamed: Vec<(i64, String, String)> = Vec::new();
+        for (fid, old_path, target, _) in targets.iter().filter(|(_, _, _, c)| !*c) {
+            let from_disk = self.disk_path(old_path);
+            let to_disk = self.disk_path(target);
+            if let Some(parent) = to_disk.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    warn!("trash_versions: mkdir {} failed: {e}", parent.display());
                     continue;
                 }
+            }
+            let f = from_disk.clone();
+            let t = to_disk.clone();
+            if let Err(e) = blocking(move || std::fs::rename(&f, &t)).await {
+                warn!("trash_versions: rename {old_path} → {target} failed: {e}");
+                continue;
+            }
+            renamed.push((*fid, old_path.clone(), target.clone()));
+        }
+        if !renamed.is_empty() {
+            self.repath_trashed_versions(&renamed, trash_versions_parent.fileid)
+                .await;
+        }
 
-                // Re-key the row: new name + parent (PHP `moveFromCache` single
-                // row branch, Cache.php:809-831).
-                let new_hash = row::path_hash(&target);
-                let new_name = target.rsplit('/').next().unwrap_or(&target).to_string();
-                let sql_upd = format!(
-                    "UPDATE {prefix}filecache \
-                     SET path=$1, path_hash=$2, name=$3, parent=$4 \
-                     WHERE fileid=$5",
-                    prefix = prefix
-                );
-                let result = db_execute!(
-                    pool,
-                    &sql_upd,
-                    &target,
-                    &new_hash,
-                    &new_name,
-                    trash_versions_parent.fileid,
-                    fid
-                );
-                if let Err(e) = result {
-                    warn!(fileid = fid, error = %e, "trash_versions: row update failed");
+        // PHP `retainVersions` → `move()` → `renameFromStorage`
+        // (Trashbin.php:445-459, Updater.php:203-204) propagates etag/mtime on
+        // the version's source chain (`files_versions/…`) and its target chain
+        // (`files_trashbin/versions`) — the last move's target-chain stamp wins
+        // on `files_trashbin` (live-verified: the oracle ends with
+        // `files_trashbin.etag == files_trashbin/versions.etag`).  One call per
+        // *distinct chain*: `propagate_change` stamps a node's ancestors, so
+        // rows sharing a parent share the whole chain (task 24.5).
+        let propagated: Vec<(&String, &String)> = targets
+            .iter()
+            .filter(|(_, _, _, is_child)| *is_child)
+            .map(|(_, old_path, target, _)| (old_path, target))
+            .chain(
+                renamed
+                    .iter()
+                    .map(|(_, old_path, target)| (old_path, target)),
+            )
+            .collect();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (old_path, _) in &propagated {
+            if seen.insert(parent_fc_path(old_path)) {
+                if let Err(e) = self.propagator.propagate_change(old_path, now, 0).await {
+                    tracing::warn!(path = %old_path, error = %e, "trash_versions: source-chain propagation failed");
                 }
             }
-
-            // PHP `retainVersions` → `move()` → `renameFromStorage`
-            // (Trashbin.php:445-459, Updater.php:203-204) propagates etag/mtime
-            // on the version's source chain (`files_versions/…`) and its target
-            // chain (`files_trashbin/versions`) — the last move's target-chain
-            // stamp wins on `files_trashbin` (live-verified: the oracle ends
-            // with `files_trashbin.etag == files_trashbin/versions.etag`).
-            if let Err(e) = self.propagator.propagate_change(old_path, now, 0).await {
-                tracing::warn!(path = %old_path, error = %e, "trash_versions: source-chain propagation failed");
-            }
-            if let Err(e) = self.propagator.propagate_change(&target, now, 0).await {
-                tracing::warn!(path = %target, error = %e, "trash_versions: target-chain propagation failed");
+        }
+        seen.clear();
+        for (_, target) in &propagated {
+            if seen.insert(parent_fc_path(target)) {
+                if let Err(e) = self.propagator.propagate_change(target, now, 0).await {
+                    tracing::warn!(path = %target, error = %e, "trash_versions: target-chain propagation failed");
+                }
             }
         }
 
@@ -783,6 +772,63 @@ impl NcFileSystem {
         if let Some(t) = &first_target {
             if let Err(e) = self.propagator.correct_folder_size_chain(t).await {
                 tracing::warn!(path = %t, error = %e, "trash_versions: target-chain size recompute failed");
+            }
+        }
+    }
+
+    /// Re-key the version rows that were renamed on disk: path, path_hash,
+    /// name and the shared `files_trashbin/versions` parent.
+    ///
+    /// Postgres does the whole batch in one statement (`UNNEST` + DB-side
+    /// `md5()`, task 24.5); SQLite has no `md5()` and keeps the per-row loop.
+    async fn repath_trashed_versions(&self, renamed: &[(i64, String, String)], parent_id: i64) {
+        let prefix = &self.state.table_prefix;
+        match &self.state.pool {
+            nc_db::pool::DbPool::Pg(p) => {
+                let (ids, paths): (Vec<i64>, Vec<String>) = renamed
+                    .iter()
+                    .map(|(fid, _, target)| (*fid, target.clone()))
+                    .unzip();
+                let names: Vec<String> = paths
+                    .iter()
+                    .map(|t| t.rsplit('/').next().unwrap_or(t).to_string())
+                    .collect();
+                let sql = format!(
+                    "UPDATE {prefix}filecache fc \
+                     SET path = u.path, path_hash = md5(u.path), name = u.name, parent = $4 \
+                     FROM UNNEST($1::bigint[], $2::text[], $3::text[]) AS u(fileid, path, name) \
+                     WHERE fc.fileid = u.fileid"
+                );
+                let r = sqlx::query::<sqlx::Postgres>(&sql)
+                    .bind(&ids)
+                    .bind(&paths)
+                    .bind(&names)
+                    .bind(parent_id)
+                    .execute(p)
+                    .await;
+                if let Err(e) = r {
+                    warn!(error = %e, "trash_versions: batched row update failed");
+                }
+            }
+            nc_db::pool::DbPool::Sqlite(p) => {
+                let sql = format!(
+                    "UPDATE {prefix}filecache \
+                     SET path=$1, path_hash=$2, name=$3, parent=$4 \
+                     WHERE fileid=$5"
+                );
+                for (fid, _, target) in renamed {
+                    let r = sqlx::query::<sqlx::Sqlite>(&sql)
+                        .bind(target)
+                        .bind(row::path_hash(target))
+                        .bind(target.rsplit('/').next().unwrap_or(target))
+                        .bind(parent_id)
+                        .bind(fid)
+                        .execute(p)
+                        .await;
+                    if let Err(e) = r {
+                        warn!(fileid = fid, error = %e, "trash_versions: row update failed");
+                    }
+                }
             }
         }
     }
@@ -1230,6 +1276,58 @@ mod tests {
         let expected_m = format!("files_trashbin/files/dir.d{ts}/a.txt");
         let (_, _, _, _, _, p9) = fc_row(&pool, &prefix, &expected_m).await.unwrap();
         assert_eq!(p9, expected_m);
+    }
+
+    /// Task 24.4: a nested subtree is re-keyed into the trash prefix wholesale
+    /// — every descendant path and path_hash, at every depth.
+    #[tokio::test]
+    async fn trash_directory_rekeys_nested_descendants() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        let data_dir = fresh_data_dir();
+        touch(&data_dir.join("admin/files/dir/a.txt"));
+        touch(&data_dir.join("admin/files/dir/sub/deep/b.txt"));
+        for (fid, path, parent, name) in [
+            (7i64, "files/dir", 2i64, "dir"),
+            (8, "files/dir/a.txt", 7, "a.txt"),
+            (9, "files/dir/sub", 7, "sub"),
+            (10, "files/dir/sub/deep", 9, "deep"),
+            (11, "files/dir/sub/deep/b.txt", 10, "b.txt"),
+        ] {
+            sqlx::query::<Sqlite>(&format!(
+                "INSERT INTO {prefix}filecache \
+                 (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+                  size, mtime, storage_mtime, etag, permissions, checksum) \
+                 VALUES ($1, 1, $2, $3, $4, $5, 0, 0, 8, 100, 100, 'etag', 27, '')"
+            ))
+            .bind(fid)
+            .bind(path)
+            .bind(row::path_hash(path))
+            .bind(parent)
+            .bind(name)
+            .execute(test_pool(&pool))
+            .await
+            .unwrap();
+        }
+
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir.clone());
+        fs.delete_dir("files/dir").await.unwrap();
+        let ts = trash_ts(&pool).await;
+
+        for suffix in ["", "/a.txt", "/sub", "/sub/deep", "/sub/deep/b.txt"] {
+            // `fc_row` matches on path_hash, so a stale hash fails the lookup.
+            let expected = format!("files_trashbin/files/dir.d{ts}{suffix}");
+            let (_, _, _, _, _, path) = fc_row(&pool, &prefix, &expected)
+                .await
+                .unwrap_or_else(|| panic!("missing {expected}"));
+            assert_eq!(path, expected);
+        }
+        let stale: i64 = sqlx::query_scalar::<Sqlite, _>(
+            "SELECT COUNT(*) FROM oc_filecache WHERE path LIKE 'files/dir%'",
+        )
+        .fetch_one(test_pool(&pool))
+        .await
+        .unwrap();
+        assert_eq!(stale, 0, "no rows left under the pre-trash prefix");
     }
 
     /// Finding #11: the preview_generation row survives the trash move (it was

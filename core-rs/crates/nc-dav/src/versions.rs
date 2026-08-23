@@ -267,95 +267,47 @@ async fn repath_version_subtree(
     if old_fc == new_fc {
         return;
     }
-    let like = format!("{old_fc}/%");
-    let sql_fetch = format!(
-        "SELECT fileid, path FROM {prefix}filecache \
-         WHERE storage = $1 AND (path = $2 OR path LIKE $3)"
-    );
-    let rows: Vec<(i64, String)> = db_dispatch!(pool, |Db, c| {
-        sqlx::query_as::<Db, (i64, String)>(&sql_fetch)
-            .bind(storage_id)
-            .bind(old_fc)
-            .bind(&like)
-            .fetch_all(c)
-            .await
-            .unwrap_or_default()
-    });
 
-    // The moved node's new parent path (same parent dir for a rename within the
-    // versions tree, but recompute so a nested rename lands under the right dir).
+    // Descendants: path/path_hash only (parents move with the subtree) — one
+    // set-based rekey on Postgres (task 24.3).
+    if let Err(e) = row::rekey_subtree_paths(pool, prefix, storage_id, old_fc, new_fc).await {
+        warn!(error = %e, "rename_versions: failed to repath cache subtree {old_fc}");
+    }
+
+    // The moved node itself: PHP `Cache::move` rewrites path, path_hash, name
+    // AND parent (Cache.php:813-831).  One row, matched by its old hash — the
+    // new parent path is recomputed so a nested rename lands under the right
+    // dir.
     let moved_parent_fc = parent_fc_path(new_fc);
     let moved_parent_id = row::lookup_by_path(pool, prefix, storage_id, &moved_parent_fc)
         .await
         .map(|r| r.fileid);
+    let new_hash = row::path_hash(new_fc);
+    let new_name = new_fc.rsplit('/').next().unwrap_or("").to_string();
+    let old_hash = row::path_hash(old_fc);
 
-    for (fileid, old_path) in rows {
-        let new_path = if old_path == old_fc {
-            new_fc.to_string()
-        } else {
-            format!("{new_fc}{}", &old_path[old_fc.len()..])
-        };
-        let new_hash = row::path_hash(&new_path);
-        if old_path == old_fc {
-            // The moved node itself: PHP `Cache::move` rewrites path, path_hash,
-            // name AND parent.
-            let new_name = new_fc.rsplit('/').next().unwrap_or("").to_string();
-            match moved_parent_id {
-                Some(pid) => {
-                    let sql = format!(
-                        "UPDATE {prefix}filecache SET path=$1, path_hash=$2, name=$3, parent=$4 WHERE fileid=$5"
-                    );
-                    let r = db_dispatch!(pool, |Db, c| {
-                        sqlx::query::<Db>(&sql)
-                            .bind(&new_path)
-                            .bind(&new_hash)
-                            .bind(&new_name)
-                            .bind(pid)
-                            .bind(fileid)
-                            .execute(c)
-                            .await
-                            .map(|_| ())
-                    });
-                    if let Err(e) = r {
-                        warn!(fileid, error = %e, "rename_versions: failed to repath cache row {old_path}");
-                    }
-                }
-                None => {
-                    warn!(new_path, "rename_versions: moved version dir parent not found; leaving parent unchanged");
-                    let sql = format!(
-                        "UPDATE {prefix}filecache SET path=$1, path_hash=$2, name=$3 WHERE fileid=$4"
-                    );
-                    let r = db_dispatch!(pool, |Db, c| {
-                        sqlx::query::<Db>(&sql)
-                            .bind(&new_path)
-                            .bind(&new_hash)
-                            .bind(&new_name)
-                            .bind(fileid)
-                            .execute(c)
-                            .await
-                            .map(|_| ())
-                    });
-                    if let Err(e) = r {
-                        warn!(fileid, error = %e, "rename_versions: failed to repath cache row {old_path}");
-                    }
-                }
-            }
-        } else {
-            // Descendants: path/path_hash only (parents move with the subtree).
-            let sql = format!("UPDATE {prefix}filecache SET path=$1, path_hash=$2 WHERE fileid=$3");
-            let r = db_dispatch!(pool, |Db, c| {
-                sqlx::query::<Db>(&sql)
-                    .bind(&new_path)
-                    .bind(&new_hash)
-                    .bind(fileid)
-                    .execute(c)
-                    .await
-                    .map(|_| ())
-            });
-            if let Err(e) = r {
-                warn!(fileid, error = %e, "rename_versions: failed to repath cache row {old_path}");
-            }
+    let r = match moved_parent_id {
+        Some(pid) => {
+            let sql = format!(
+                "UPDATE {prefix}filecache SET path=$1, path_hash=$2, name=$3, parent=$4 \
+                 WHERE storage=$5 AND path_hash=$6"
+            );
+            db_execute!(pool, &sql, new_fc, &new_hash, &new_name, pid, storage_id, &old_hash)
         }
+        None => {
+            warn!(
+                new_fc,
+                "rename_versions: moved version dir parent not found; leaving parent unchanged"
+            );
+            let sql = format!(
+                "UPDATE {prefix}filecache SET path=$1, path_hash=$2, name=$3 \
+                 WHERE storage=$4 AND path_hash=$5"
+            );
+            db_execute!(pool, &sql, new_fc, &new_hash, &new_name, storage_id, &old_hash)
+        }
+    };
+    if let Err(e) = r {
+        warn!(error = %e, "rename_versions: failed to repath cache row {old_fc}");
     }
 }
 
