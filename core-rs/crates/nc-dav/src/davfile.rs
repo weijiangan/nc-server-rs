@@ -847,7 +847,7 @@ impl DavFile for NcDavFile {
             // Finding #8: PHP materializes the user's `cache/` filecache row on
             // the first files access — the first PUT on a fresh instance shows
             // it (the delete path already materializes it in move_to_trash).
-            crate::filesystem::ensure_lazy_dir_row(
+            crate::cache_rows::ensure_lazy_dir_row(
                 &ctx.pool,
                 &ctx.prefix,
                 ctx.storage_id,

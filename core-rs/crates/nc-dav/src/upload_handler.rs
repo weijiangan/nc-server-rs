@@ -945,7 +945,7 @@ async fn handle_move(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        crate::filesystem::ensure_lazy_dir_row(
+        crate::cache_rows::ensure_lazy_dir_row(
             &state.pool,
             &state.table_prefix,
             storage_id,
