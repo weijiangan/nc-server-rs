@@ -548,6 +548,35 @@ impl DavFile for NcDavFile {
                 .await
                 .map_err(io_to_fs)?;
 
+            // Capture the disk mtime left by the write BEFORE applying the
+            // effective mtime below: the etag-reuse decision (same-second
+            // overwrite, Scanner.php:167-183) must be based on the storage's
+            // actual write-time mtime, not the touched value — matching PHP's
+            // Updater which decides etag reuse from the pre-touch
+            // storage_mtime (Updater.php:173).  The touch below must not
+            // change that decision.
+            let write_mtime = disk_mtime(&ctx.final_path);
+
+            // ── Blocking: disk mtime ← effective mtime ───────────────────────
+            // PHP's simple PUT sets the **disk** file mtime from the effective
+            // mtime (`File.php:351` `View::touch` → `Local::touch` →
+            // `touch()`).  Without this, the renamed file keeps its write-time
+            // mtime while `oc_filecache.mtime`/`storage_mtime` hold the
+            // effective mtime; a later `occ files:scan` then re-derives mtime
+            // from the disk (`Scanner.php:173` — a storage_mtime mismatch
+            // discards the cached mtime) and reverts the media-mtime override.
+            // Match PHP: disk mtime == effective mtime, so a scan sees no
+            // change.  (Chunked MOVE already does this in upload_handler.rs.)
+            let touch_path = ctx.final_path.clone();
+            let t = filetime::FileTime::from_unix_time(use_mtime, 0);
+            if let Err(e) = blocking(move || filetime::set_file_times(&touch_path, t, t)).await {
+                tracing::warn!(
+                    path = %ctx.final_path.display(),
+                    error = %e,
+                    "PUT: failed to set disk mtime from effective mtime"
+                );
+            }
+
             // ── Async: upsert oc_filecache ────────────────────────────────────
             let new_etag = new_etag();
             let checksum = ctx.oc_checksum.as_deref().unwrap_or("");
@@ -562,8 +591,7 @@ impl DavFile for NcDavFile {
                 // overwrite keeps the row's etag, and the version file — a
                 // copy of this row — shares it).  Replicate: reuse the old
                 // etag when the new disk mtime equals the old storage_mtime.
-                let disk_mtime = disk_mtime(&ctx.final_path)
-                    .unwrap_or(use_mtime);
+                let disk_mtime = write_mtime.unwrap_or(use_mtime);
                 let etag_value = if ctx.old_storage_mtime != 0
                     && disk_mtime == ctx.old_storage_mtime
                 {

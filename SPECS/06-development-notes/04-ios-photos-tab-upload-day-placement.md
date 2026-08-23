@@ -133,5 +133,9 @@ scan and the `arrival_anchor` plumbing were deleted (dead).  `mtime.rs`'s
 non-media, missing ctime).  Verification: `cargo test -p nc-dav --lib` green.
 
 Replaced the ">15-minute split" follow-up: the flat rule now covers that case
-by construction.  The live A/B and the simple-PUT disk-mtime gap (finding 5)
-remain open.
+by construction.  The simple-PUT disk-mtime gap (finding 5) is now closed —
+`davfile.rs` flush calls `set_file_times` with the effective mtime (matching
+PHP's `View::touch`), so `occ files:scan` no longer reverts `mtime` from the
+disk.  The etag-reuse decision is deliberately fed the **pre-touch** disk
+mtime so the same-second-overwrite reuse (Scanner.php:167-183) is unchanged.
+The live A/B remains open.
