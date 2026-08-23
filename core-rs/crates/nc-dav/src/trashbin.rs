@@ -286,6 +286,16 @@ impl NcFileSystem {
             }
         }
 
+        // PHP's post_delete hooks run AFTER `removeUpdate` (the source-chain
+        // propagation above), so version cleanup is the final writer of the
+        // root's etag (PHP `basicOperation`: disk-op → `removeUpdate` →
+        // post-hooks; View.php:1248-1282).  Only for hard-deletes — the trash
+        // path uses `trash_versions` (which moves, not deletes).
+        if trash_fc.is_none() {
+            let relative = fc_path.strip_prefix("files/").unwrap_or(fc_path);
+            self.hard_delete_versions(relative, frow.fileid).await;
+        }
+
         Ok(())
     }
 
@@ -776,6 +786,155 @@ impl NcFileSystem {
         }
     }
 
+    /// Hard-delete version cleanup — mirrors PHP's `remove_hook` cascade when
+    /// the trashbin app is disabled (no `move2trash`, so `View::unlink` fires
+    /// `NodeDeletedEvent` → `remove_hook`).
+    ///
+    /// PHP `Storage::delete($path)` (Storage.php:251-269) iterates every
+    /// `files_versions/{relative}.v{ts}` file and calls `View::unlink()` +
+    /// `Cache::remove()` on each — deleting the disk file AND its `oc_filecache`
+    /// + `oc_filecache_extended` rows.  Then `deleteVersionsEntity($node)`
+    /// (FileEventsListener.php:304-319, gated on `$node instanceof File`)
+    /// calls `deleteAllVersionsForFileId($fileid)` (VersionsMapper.php:63-69)
+    /// — an unconditional `DELETE FROM oc_files_versions WHERE file_id = ?`.
+    ///
+    /// Only called for **file** hard-deletes.  Directory hard-delete in PHP
+    /// fires `remove_hook` for the `Folder` node only (raw `Local::rmdir`,
+    /// no per-child `NodeDeletedEvent`), and `deleteVersionsEntity` is skipped
+    /// — so PHP orphans child version files and `oc_files_versions` rows.
+    /// Rust's directory hard-delete matches that behavior (no version cleanup).
+    async fn hard_delete_versions(&self, relative: &str, fileid: i64) {
+        let pool = &self.state.pool;
+        let prefix = &self.state.table_prefix;
+
+        // Unconditional `oc_files_versions` row cleanup — matches PHP
+        // `deleteAllVersionsForFileId` (runs even when no version files exist
+        // on disk; the SUT's PUT creates a row for every write).
+        let sql_del = format!(
+            "DELETE FROM {prefix}files_versions WHERE file_id = $1",
+            prefix = prefix
+        );
+        if let Err(e) = db_execute!(pool, &sql_del, fileid) {
+            warn!(fileid = fileid, error = %e, "hard_delete_versions: oc_files_versions DELETE failed");
+        }
+
+        // Collect version filecache rows + their on-disk paths so we can delete
+        // both in one pass.  PHP `Storage::delete` uses `getVersions()` which
+        // scans `files_versions/{dir}/` for files matching `{basename}.v{ts}`;
+        // the filecache rows mirror those files, so a `LIKE` on the version
+        // prefix matches the same set.
+        let versions_base = format!("files_versions/{relative}");
+        let file_like = format!("{versions_base}.v%");
+        let sql = format!(
+            "SELECT fileid, path FROM {prefix}filecache \
+             WHERE storage = $1 AND path LIKE $2 \
+             ORDER BY path",
+            prefix = prefix
+        );
+        let rows: Vec<(i64, String)> = db_dispatch!(pool, |Db, c| {
+            match sqlx::query::<Db>(&sql)
+                .bind(self.storage_id)
+                .bind(&file_like)
+                .fetch_all(c)
+                .await
+            {
+                Ok(rs) => rs
+                    .into_iter()
+                    .map(|r| (r.get::<i64, _>("fileid"), r.get::<String, _>("path")))
+                    .collect(),
+                Err(e) => {
+                    warn!(error = %e, "hard_delete_versions: version-row query failed");
+                    return;
+                }
+            }
+        });
+        if rows.is_empty() {
+            return;
+        }
+
+        // Delete each version file on disk + its filecache + filecache_extended
+        // rows.  PHP does this one version at a time via `View::unlink()` →
+        // `Cache::remove()` (Cache.php:556-578): the `Cache::remove` deletes
+        // `filecache` + `filecache_extended` for the version's fileid.
+        let ids: Vec<i64> = rows.iter().map(|(fid, _)| *fid).collect();
+        for (_, vpath) in &rows {
+            let disk = self.disk_path(vpath);
+            let d = disk.clone();
+            if let Err(e) = blocking(move || std::fs::remove_file(&d)).await {
+                // Non-fatal: the filecache row still gets deleted below; a
+                // missing disk file is the expected end-state anyway.
+                tracing::debug!(path = %vpath, error = %e, "hard_delete_versions: disk remove failed (may already be gone)");
+            }
+        }
+
+        // Batch-delete the filecache_extended rows for all version fileids.
+        // PHP deletes them one-by-one inside `Cache::remove`; we batch the
+        // DELETE to avoid N round-trips (the outcome is identical).
+        match pool {
+            nc_db::pool::DbPool::Pg(p) => {
+                let sql_ext = format!(
+                    "DELETE FROM {prefix}filecache_extended WHERE fileid = ANY($1::bigint[])",
+                    prefix = prefix
+                );
+                if let Err(e) = sqlx::query::<sqlx::Postgres>(&sql_ext)
+                    .bind(&ids)
+                    .execute(p)
+                    .await
+                {
+                    warn!(error = %e, "hard_delete_versions: batch filecache_extended DELETE failed");
+                }
+                let sql_fc = format!(
+                    "DELETE FROM {prefix}filecache WHERE fileid = ANY($1::bigint[])",
+                    prefix = prefix
+                );
+                if let Err(e) = sqlx::query::<sqlx::Postgres>(&sql_fc)
+                    .bind(&ids)
+                    .execute(p)
+                    .await
+                {
+                    warn!(error = %e, "hard_delete_versions: batch filecache DELETE failed");
+                }
+            }
+            nc_db::pool::DbPool::Sqlite(p) => {
+                let sql_ext =
+                    format!("DELETE FROM {prefix}filecache_extended WHERE fileid = $1", prefix = prefix);
+                let sql_fc =
+                    format!("DELETE FROM {prefix}filecache WHERE fileid = $1", prefix = prefix);
+                for fid in &ids {
+                    if let Err(e) =
+                        sqlx::query::<sqlx::Sqlite>(&sql_ext).bind(fid).execute(p).await
+                    {
+                        warn!(fileid = fid, error = %e, "hard_delete_versions: filecache_extended DELETE failed");
+                    }
+                    if let Err(e) =
+                        sqlx::query::<sqlx::Sqlite>(&sql_fc).bind(fid).execute(p).await
+                    {
+                        warn!(fileid = fid, error = %e, "hard_delete_versions: filecache DELETE failed");
+                    }
+                }
+            }
+        }
+
+        // Propagate etag/mtime + recompute sizes on the `files_versions` chain
+        // — PHP's `View::unlink` on each version file triggers
+        // `Updater::remove` → `propagateChange` + `correctFolderSize(parent)`.
+        // We do one `propagate_change` per distinct version-parent chain (the
+        // `.v{ts}` siblings all share the same `files_versions/{dir}` parent),
+        // then a single `correct_folder_size_chain` from the deepest parent.
+        let now = now_secs();
+        let parent_fc = parent_fc_path(&versions_base);
+        if let Err(e) = self.propagator.propagate_change(&parent_fc, now, 0).await {
+            warn!(path = %parent_fc, error = %e, "hard_delete_versions: files_versions chain propagation failed");
+        }
+        if let Err(e) = self
+            .propagator
+            .correct_folder_size_chain(&parent_fc)
+            .await
+        {
+            warn!(path = %parent_fc, error = %e, "hard_delete_versions: files_versions chain size recompute failed");
+        }
+    }
+
     /// Re-key the version rows that were renamed on disk: path, path_hash,
     /// name and the shared `files_trashbin/versions` parent.
     ///
@@ -842,6 +1001,8 @@ pub(crate) fn trash_fc_name(basename: &str, timestamp: i64) -> String {
 #[cfg(test)]
 mod tests {
     use sqlx::Sqlite;
+
+    use nc_db::pool::DbPool;
 
     use crate::path_utils::disk_mtime;
     use crate::row;
@@ -1468,5 +1629,213 @@ mod tests {
             0,
             "cache row must have no extended row"
         );
+    }
+
+    // ── Hard-delete version cleanup ──────────────────────────────────────
+    //
+    // When the trashbin app is disabled, PHP's `remove_hook` fires after
+    // `View::unlink` (not `move2trash`).  `Storage::delete` deletes the
+    // version FILES on disk + their `oc_filecache` / `oc_filecache_extended`
+    // rows (via `Cache::remove`), and `deleteVersionsEntity` deletes the
+    // `oc_files_versions` metadata rows.  The following tests verify the
+    // Rust hard-delete path replicates this — disabling the trashbin app
+    // routes through `hard_delete_versions` instead of `trash_versions`.
+
+    /// Disable the trashbin app in the test DB so `should_move_to_trash`
+    /// returns false — exercising the hard-delete branch.
+    async fn disable_trashbin(pool: &DbPool) {
+        sqlx::query::<Sqlite>(
+            "UPDATE oc_appconfig SET configvalue = 'no' WHERE appid = 'files_trashbin'",
+        )
+        .execute(test_pool(pool))
+        .await
+        .unwrap();
+    }
+
+    /// Hard-delete of a file deletes its version files on disk, their
+    /// `oc_filecache` + `oc_filecache_extended` rows, and the
+    /// `oc_files_versions` metadata rows — matching PHP's `remove_hook`
+    /// → `Storage::delete` + `deleteVersionsEntity` cascade.
+    #[tokio::test]
+    async fn hard_delete_file_deletes_version_files_and_rows() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        disable_trashbin(&pool).await;
+        let data_dir = fresh_data_dir();
+        touch(&data_dir.join("admin/files/hello.txt"));
+        touch(&data_dir.join("admin/files_versions/hello.txt.v100"));
+
+        // Version filecache row (id 5, parent 6 = files_versions) + an
+        // oc_files_versions metadata row for the source file (id 4).
+        sqlx::query::<Sqlite>(
+            "INSERT INTO oc_filecache \
+             (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+              size, mtime, storage_mtime, etag, permissions, checksum) \
+             VALUES (5, 1, 'files_versions/hello.txt.v100', $1, 6, 'hello.txt.v100', 0, 0, 26, 100, 100, 'etag', 27, '')",
+        )
+        .bind(row::path_hash("files_versions/hello.txt.v100"))
+        .execute(test_pool(&pool))
+        .await
+        .unwrap();
+        sqlx::query::<Sqlite>(
+            "INSERT INTO oc_filecache_extended (fileid, metadata_etag, creation_time, upload_time) \
+             VALUES (5, 'meta', 100, 100)",
+        )
+        .execute(test_pool(&pool))
+        .await
+        .unwrap();
+        sqlx::query::<Sqlite>(
+            "INSERT INTO oc_files_versions (id, file_id, \"timestamp\", size, mimetype, metadata) \
+             VALUES (1, 4, 100, 26, 0, '{\"author\":\"admin\"}')",
+        )
+        .execute(test_pool(&pool))
+        .await
+        .unwrap();
+
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir.clone());
+        fs.delete_file("files/hello.txt").await.unwrap();
+
+        // Version file deleted from disk.
+        assert!(
+            !data_dir.join("admin/files_versions/hello.txt.v100").exists(),
+            "version file must be deleted on disk"
+        );
+
+        // Version filecache row deleted.
+        assert!(
+            fc_row(&pool, &prefix, "files_versions/hello.txt.v100")
+                .await
+                .is_none(),
+            "version filecache row must be deleted"
+        );
+
+        // Version filecache_extended row deleted.
+        let ext_count: i64 = sqlx::query_scalar::<Sqlite, _>(
+            "SELECT COUNT(*) FROM oc_filecache_extended WHERE fileid = 5",
+        )
+        .fetch_one(test_pool(&pool))
+        .await
+        .unwrap();
+        assert_eq!(ext_count, 0, "version filecache_extended row must be deleted");
+
+        // oc_files_versions metadata row deleted.
+        let vcount: i64 = sqlx::query_scalar::<Sqlite, _>("SELECT COUNT(*) FROM oc_files_versions")
+            .fetch_one(test_pool(&pool))
+            .await
+            .unwrap();
+        assert_eq!(vcount, 0, "oc_files_versions row must be deleted");
+
+        // Main file also deleted.
+        assert!(fc_row(&pool, &prefix, "files/hello.txt").await.is_none());
+    }
+
+    /// Hard-delete deletes `oc_files_versions` rows even when no version FILE
+    /// exists on disk — PHP's `deleteVersionsEntity` is unconditional.
+    #[tokio::test]
+    async fn hard_delete_file_deletes_version_row_without_files() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        disable_trashbin(&pool).await;
+        let data_dir = fresh_data_dir();
+        touch(&data_dir.join("admin/files/hello.txt"));
+        sqlx::query::<Sqlite>(
+            "INSERT INTO oc_files_versions (id, file_id, \"timestamp\", size, mimetype, metadata) \
+             VALUES (1, 4, 100, 26, 0, '{\"author\":\"admin\"}')",
+        )
+        .execute(test_pool(&pool))
+        .await
+        .unwrap();
+
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir);
+        fs.delete_file("files/hello.txt").await.unwrap();
+
+        let vcount: i64 = sqlx::query_scalar::<Sqlite, _>("SELECT COUNT(*) FROM oc_files_versions")
+            .fetch_one(test_pool(&pool))
+            .await
+            .unwrap();
+        assert_eq!(
+            vcount, 0,
+            "version rows must be deleted even without version files"
+        );
+    }
+
+    /// Hard-delete of a directory does NOT clean up child version files or
+    /// `oc_files_versions` rows — matching PHP, where `Local::rmdir` uses raw
+    /// `unlink()`/`rmdir()` (no per-child `NodeDeletedEvent`), and
+    /// `deleteVersionsEntity` is gated on `$node instanceof File`.
+    #[tokio::test]
+    async fn hard_delete_directory_leaves_child_versions() {
+        let (pool, prefix, storage_id) = fresh_delete_db().await;
+        disable_trashbin(&pool).await;
+        let data_dir = fresh_data_dir();
+        touch(&data_dir.join("admin/files/dir/a.txt"));
+        touch(&data_dir.join("admin/files_versions/dir/a.txt.v100"));
+
+        // files/dir (id 7) + files/dir/a.txt (id 9) +
+        // files_versions/dir (id 10) + files_versions/dir/a.txt.v100 (id 11).
+        for (fid, path, parent, name) in [
+            (7i64, "files/dir", 2i64, "dir"),
+            (9, "files/dir/a.txt", 7, "a.txt"),
+            (10, "files_versions/dir", 6, "dir"),
+            (11, "files_versions/dir/a.txt.v100", 10, "a.txt.v100"),
+        ] {
+            sqlx::query::<Sqlite>(&format!(
+                "INSERT INTO {prefix}filecache \
+                 (fileid, storage, path, path_hash, parent, name, mimetype, mimepart, \
+                  size, mtime, storage_mtime, etag, permissions, checksum) \
+                 VALUES ($1, 1, $2, $3, $4, $5, 0, 0, 8, 100, 100, 'etag', 27, '')"
+            ))
+            .bind(fid)
+            .bind(path)
+            .bind(row::path_hash(path))
+            .bind(parent)
+            .bind(name)
+            .execute(test_pool(&pool))
+            .await
+            .unwrap();
+        }
+        // Drop the seeded hello.txt row so it doesn't linger under files/.
+        sqlx::query::<Sqlite>("DELETE FROM oc_filecache WHERE fileid = 4")
+            .execute(test_pool(&pool))
+            .await
+            .unwrap();
+        sqlx::query::<Sqlite>(
+            "INSERT INTO oc_files_versions (id, file_id, \"timestamp\", size, mimetype, metadata) \
+             VALUES (1, 9, 100, 8, 0, '{\"author\":\"admin\"}')",
+        )
+        .execute(test_pool(&pool))
+        .await
+        .unwrap();
+
+        let fs = test_fs(pool.clone(), prefix.clone(), storage_id, data_dir.clone());
+        fs.delete_dir("files/dir").await.unwrap();
+
+        // Version file NOT deleted on disk (PHP orphan behavior).
+        assert!(
+            data_dir
+                .join("admin/files_versions/dir/a.txt.v100")
+                .exists(),
+            "directory hard-delete must NOT delete child version files"
+        );
+
+        // Version filecache row NOT deleted.
+        assert!(
+            fc_row(&pool, &prefix, "files_versions/dir/a.txt.v100")
+                .await
+                .is_some(),
+            "directory hard-delete must NOT delete child version filecache rows"
+        );
+
+        // oc_files_versions row NOT deleted (PHP orphan behavior).
+        let vcount: i64 = sqlx::query_scalar::<Sqlite, _>("SELECT COUNT(*) FROM oc_files_versions")
+            .fetch_one(test_pool(&pool))
+            .await
+            .unwrap();
+        assert_eq!(
+            vcount, 1,
+            "directory hard-delete must NOT delete child oc_files_versions rows"
+        );
+
+        // But the main directory subtree IS deleted.
+        assert!(fc_row(&pool, &prefix, "files/dir").await.is_none());
+        assert!(fc_row(&pool, &prefix, "files/dir/a.txt").await.is_none());
     }
 }
