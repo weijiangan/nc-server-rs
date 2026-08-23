@@ -3,9 +3,9 @@
 pub mod appconfig;
 pub mod config;
 pub mod filename_validator;
-pub mod migrate;
 pub mod mime;
 pub mod pool;
+pub mod schema;
 pub mod time;
 
 #[macro_use]

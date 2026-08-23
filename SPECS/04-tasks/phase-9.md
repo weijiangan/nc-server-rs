@@ -11,11 +11,23 @@ Goal: implement the cross-cutting PHP behaviours that execute **inline on the Ru
 ### 9.1 Gap tables — schema awareness (NOT migrations)
 > **PHP owns the schema** (see [`../02-specifications/improvements.md`](../02-specifications/improvements.md) §I.3 and [`../../core-rs/crates/nc-db/src/migrate.rs`](../../core-rs/crates/nc-db/src/migrate.rs)): the `files_trashbin` app and core `tags` code create these tables during PHP install/`occ app:enable`. Rust must **read/write** them, not issue DDL for them. Do **not** add `sqlx` migrations that `CREATE` these tables at runtime — that reintroduces the dual-migration divergence risk §I.3 was written to avoid.
 
-- [ ] Add `oc_files_trash` (REQ §9.4: `auto_id` BIGINT PK AI, `id` VARCHAR(250) = basename, `user` VARCHAR(64), `timestamp` VARCHAR(12), `location` VARCHAR(512), `type` VARCHAR(4) nullable, `mime` VARCHAR(255) nullable, `deleted_by` VARCHAR(64)) and `oc_vcategory` / `oc_vcategory_to_object` (REQ §9.9) to the **startup schema-validation allowlist** — verify they exist and have the critical columns, bail with a clear error if a required table/column is missing (a trash/favorites feature depends on them)
-- [ ] Add the same tables to the **test-only** schema fixtures used by the isolated `nc-db` integration DB (so Rust-only test harnesses can spin up a DB without a full PHP install) — clearly separated from any runtime path
+- [x] Add `oc_files_trash` (REQ §9.4: `auto_id` BIGINT PK AI, `id` VARCHAR(250) = basename, `user` VARCHAR(64), `timestamp` VARCHAR(12), `location` VARCHAR(512), `type` VARCHAR(4) nullable, `mime` VARCHAR(255) nullable, `deleted_by` VARCHAR(64)) and `oc_vcategory` / `oc_vcategory_to_object` (REQ §9.9) to the **startup schema-validation allowlist** — verify they exist and have the critical columns, bail with a clear error if a required table/column is missing (a trash/favorites feature depends on them)
+- [x] Add the same tables to the **test-only** schema fixtures used by the isolated `nc-db` integration DB (so Rust-only test harnesses can spin up a DB without a full PHP install) — clearly separated from any runtime path
 - [ ] Confirm the queries against these tables compile-verify (sqlx) against a PHP-created schema on PostgreSQL, MySQL/MariaDB, and SQLite
 
 **Verify:** starting Rust against a PHP-installed DB that has these tables passes validation; against a DB missing `oc_files_trash` it exits with a clear "run PHP install / enable files_trashbin" error rather than failing mid-request. `cargo test` in `nc-db` builds its isolated test DB and exercises trash/favorites read+write paths.
+
+> **Note (2026-08-24):** the third bullet is stale. The gap-table queries are
+> runtime-bound `format!` + `sqlx::query` strings, not compile-verified `query!`
+> macros, and there is no `.sqlx` offline cache — "compile-verify (sqlx)" does
+> not apply. And per the Postgres-first constitution (only PostgreSQL and
+> SQLite exist), the MySQL/MariaDB wording is out of scope. The real coverage
+> (which is done) is `validate_schema()` in
+> `../../core-rs/crates/nc-db/src/schema.rs` checking these tables/columns, and
+> the isolated `nc-db` test fixture creating them (`tests/schema.rs`).
+
+> **Deviation (2026-08-24):** the allowlist is surfaced through a **manual**
+> `nc-server check-schema` command, not a boot-time gate — see 9.9.
 
 ### 9.2 Cache propagation on write — parent ETag / mtime / size (REQ §6.8) — ✅ IMPLEMENTED
 > PHP source: `lib/private/Files/Cache/Updater.php` (`update`/`remove`/`copyOrRenameFromStorage`) → `lib/private/Files/Cache/Propagator.php` (`propagateChange`).
@@ -139,13 +151,29 @@ independently.
 ### 9.9 Startup schema validation (replaces disabled `migrate!()`)
 > Context: [`../02-specifications/improvements.md`](../02-specifications/improvements.md) §I.3 and [`../../core-rs/crates/nc-db/src/migrate.rs`](../../core-rs/crates/nc-db/src/migrate.rs). PHP owns the schema; `nc_db::migrate::run()` is currently a no-op. Replace it with a fail-fast validation so a mis-provisioned DB is caught at boot, not mid-request.
 
-- [ ] Replace the no-op `nc_db::migrate::run()` with a `validate_schema()` that queries `information_schema` (PostgreSQL/MySQL) / `pragma_table_info` (SQLite) for every table + critical column Rust reads or writes
-- [ ] Coverage = the core+files tables (REQ §9.1–§9.8) **plus** the §9.1 gap tables (`oc_files_trash`, `oc_vcategory`, `oc_vcategory_to_object`)
-- [ ] On a missing table/column: bail at startup with a clear, actionable error (which table/column, and that PHP install / `occ app:enable` must create it) — do **not** attempt DDL
-- [ ] Do **not** re-enable `sqlx::migrate!()` on the runtime path; keep the `migrations/` SQL only for schema docs, sqlx compile-verify, and the isolated `nc-db` test DB
+- [x] Replace the no-op `nc_db::migrate::run()` with a `validate_schema()` that queries `information_schema` (PostgreSQL/MySQL) / `pragma_table_info` (SQLite) for every table + critical column Rust reads or writes
+- [x] Coverage = the core+files tables (REQ §9.1–§9.8) **plus** the §9.1 gap tables (`oc_files_trash`, `oc_vcategory`, `oc_vcategory_to_object`)
+- [x] On a missing table/column: bail at startup with a clear, actionable error (which table/column, and that PHP install / `occ app:enable` must create it) — do **not** attempt DDL
+- [x] Do **not** re-enable `sqlx::migrate!()` on the runtime path; keep the `migrations/` SQL only for schema docs, sqlx compile-verify, and the isolated `nc-db` test DB
 - [ ] Validation runs once at boot, before the HTTP listener opens (same slot the old `migrate!()` occupied in `main.rs`)
 
 **Verify:** boot against a complete PHP-installed DB → validation passes, server starts. Drop `oc_files_trash` → boot fails fast with an error naming the table; no request is served. Remove a critical column from `oc_filecache` → same fail-fast behaviour.
+
+> **Deviation (2026-08-24):** boot-time validation was deliberately **not**
+> implemented — the operator wanted to inspect the schema on demand without
+> taking the server down. The work landed as the one-shot `nc-server
+> check-schema` subcommand (in `nc-server/src/main.rs`): it loads the config,
+> connects to the DB, runs `nc_db::schema::validate_schema()` (read-only catalog
+> queries only), prints every missing table/column, and exits non-zero on
+> mismatch. Startup never runs it and never issues DDL. The `migrate.rs` no-op
+> was removed (replaced by `schema.rs`); `sqlx::migrate!()` stays off the
+> runtime path and the `migrations/` SQL is used only by the isolated `nc-db`
+> test fixture. The context line above links to the deleted `migrate.rs`.
+
+> **Note (2026-08-24):** `validate_schema()` targets PostgreSQL
+> (`information_schema.columns` + `table_name = ANY($1)`) and SQLite
+> (`sqlite_master` + `PRAGMA table_info`). There is no MySQL/MariaDB branch —
+> that dialect is out of scope per the Postgres-first constitution.
 
 ### 9.10 Phase exit criteria
 - [ ] `cargo test --all-features` exits 0 (includes new propagation, trashbin, favorites, and REPORT unit/integration tests)
@@ -155,3 +183,52 @@ independently.
 - [ ] Startup schema validation (§9.9) passes against a PHP-installed DB and fails fast on a missing table/column
 
 **Verify:** the above suites exit 0; manual web-client smoke test confirms stars, tags, deleted-files view, comment badges, and share badges render correctly.
+
+## Changes
+
+### 2026-08-24 — 9.1 + 9.9: schema validation as a manual `check-schema` command
+
+**Decision:** the operator asked for the 9.1/9.9 schema check to be runnable on
+demand ("let me run to just to see if the schema matches") rather than a
+boot-time gate. The boot-time bail (9.9's last checkbox and its Verify text)
+was therefore intentionally not implemented; everything else in 9.1/9.9 landed.
+
+**What landed:**
+- `core-rs/crates/nc-db/src/schema.rs` — `validate_schema(pool, prefix)` +
+  `SchemaReport`, with the required table/column list (`SCHEMA`). Read-only
+  catalog queries only (`information_schema` on Postgres, `sqlite_master` +
+  `PRAGMA table_info` on SQLite); never issues DDL.
+- The three §9.1 gap tables (`oc_files_trash`, `oc_vcategory`,
+  `oc_vcategory_to_object`) plus every other table Rust reads/writes
+  (`oc_comments`, `oc_comments_read_markers`, `oc_systemtag`,
+  `oc_systemtag_object_mapping`, `oc_files_versions`, `oc_preview_generation`,
+  …) are in `SCHEMA`.
+- `core-rs/crates/nc-server/src/main.rs` — `check-schema` subcommand; prints a
+  per-item report and exits 1 on mismatch. The old `nc_db::migrate::run()` no-op
+  call was removed from startup.
+- `core-rs/crates/nc-db/src/migrate.rs` deleted; `pub mod migrate` → `pub mod
+  schema` in `lib.rs`.
+- `core-rs/crates/nc-db/tests/migrations.rs` (pre-existing broken: `&DbPool`
+  no longer implements `Executor` after PHASE-22 T3.3) replaced by
+  `tests/schema.rs`: an isolated SQLite fixture built from the `migrations/`
+  SQL (the sanctioned test-only consumer) + explicit DDL for the PHP-app-owned
+  tables, then `validate_schema` round-trips.
+
+**Key decision — where the column list comes from:** the `SCHEMA` columns are
+grounded in the PHP Doctrine migrations (`workspace/server/core/Migrations/`
+and `apps/*/lib/Migration/`), **not** the Rust `core-rs/migrations/*.sql`, which
+are stale (e.g. they put `creation_time`/`upload_time` on `oc_filecache`, which
+PHP keeps only on `oc_filecache_extended`; `oc_accounts.id` and
+`oc_accounts_data.verified` also don't exist in the live PHP schema). The live
+dev DB was cross-checked against the PHP migrations and matched exactly.
+
+**Verification:**
+- `cargo test -p nc-db` — 39 unit + 5 integration tests pass (full fixture
+  validates; missing table and missing column are reported).
+- `cargo build -p nc-server` — whole dependency chain compiles.
+- `nc-server --root <sqlite-root> check-schema` smoke-tested three ways:
+  empty DB → 24 missing tables, exit 1; complete fixture → pass, exit 0;
+  `oc_files_trash` without `deleted_by` → single missing column, exit 1.
+- The Postgres catalog query (`information_schema.columns` +
+  `table_name = ANY($1)`) was run against the live dev DB and returns the
+  expected tables/column counts.

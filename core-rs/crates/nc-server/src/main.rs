@@ -11,7 +11,7 @@ mod state;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use state::AppState;
 
@@ -26,6 +26,22 @@ struct Args {
     /// Bind address.
     #[arg(long, default_value = "0.0.0.0:7000")]
     listen: String,
+
+    /// One-shot subcommands that run and exit without opening the HTTP listener.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// One-shot operations that never start the HTTP listener.
+#[derive(Subcommand, Debug, Clone, Copy)]
+enum Command {
+    /// Compare the database schema against what nc-server expects (read-only).
+    ///
+    /// Reports any missing table / critical column and exits non-zero on
+    /// mismatch.  The database is never modified — PHP owns the schema
+    /// (improvements.md §I.3), so the fix for a reported gap is always on the
+    /// PHP side (`occ upgrade`, `occ app:enable …`, or a full install).
+    CheckSchema,
 }
 
 // task 23.3: bounded runtime — 2 workers (the target box's cores) and
@@ -40,6 +56,46 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(async_main())
+}
+
+/// Run the `check-schema` subcommand: compare the live DB against the tables +
+/// critical columns `nc-server` reads or writes, print a per-item report, and
+/// exit non-zero when anything is missing.
+///
+/// Read-only — only catalog queries (`information_schema` / `PRAGMA table_info`)
+/// run against the database.  The server is never started and nothing is
+/// created, altered, or dropped (PHP owns the schema).
+async fn run_schema_check(pool: &nc_db::pool::DbPool, prefix: &str) -> anyhow::Result<()> {
+    let report = nc_db::schema::validate_schema(pool, prefix)
+        .await
+        .context("Schema-validation catalog query failed")?;
+
+    if report.is_ok() {
+        println!(
+            "Schema check passed: {} required tables present with all critical columns.",
+            nc_db::schema::SCHEMA.len()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Schema check FAILED — the database does not match what nc-server expects \
+         ({} missing tables, {} missing columns).",
+        report.missing_tables.len(),
+        report.missing_columns.len()
+    );
+    for table in &report.missing_tables {
+        println!("  MISSING TABLE  {table}");
+    }
+    for (table, column) in &report.missing_columns {
+        println!("  MISSING COLUMN {table}.{column}");
+    }
+    println!(
+        "These tables/columns are created by PHP (install, `occ upgrade`, \
+         `occ app:enable files_trashbin`, …), never by nc-server. Fix on the \
+         PHP side and re-run `check-schema`."
+    );
+    std::process::exit(1);
 }
 
 async fn async_main() -> anyhow::Result<()> {
@@ -63,12 +119,15 @@ async fn async_main() -> anyhow::Result<()> {
         .await
         .context("Failed to build database pool")?;
 
-    // ── Migrations ───────────────────────────────────────────────────────────
-    // Currently a no-op: sqlx migrations are disabled because PHP owns the
-    // schema (see SPECS/02-specifications/improvements.md §I.3 and nc_db::migrate::run docs).
-    nc_db::migrate::run(&pool)
-        .await
-        .context("Database migration failed")?;
+    // ── One-shot subcommand: check-schema ────────────────────────────────────
+    // Deliberately NOT a boot-time gate (phase-9 9.9 deviation): the operator
+    // invokes `nc-server check-schema` manually to see whether a PHP-provisioned
+    // database matches what this server was built against.  Startup stays
+    // unblocked — PHP owns the schema (improvements.md §I.3) and a missing
+    // column must not take the server down.
+    if let Some(Command::CheckSchema) = args.command {
+        return run_schema_check(&pool, &config.dbtableprefix).await;
+    }
 
     // ── Startup caches ───────────────────────────────────────────────────────
     let prefix = &config.dbtableprefix;
