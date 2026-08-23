@@ -19,7 +19,9 @@ use nc_auth::AuthInfo;
 use tokio::fs;
 use tracing::warn;
 
+use crate::path_utils::new_etag;
 use crate::{propagator::Propagator, row, versions, NcDavState};
+use nc_db::now_secs;
 use nc_db::{db_dispatch, db_execute};
 
 static H_CSP: HeaderName = HeaderName::from_static("content-security-policy");
@@ -386,10 +388,7 @@ async fn write_file(
         .await
         .map_err(|e| format!("Failed to write file: {}", e))?;
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = now_secs();
 
     let file_mtime = mtime.unwrap_or(now);
 
@@ -398,7 +397,7 @@ async fn write_file(
         warn!(path = %final_disk_path.display(), error = %e, "Failed to set file mtime on bulk upload");
     }
 
-    let etag_raw = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+    let etag_raw = new_etag();
     // PHP getETag() returns quoted etag; JSON-encode doubles the quotes.
     let etag = format!("\"{}\"", etag_raw);
 

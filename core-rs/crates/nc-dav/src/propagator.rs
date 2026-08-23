@@ -13,8 +13,10 @@ use nc_db::pool::{DbPool, DbTxn};
 use sqlx::{Postgres, Row as _, Sqlite};
 use tracing::warn;
 
+use crate::path_utils::new_etag;
 use crate::row;
 use nc_db::db_dispatch;
+use nc_db::now_secs;
 
 /// Drives cache propagation for a single storage.
 ///
@@ -83,10 +85,7 @@ impl Propagator {
         time: i64,
         size_difference: i64,
     ) -> Result<(), String> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = now_secs();
         let time = time.min(now);
 
         let parents = Self::get_parents(internal_path);
@@ -99,7 +98,7 @@ impl Propagator {
         parent_hashes.sort();
 
         // All ancestors get the same etag (PHP line 78).
-        let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+        let etag = new_etag();
 
         for attempt in 0..Self::MAX_RETRIES {
             match self

@@ -37,6 +37,7 @@ use tar::Builder as TarBuilder;
 use zip::write::FileOptions as ZipFileOptions;
 use zip::ZipWriter;
 
+use crate::path_utils::parent_fc_path;
 use crate::row;
 
 static H_CSP: HeaderName = HeaderName::from_static("content-security-policy");
@@ -500,14 +501,6 @@ async fn collect_node(
     }
 
     result
-}
-
-/// Parent fc_path — e.g. "files/Photos" → "files", "files" → "".
-fn parent_fc_path(fc_path: &str) -> String {
-    fc_path
-        .rsplit_once('/')
-        .map(|(parent, _)| parent.to_string())
-        .unwrap_or_default()
 }
 
 // ─── Archive building (buffered, fallback for small archives) ──────────────────

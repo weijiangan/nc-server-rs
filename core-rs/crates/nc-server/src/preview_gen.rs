@@ -25,6 +25,7 @@
 use crate::state::AppState;
 use bytes::Bytes;
 use nc_dav::row::FileCacheRow;
+use nc_db::now_secs;
 use nc_preview::backend::{
     BackendError, ImaginaryClient, PreviewBackend, DEFAULT_MAX_FILESIZE_MIB,
 };
@@ -340,11 +341,4 @@ fn data_dir(state: &AppState) -> std::path::PathBuf {
         .datadirectory
         .clone()
         .unwrap_or_else(|| state.nc_root.join("data"))
-}
-
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }

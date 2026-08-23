@@ -12,8 +12,10 @@ use tracing::warn;
 
 use crate::filesystem::{blocking, io_to_fs};
 use crate::path_utils::{extension, is_trash_extension};
+use crate::path_utils::{new_etag, parent_fc_path};
 use crate::row;
 use crate::NcFileSystem;
+use nc_db::now_secs;
 use nc_db::{db_dispatch, db_execute};
 
 impl NcFileSystem {
@@ -112,11 +114,8 @@ impl NcFileSystem {
                 .await
                 .map_err(|e| format!("mkdir: {e}"))?;
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+            let now = now_secs();
+            let etag = new_etag();
 
             // §10.8: mimetype = httpd/unix-directory, mimepart = httpd.
             // Resolved once at startup (phase-21 S3).
@@ -211,11 +210,7 @@ impl NcFileSystem {
             //   propagations overwrite them) but are the mechanism behind the
             //   oracle's `files_trashbin == files_trashbin/files` etag, and
             //   PHP does the same for MKCOL/PUT ancestor mkdirs.
-            let parent_fc_path = {
-                let mut parts: Vec<&str> = built.split('/').collect();
-                parts.pop();
-                parts.join("/")
-            };
+            let parent_fc_path = parent_fc_path(&built);
             let parent_disk = self.disk_path(&parent_fc_path);
             if let Err(e) = self
                 .propagator
@@ -260,11 +255,7 @@ impl NcFileSystem {
         }
 
         // Look up parent (auto-create if missing, matching PHP).
-        let parent_path = {
-            let mut parts: Vec<&str> = fc_path.split('/').collect();
-            parts.pop();
-            parts.join("/")
-        };
+        let parent_path = parent_fc_path(&fc_path);
         let parent_row = self
             .ensure_parent_dir(&parent_path)
             .await
@@ -276,11 +267,8 @@ impl NcFileSystem {
             .map_err(io_to_fs)?;
 
         // Insert into oc_filecache.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+        let now = now_secs();
+        let etag = new_etag();
 
         // §10.8: mimetype = httpd/unix-directory, mimepart = httpd —
         // hoisted onto the AppState ids (PHASE-22 T8.3).
@@ -348,11 +336,7 @@ impl NcFileSystem {
         .ok_or(FsError::NotFound)?;
 
         // Resolve new parent.
-        let to_parent_fc = {
-            let mut parts: Vec<&str> = to_fc.split('/').collect();
-            parts.pop();
-            parts.join("/")
-        };
+        let to_parent_fc = parent_fc_path(&to_fc);
         let to_parent = row::lookup_by_path(
             &self.state.pool,
             &self.state.table_prefix,
@@ -369,10 +353,7 @@ impl NcFileSystem {
             .await
             .map_err(io_to_fs)?;
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = now_secs();
         let new_name = to_fc.rsplit('/').next().unwrap_or("").to_string();
         let new_hash = row::path_hash(&to_fc);
         let prefix = &self.state.table_prefix;
@@ -500,11 +481,7 @@ impl NcFileSystem {
         // sizeDifference=0 (etag/mtime only).  The immediate source/target
         // parents' sizes are fixed by correctFolderSize (PHP
         // Updater.php:195-204).
-        let from_parent_fc = {
-            let mut parts: Vec<&str> = from_fc.split('/').collect();
-            parts.pop();
-            parts.join("/")
-        };
+        let from_parent_fc = parent_fc_path(&from_fc);
         // PHP `copyOrRenameFromStorage` corrects both direct parents'
         // `storage_mtime` from their disk mtimes (Updater.php:198-201).
         for (parent_fc, label) in [
@@ -605,11 +582,7 @@ impl NcFileSystem {
         )
         .await
         {
-            let to_parent_fc = {
-                let mut parts: Vec<&str> = to_fc.split('/').collect();
-                parts.pop();
-                parts.join("/")
-            };
+            let to_parent_fc = parent_fc_path(&to_fc);
             // PHP's copy scans the target parent into the cache when it's
             // missing (Updater.php:141-148 — the disk copy needs the dir
             // too).  A COPY into a fresh subdir must create it
@@ -626,19 +599,13 @@ impl NcFileSystem {
             )
             .await
             {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
+                let now = now_secs();
                 // The copied row is a CLONE of the source (PHP
                 // `copyFromCache`): it inherits the source's etag and
                 // mtime, drops the checksum (NULL), and takes
                 // `storage_mtime` = the copy time (the copied file's disk
                 // mtime — PHP `updateStorageMTimeOnly`).
-                let etag = from_row
-                    .etag
-                    .clone()
-                    .unwrap_or_else(|| format!("{:032x}", uuid::Uuid::new_v4().as_u128()));
+                let etag = from_row.etag.clone().unwrap_or_else(|| new_etag());
                 let (src_creation, src_upload) = {
                     let ext = row::get_extended(
                         &self.state.pool,
@@ -786,10 +753,7 @@ impl NcFileSystem {
         // §9.2: COPY propagates the target chain with
         // sizeDifference=0 (etag/mtime only), then corrects the
         // immediate target parent size (PHP Updater.php:195-204).
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = now_secs();
         if let Err(e) = self.propagator.propagate_change(&to_fc, now, 0).await {
             tracing::warn!(path = %to_fc, error = %e, "copy: propagation failed");
         }
@@ -881,6 +845,7 @@ impl NcFileSystem {
 
 #[cfg(test)]
 mod tests {
+    use crate::path_utils::parent_fc_path;
     use crate::row;
     use crate::testing::{extended_count, fresh_data_dir, fresh_delete_db, test_fs};
 
@@ -899,14 +864,6 @@ mod tests {
     /// all write paths (PUT, MKCOL, bulk upload).
     fn upload_fc_path(dav_path: &str) -> String {
         crate::row::dav_to_fc_path(dav_path)
-    }
-
-    /// Extract the parent directory from a filecache path, matching the
-    /// logic in `bulk_handler` and `move_to_trash`.
-    fn upload_parent_fc(fc_path: &str) -> String {
-        let mut parts: Vec<&str> = fc_path.split('/').collect();
-        parts.pop();
-        parts.join("/")
     }
 
     /// Build the chain of ancestor paths from a filecache path, matching
@@ -969,20 +926,20 @@ mod tests {
     #[test]
     fn upload_parent_root_level() {
         // Parent of "files/test.txt" is "files".
-        assert_eq!(upload_parent_fc("files/test.txt"), "files");
+        assert_eq!(parent_fc_path("files/test.txt"), "files");
     }
 
     #[test]
     fn upload_parent_nested() {
         assert_eq!(
-            upload_parent_fc("files/Media/Decent photos/001.jpg"),
+            parent_fc_path("files/Media/Decent photos/001.jpg"),
             "files/Media/Decent photos"
         );
     }
 
     #[test]
     fn upload_parent_two_levels() {
-        assert_eq!(upload_parent_fc("files/a/b"), "files/a");
+        assert_eq!(parent_fc_path("files/a/b"), "files/a");
     }
 
     #[test]

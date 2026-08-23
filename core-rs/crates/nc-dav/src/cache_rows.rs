@@ -1,3 +1,4 @@
+use crate::path_utils::new_etag;
 use crate::row;
 use crate::NcDavState;
 use nc_db::db_execute;
@@ -37,7 +38,7 @@ pub(crate) async fn ensure_lazy_cache_row(state: &NcDavState, storage_id: i64, n
         now,
     )
     .await;
-    let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+    let etag = new_etag();
     let sql = format!(
         "UPDATE {prefix}filecache SET etag = $1, storage_mtime = GREATEST(storage_mtime + 60, $2) \
          WHERE storage = $3 AND path = ''",
@@ -95,7 +96,7 @@ pub(crate) async fn ensure_lazy_dir_row(
         .map(|r| r.fileid)
         .unwrap_or(-1);
     let dir_hash = row::path_hash(dir_name);
-    let dir_etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+    let dir_etag = new_etag();
     let sql = format!(
         "INSERT INTO {prefix}filecache \
          (storage, path, path_hash, parent, name, mimetype, mimepart, \

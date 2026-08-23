@@ -1,4 +1,29 @@
+use std::path::Path;
+
 use dav_server::fs::DavProp;
+
+/// The parent of an `oc_filecache` path — `"files/a/b"` → `"files/a"`,
+/// `"files"` → `""` (the storage root).
+pub(crate) fn parent_fc_path(fc_path: &str) -> String {
+    fc_path
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default()
+}
+
+/// A fresh `oc_filecache.etag` in PHP's format: 32 lowercase hex digits.
+pub(crate) fn new_etag() -> String {
+    format!("{:032x}", uuid::Uuid::new_v4().as_u128())
+}
+
+/// A file's mtime as Unix seconds, or `None` when it cannot be read.
+pub(crate) fn disk_mtime(path: impl AsRef<Path>) -> Option<i64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+}
 
 /// Extract the file extension from a filename.
 pub(crate) fn extension(name: &str) -> &str {

@@ -4,6 +4,7 @@ use nc_db::pool::DbPool;
 
 use crate::token::{CachedToken, SharedTokenCache};
 use nc_db::db_execute;
+use nc_db::now_secs;
 
 // ── Hashing ───────────────────────────────────────────────────────────────────
 
@@ -126,10 +127,7 @@ pub async fn lookup_bearer(
     let (id, uid, token_type, scope, expires, last_activity) = row?;
 
     if let Some(exp) = expires {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = now_secs();
         if now > exp {
             return None; // token expired — do not cache
         }
@@ -165,10 +163,7 @@ pub fn evict(raw_token: &str, app_secret: &str, token_cache: &SharedTokenCache) 
 /// Spawns a `tokio` task; the caller is never delayed.  Throttled to
 /// [`ACTIVITY_UPDATE_INTERVAL`] like PHP (round-4 Task 11).
 pub fn spawn_last_activity_update(token_id: i64, last_activity: i64, pool: DbPool, prefix: String) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = now_secs();
     if now - last_activity < ACTIVITY_UPDATE_INTERVAL {
         return;
     }
@@ -189,10 +184,7 @@ const ACTIVITY_UPDATE_INTERVAL: i64 = 60;
 
 /// Blocking portion of the last_activity update (called from the spawned task).
 pub async fn update_last_activity(token_id: i64, pool: &DbPool, prefix: &str) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = now_secs();
     let table = format!("{prefix}authtoken");
     let sql = format!("UPDATE {table} SET last_activity = $1 WHERE id = $2");
     let result = db_execute!(pool, &sql, now, token_id);

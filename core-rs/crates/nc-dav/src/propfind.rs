@@ -20,6 +20,7 @@ use crate::metadata::{NcDirEntry, NcMetaData};
 use crate::path_utils::percent_encode_path;
 use crate::row;
 use crate::NcFileSystem;
+use nc_db::now_secs;
 
 /// Read a value from the per-request batch, or `None` when the node is
 /// outside the batch (caller falls back to the single-row query).
@@ -245,10 +246,7 @@ impl NcFileSystem {
         // statements.
         tracing::debug!(fc_path = %fc_path, storage_id = self.storage_id, "read_dir lazy-cache gate");
         if fc_path.trim_end_matches('/') == "files" {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+            let now = now_secs();
             ensure_lazy_cache_row(&self.state, self.storage_id, now).await;
         }
 

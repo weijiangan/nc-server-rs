@@ -22,7 +22,9 @@ use std::time::SystemTime;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
+use crate::path_utils::new_etag;
 use crate::{propagator::Propagator, row, NcDavState};
+use nc_db::now_secs;
 use nc_db::{db_dispatch, db_execute};
 
 static H_CSP: HeaderName = HeaderName::from_static("content-security-policy");
@@ -753,10 +755,7 @@ async fn handle_move(
     }
 
     // Get current time
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = now_secs();
 
     // Handle X-OC-MTime header (§10.5: validate with PHP MtimeSanitizer)
     let mtime_header = match crate::mtime::sanitize_mtime(
@@ -801,7 +800,7 @@ async fn handle_move(
     }
 
     // Generate ETag (format: quoted 32-char hex UUID)
-    let etag_raw = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+    let etag_raw = new_etag();
     let etag = etag_raw.clone();
 
     // Insert or update oc_filecache — allocate fileid for new files
@@ -908,10 +907,7 @@ async fn handle_move(
             Propagator::new(state.pool.clone(), state.table_prefix.clone(), storage_id);
         // PHP lazily materializes the `uploads/` row on the first upload
         // (finding #24) — the source chain needs it.
-        let now_s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now_s = now_secs();
         crate::cache_rows::ensure_lazy_dir_row(
             &state.pool,
             &state.table_prefix,

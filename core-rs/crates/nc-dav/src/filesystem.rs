@@ -35,6 +35,7 @@ use crate::{
     row::{self, dav_to_fc_path, disk_path},
     NcDavState,
 };
+use nc_db::now_secs;
 
 // ─── NcFileSystem ─────────────────────────────────────────────────────────────
 
@@ -493,10 +494,7 @@ impl DavFileSystem for NcFileSystem {
                     // arrival_anchor captured at open() — the server-observed
                     // request arrival (the fallback window anchors on it).
                     is_media: part_str == "image" || part_str == "video",
-                    arrival_anchor: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64,
+                    arrival_anchor: now_secs(),
                     media_mtime_ctime_fallback: self.state.media_mtime_ctime_fallback,
                     write_result: self.write_result.clone(),
                     put_error: self.put_error.clone(),

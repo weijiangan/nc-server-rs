@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 
 use nc_db::db_dispatch;
+use nc_db::now_secs;
 use nc_db::pool::DbPool;
 
 // ── Extraction ────────────────────────────────────────────────────────────────
@@ -174,10 +175,7 @@ async fn try_app_token(
 
     // Check expiry.
     if let Some(exp) = expires {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = now_secs();
         if now > exp {
             return None;
         }

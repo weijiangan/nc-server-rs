@@ -1,3 +1,4 @@
+use nc_db::now_secs;
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -38,10 +39,7 @@ impl CachedToken {
     /// Returns true if `oc_authtoken.expires` is in the past.
     pub fn is_expired(&self) -> bool {
         if let Some(exp) = self.expires {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+            let now = now_secs();
             now > exp
         } else {
             false

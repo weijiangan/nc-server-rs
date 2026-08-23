@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use nc_db::now_secs;
 use nc_db::{appconfig::SharedAppConfigCache, pool::DbPool};
 use nc_db::{db_execute, db_scalar_one};
 
@@ -218,10 +219,7 @@ pub async fn record_attempt(action: &str, client_ip: &str, pool: &DbPool, prefix
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    now_secs()
 }
 
 /// Derive the /24 (IPv4) or /48 (IPv6) subnet string for grouping attempts.

@@ -17,7 +17,9 @@ use nc_db::mime::SharedMimeCache;
 use nc_db::pool::DbPool;
 use tracing::{debug, warn};
 
+use crate::path_utils::{new_etag, parent_fc_path};
 use crate::row;
+use nc_db::now_secs;
 use nc_db::{db_dispatch, db_execute, db_scalar_one};
 
 /// Save the pre-overwrite file content as a version.
@@ -282,11 +284,7 @@ async fn repath_version_subtree(
 
     // The moved node's new parent path (same parent dir for a rename within the
     // versions tree, but recompute so a nested rename lands under the right dir).
-    let moved_parent_fc = {
-        let mut parts: Vec<&str> = new_fc.split('/').collect();
-        parts.pop();
-        parts.join("/")
-    };
+    let moved_parent_fc = parent_fc_path(new_fc);
     let moved_parent_id = row::lookup_by_path(pool, prefix, storage_id, &moved_parent_fc)
         .await
         .map(|r| r.fileid);
@@ -375,11 +373,7 @@ async fn repath_version_row(
     }
     let new_hash = row::path_hash(new_fc);
     let new_name = new_fc.rsplit('/').next().unwrap_or("").to_string();
-    let new_parent_fc = {
-        let mut parts: Vec<&str> = new_fc.split('/').collect();
-        parts.pop();
-        parts.join("/")
-    };
+    let new_parent_fc = parent_fc_path(new_fc);
     // PHP `Cache::move` recomputes the moved node's parent from the target path.
     match row::lookup_by_path(pool, prefix, storage_id, &new_parent_fc).await {
         Some(parent) => {
@@ -555,11 +549,7 @@ async fn clone_version_file(
     let Some(src) = row::lookup_by_path(pool, prefix, storage_id, old_fc).await else {
         return;
     };
-    let parent_fc = {
-        let mut parts: Vec<&str> = new_fc.split('/').collect();
-        parts.pop();
-        parts.join("/")
-    };
+    let parent_fc = parent_fc_path(new_fc);
     let Some(parent) = row::lookup_by_path(pool, prefix, storage_id, &parent_fc).await else {
         warn!(new_fc, "copy_versions: target parent not found");
         return;
@@ -666,11 +656,7 @@ async fn clone_version_subtree(
         let parent_id = if let Some(p) = remap.get(&old_parent) {
             *p
         } else {
-            let parent_fc = {
-                let mut parts: Vec<&str> = new_path.split('/').collect();
-                parts.pop();
-                parts.join("/")
-            };
+            let parent_fc = parent_fc_path(&new_path);
             match row::lookup_by_path(pool, prefix, storage_id, &parent_fc).await {
                 Some(p) => p.fileid,
                 None => {
@@ -750,14 +736,10 @@ async fn ensure_version_parents(
             }
         } else {
             // Look up the immediate parent.
-            crate::row::lookup_by_path(pool, prefix, storage_id, &{
-                let mut parts: Vec<&str> = built.split('/').collect();
-                parts.pop();
-                parts.join("/")
-            })
-            .await
-            .map(|r| r.fileid)
-            .ok_or_else(|| format!("Parent not found for {built}"))?
+            crate::row::lookup_by_path(pool, prefix, storage_id, &parent_fc_path(&built))
+                .await
+                .map(|r| r.fileid)
+                .ok_or_else(|| format!("Parent not found for {built}"))?
         };
 
         let parent_fileid = parent_fc;
@@ -766,7 +748,7 @@ async fn ensure_version_parents(
         let name = seg.to_string();
         let now = current_timestamp();
 
-        let etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+        let etag = new_etag();
 
         let sql = format!(
             "INSERT INTO {prefix}filecache \
@@ -807,11 +789,7 @@ async fn ensure_version_parents(
         // bumped mtime.  These etag stamps are transient (the copy's
         // propagation overwrites them) but the storage_mtime stamp is the
         // observable parity behavior.
-        let parent_fc = {
-            let mut parts: Vec<&str> = built.split('/').collect();
-            parts.pop();
-            parts.join("/")
-        };
+        let parent_fc = parent_fc_path(&built);
         let parent_disk = crate::row::disk_path(data_dir, uid, &parent_fc);
         if let Err(e) = propagator
             .correct_parent_storage_mtime(&parent_fc, &parent_disk)
@@ -857,11 +835,7 @@ async fn insert_version_row(
     let name = version_fc.rsplit('/').next().unwrap_or("").to_string();
 
     // Look up the immediate parent (must exist after ensure_version_parents).
-    let parent_fc = {
-        let mut parts: Vec<&str> = version_fc.split('/').collect();
-        parts.pop();
-        parts.join("/")
-    };
+    let parent_fc = parent_fc_path(version_fc);
     let parent_id = match row::lookup_by_path(pool, prefix, storage_id, &parent_fc).await {
         Some(r) => r.fileid,
         None => {
@@ -1017,10 +991,7 @@ pub(crate) fn version_metadata_json(author_uid: &str) -> String {
 }
 
 fn current_timestamp() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    now_secs()
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

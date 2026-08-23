@@ -25,8 +25,10 @@ use tokio::task;
 
 use crate::fadvise::Advice;
 use crate::metadata::NcMetaData;
+use crate::path_utils::{disk_mtime, new_etag};
 use crate::propagator::Propagator;
 use nc_db::mime::SharedMimeCache;
+use nc_db::now_secs;
 use nc_db::pool::DbPool;
 use nc_db::{db_execute, db_scalar_one};
 
@@ -460,10 +462,7 @@ impl DavFile for NcDavFile {
             }
 
             // ── Mtime / ctime resolution ──────────────────────────────────────
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+            let now = now_secs();
             let use_mtime        = ctx.x_oc_mtime.unwrap_or(now);
             // §10.5 + improvements.md: the media-mtime fallback.  Media uploads
             // whose X-OC-MTime matches the iOS client's `?? Date()` upload-instant
@@ -555,7 +554,7 @@ impl DavFile for NcDavFile {
                 .map_err(io_to_fs)?;
 
             // ── Async: upsert oc_filecache ────────────────────────────────────
-            let new_etag = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+            let new_etag = new_etag();
             let checksum = ctx.oc_checksum.as_deref().unwrap_or("");
             let pool     = &ctx.pool;
             let prefix   = &ctx.prefix;
@@ -568,11 +567,7 @@ impl DavFile for NcDavFile {
                 // overwrite keeps the row's etag, and the version file — a
                 // copy of this row — shares it).  Replicate: reuse the old
                 // etag when the new disk mtime equals the old storage_mtime.
-                let disk_mtime = std::fs::metadata(&ctx.final_path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
+                let disk_mtime = disk_mtime(&ctx.final_path)
                     .unwrap_or(use_mtime);
                 let etag_value = if ctx.old_storage_mtime != 0
                     && disk_mtime == ctx.old_storage_mtime

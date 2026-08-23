@@ -13,8 +13,10 @@ use dav_server::fs::FsError;
 
 use crate::cache_rows::ensure_lazy_dir_row;
 use crate::filesystem::{blocking, io_to_fs};
+use crate::path_utils::{disk_mtime, parent_fc_path};
 use crate::row;
 use crate::NcFileSystem;
+use nc_db::now_secs;
 use nc_db::{db_dispatch, db_execute};
 
 impl NcFileSystem {
@@ -145,10 +147,7 @@ impl NcFileSystem {
         // hard-deleted.  The trash-chain propagation runs first and the
         // source chain last (PHP's Updater::remove is the final root etag
         // writer — see delete_file for the full ordering rationale).
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = now_secs();
         if let Some(tfc) = trash_fc.as_deref() {
             self.propagate_trash_target(fc_path, tfc, now).await;
         }
@@ -240,10 +239,7 @@ impl NcFileSystem {
             }
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = now_secs();
 
         // PHP `renameFromStorage` target-chain side effects
         // (`copyOrRenameFromStorage`, Updater.php:192-204): the trash ancestors
@@ -362,10 +358,7 @@ impl NcFileSystem {
         row: &row::FileCacheRow,
     ) -> Result<String, FsError> {
         let relative = fc_path.strip_prefix("files/").unwrap_or(fc_path);
-        let mut now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let mut now = now_secs();
 
         // PHP Trashbin::move2trash() uses pathinfo():
         //   $filename = pathinfo($ownerPath)['basename'];  // e.g. "test.txt"
@@ -410,11 +403,7 @@ impl NcFileSystem {
         }
 
         // Ensure the trash parent exists in filecache.
-        let trash_parent_fc = {
-            let mut parts: Vec<&str> = trash_fc.split('/').collect();
-            parts.pop();
-            parts.join("/")
-        };
+        let trash_parent_fc = parent_fc_path(&trash_fc);
         self.ensure_parent_dir(&trash_parent_fc)
             .await
             .map_err(|_| FsError::NotFound)?;
@@ -507,12 +496,7 @@ impl NcFileSystem {
 
         // PHP `updateStorageMTimeOnly($target)` (Updater.php:207-220): the
         // moved file's own `storage_mtime` ← its disk mtime (mtime untouched).
-        let disk_mtime = std::fs::metadata(&to_disk)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(now);
+        let disk_mtime = disk_mtime(&to_disk).unwrap_or(now);
         let sql_sm = format!(
             "UPDATE {prefix}filecache SET storage_mtime = $1 WHERE fileid = $2",
             prefix = self.state.table_prefix
@@ -813,6 +797,7 @@ pub(crate) fn trash_fc_name(basename: &str, timestamp: i64) -> String {
 mod tests {
     use sqlx::Sqlite;
 
+    use crate::path_utils::disk_mtime;
     use crate::row;
     use crate::testing::{
         etag_of, extended_count, fc_row, fresh_data_dir, fresh_delete_db, test_fs, test_pool,
@@ -1034,12 +1019,7 @@ mod tests {
         assert_eq!(size, 26);
         assert_eq!(mtime, 100, "trashed file must keep its original mtime");
         assert_eq!(trash_path, expected);
-        let disk_mtime = std::fs::metadata(data_dir.join("admin").join(&trash_path))
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap();
+        let disk_mtime = disk_mtime(data_dir.join("admin").join(&trash_path)).unwrap();
         assert!(
             (storage_mtime - disk_mtime).abs() <= 1,
             "storage_mtime {storage_mtime} should be the disk mtime {disk_mtime}"
@@ -1084,12 +1064,7 @@ mod tests {
         // Source chain: files/ loses the 26 bytes.
         let (_, size, _, storage_mtime, _, _) = fc_row(&pool, &prefix, "files").await.unwrap();
         assert_eq!(size, 74, "files/ must lose the trashed file's size");
-        let files_disk_mtime = std::fs::metadata(data_dir.join("admin/files"))
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap();
+        let files_disk_mtime = disk_mtime(data_dir.join("admin/files")).unwrap();
         assert!(
             (storage_mtime - files_disk_mtime).abs() <= 1,
             "files/ storage_mtime {storage_mtime} should be its disk mtime {files_disk_mtime}"
@@ -1366,12 +1341,7 @@ mod tests {
         fs.delete_file("files/hello.txt").await.unwrap();
 
         let (_, _, _, root_sm, _, _) = fc_row(&pool, &prefix, "").await.unwrap();
-        let disk_mtime = std::fs::metadata(data_dir.join("admin"))
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap();
+        let disk_mtime = disk_mtime(data_dir.join("admin")).unwrap();
         assert!(
             (root_sm - disk_mtime).abs() <= 1,
             "root storage_mtime {root_sm} should be the root dir's disk mtime {disk_mtime}"
