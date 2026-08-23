@@ -23,6 +23,7 @@ Phase-by-phase execution tracking. Each phase is intentionally kept as a single 
   - [`phase-22.md`](phase-22.md) — Remaining plan items T6-T10 — ⬜
   - [`phase-23.md`](phase-23.md) — Deployment-profile tuning — ⬜
   - [`phase-24.md`](phase-24.md) — Write-path batch: subtree-level operations — ⬜
+  - [`phase-25.md`](phase-25.md) — Write-path duplication: shared row builders — ⬜
 
 ## Related
 - How to write/track tasks: [`../05-llm-playbooks/README.md`](../05-llm-playbooks/README.md)

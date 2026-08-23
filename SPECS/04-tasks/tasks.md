@@ -26,6 +26,7 @@ Each phase lives in its own file for context-size management:
 | 22 — Remaining plan items T6-T10 (filtering/merges, native pool, CTE, write path, pipelining, cleanup, index audit) | [phase-22.md](phase-22.md) | ⬜ Not started |
 | 23 — Deployment-profile tuning (2-core, HDD, localhost Postgres) | [phase-23.md](phase-23.md) | ⬜ Not started |
 | 24 — Write-path batch: subtree-level operations (MOVE / DELETE-to-trash) | [phase-24.md](phase-24.md) | ⬜ Not started |
+| 25 — Write-path duplication: shared row builders (filecache INSERT, mimetype resolution, row re-key) | [phase-25.md](phase-25.md) | ⬜ Not started |
 
 | Deferred improvements (nice-to-have) | [../02-specifications/improvements.md](../02-specifications/improvements.md) | ⬜ |
 
