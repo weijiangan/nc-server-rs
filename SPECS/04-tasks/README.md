@@ -21,6 +21,8 @@ Phase-by-phase execution tracking. Each phase is intentionally kept as a single 
   - [`phase-18.md`](phase-18.md) — Performance improvements (flamegraph rounds 1-4) — ✅
   - [`phase-21.md`](phase-21.md) — DAV read-path round-trip reduction, Tier 1 — ✅
   - [`phase-22.md`](phase-22.md) — Remaining plan items T6-T10 — ⬜
+  - [`phase-23.md`](phase-23.md) — Deployment-profile tuning — ⬜
+  - [`phase-24.md`](phase-24.md) — Write-path batch: subtree-level operations — ⬜
 
 ## Related
 - How to write/track tasks: [`../05-llm-playbooks/README.md`](../05-llm-playbooks/README.md)

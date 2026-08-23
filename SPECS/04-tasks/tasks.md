@@ -24,6 +24,8 @@ Each phase lives in its own file for context-size management:
 | 18 — Performance improvements (flamegraph rounds 1-4) | [phase-18.md](phase-18.md) | ✅ Complete |
 | 21 — DAV read-path round-trip reduction, Tier 1 | [phase-21.md](phase-21.md) | ✅ Complete |
 | 22 — Remaining plan items T6-T10 (filtering/merges, native pool, CTE, write path, pipelining, cleanup, index audit) | [phase-22.md](phase-22.md) | ⬜ Not started |
+| 23 — Deployment-profile tuning (2-core, HDD, localhost Postgres) | [phase-23.md](phase-23.md) | ⬜ Not started |
+| 24 — Write-path batch: subtree-level operations (MOVE / DELETE-to-trash) | [phase-24.md](phase-24.md) | ⬜ Not started |
 
 | Deferred improvements (nice-to-have) | [../02-specifications/improvements.md](../02-specifications/improvements.md) | ⬜ |
 
