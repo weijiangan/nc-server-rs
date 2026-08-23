@@ -521,6 +521,9 @@ async fn insert_version_clone(
 ) -> i64 {
     let hash = row::path_hash(new_fc);
     let name = new_fc.rsplit('/').next().unwrap_or("").to_string();
+    // `checksum` and `etag` are bound as Option to preserve NULL — PHP's
+    // `Cache::copyFromCache` clones the source row as-is, and a NULL checksum
+    // (the common case for un-scanned files) must stay NULL, not "".
     let sql = format!(
         "INSERT INTO {prefix}filecache \
          (storage, path, path_hash, parent, name, mimetype, mimepart, size, mtime, \
@@ -540,9 +543,9 @@ async fn insert_version_clone(
         src.size,
         src.mtime,
         src.storage_mtime,
-        src.etag.as_deref().unwrap_or(""),
+        src.etag.as_deref(),
         src.permissions,
-        src.checksum.as_deref().unwrap_or("")
+        src.checksum.as_deref()
     );
     let new_id = match fetched {
         Ok(id) => id,
@@ -940,6 +943,115 @@ pub(crate) async fn insert_version_entity(
 /// `to_string` is compact and escapes the same characters PHP does.
 pub(crate) fn version_metadata_json(author_uid: &str) -> String {
     serde_json::json!({ "author": author_uid }).to_string()
+}
+
+/// Sync `oc_files_versions` rows with filesystem version files — PHP's
+/// `getVersionsForFile` "read that writes" (LegacyVersionsBackend.php:48-147).
+///
+/// PHP's `VersionManager::createVersionEntity` calls `getVersionsForFile`,
+/// which groups DB rows and filesystem `.v{ts}` files by revision.  Any
+/// filesystem version lacking a DB row gets one inserted with `metadata=[]`
+/// and the version file's size/mimetype/timestamp.  This is how a COPY ends up
+/// with a `metadata=[]` row at the version's old mtime alongside the
+/// `createVersionEntity` row at the current mtime.
+///
+/// `fc_path` is the filecache path (e.g. `files/ver-copied.txt`).
+/// `target_fileid` is the fileid of the file whose versions we're syncing.
+pub(crate) async fn sync_version_entities(
+    pool: &DbPool,
+    prefix: &str,
+    data_dir: &Path,
+    uid: &str,
+    mime_cache: &SharedMimeCache,
+    target_fileid: i64,
+    fc_path: &str,
+) {
+    let relative = match fc_path.strip_prefix("files/") {
+        Some(r) => r,
+        None => return,
+    };
+
+    // Scan files_versions/{dir}/ for {basename}.v{ts} files.
+    let versions_dir =
+        crate::row::disk_path(data_dir, uid, &format!("files_versions/{relative}"));
+    let parent_dir = match versions_dir.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    let basename = match versions_dir.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+
+    let mut entries = match tokio::fs::read_dir(parent_dir).await {
+        Ok(e) => e,
+        Err(_) => return, // no versions directory yet
+    };
+
+    // Collect (timestamp, size) from .v{ts} files on disk.
+    let mut fs_versions: Vec<(i64, i64)> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        // Match {basename}.v{digits}
+        if let Some(suffix) = name_str.strip_prefix(&basename) {
+            if let Some(ts_str) = suffix.strip_prefix(".v") {
+                if let Ok(ts) = ts_str.parse::<i64>() {
+                    if let Ok(meta) = tokio::fs::metadata(entry.path()).await {
+                        fs_versions.push((ts, meta.len() as i64));
+                    }
+                }
+            }
+        }
+    }
+
+    if fs_versions.is_empty() {
+        return;
+    }
+
+    // Fetch existing DB version rows for this file.
+    let sql_existing = format!(
+        "SELECT \"timestamp\" FROM {prefix}files_versions WHERE file_id = $1"
+    );
+    let existing_ts: Vec<i64> = db_dispatch!(pool, |Db, c| {
+        sqlx::query_as::<Db, (i64,)>(&sql_existing)
+            .bind(target_fileid)
+            .fetch_all(c)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(ts,)| ts)
+            .collect()
+    });
+
+    // Insert a row for each filesystem version that lacks a DB row.
+    for (ts, size) in &fs_versions {
+        if existing_ts.contains(ts) {
+            continue;
+        }
+        // PHP inserts with the version file's mimetype (detected from the
+        // basename, not the .v suffix).  For text files this is text/plain.
+        let mime_str = mime_guess::from_path(&basename)
+            .first_raw()
+            .unwrap_or("application/octet-stream");
+        let mime_id = nc_db::mime::get_or_insert_mime_id(
+            pool,
+            prefix,
+            mime_cache,
+            mime_str,
+        )
+        .await;
+        let insert_sql = format!(
+            "INSERT INTO {prefix}files_versions (file_id, \"timestamp\", size, mimetype, metadata) \
+             VALUES ($1, $2, $3, $4, '[]'::json)"
+        );
+        if let Err(e) = db_execute!(pool, &insert_sql, target_fileid, ts, size, mime_id) {
+            warn!(target_fileid, ts, error = %e, "sync_version_entities: INSERT failed");
+        }
+    }
 }
 
 fn current_timestamp() -> i64 {

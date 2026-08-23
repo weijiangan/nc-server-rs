@@ -163,13 +163,15 @@ const SPECS: &[TableSpec] = &[
             KeyPart::Col("mime"),
         ],
     },
-    // One version row per (file) for the scenarios considered; a file with
-    // multiple same-size versions would need `timestamp` in the key, but that is
-    // volatile — revisit when a versioning scenario lands.
+    // Natural key is (file_id, timestamp) — a file can have multiple version
+    // rows at different revision timestamps.  `timestamp` is classified
+    // `volatile_independent` for VALUE comparison (masked to a constant), but
+    // in the natural key it uses the raw value so rows at different revisions
+    // don't collapse into one entry.
     TableSpec {
         name: "oc_files_versions",
         pk: "id",
-        key: &[KeyPart::FkCol("file_id")],
+        key: &[KeyPart::FkCol("file_id"), KeyPart::Col("timestamp")],
     },
     TableSpec {
         name: "oc_preview_generation",

@@ -44,11 +44,17 @@
     - 25_preview_image
     - 26_preview_unpreviewable
     - 27_imaginary_preview
+    - 28_move_versioned_file
+    - 29_copy_versioned_file
   table: oc_filecache
   # Canonical natural key: the storage label + the path concatenated — the
   # home root row's key is exactly "home::admin" (empty path).
   key: "home::admin\u0001"
-  columns: [size]
+  # `mtime` too: the root's mtime is always timing noise (both sides
+  # propagate `time()`), but it's bundled on the same row as the accepted
+  # size divergence.  Covering it here prevents `replay-second-boundary`
+  # from matching first and masking the real size divergence as noise.
+  columns: [size, mtime]
 
 - id: checksum-verification
   why: >-
@@ -133,11 +139,15 @@
     - 25_preview_image
     - 26_preview_unpreviewable
     - 27_imaginary_preview
+    - 28_move_versioned_file
+    - 29_copy_versioned_file
   table: oc_filecache
   key: ""
   # `mtime` too: 18's stable_overrides compare mtime verbatim, and the
   # sequential replay's second-boundary straddle shows as a before-mtime
   # label difference (the after-values are the same generation instant).
+  # 29's stable_overrides also compare storage_mtime verbatim — the COPY
+  # target's storage_mtime is `now()` which straddles the same boundary.
   columns: [size, etag, mtime, storage_mtime]
 
 # The nc-server's background-job loop (and PHP's request-triggered cron) bump

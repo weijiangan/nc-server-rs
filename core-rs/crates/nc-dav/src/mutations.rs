@@ -547,6 +547,24 @@ impl NcFileSystem {
             }
         }
 
+        // §9.4: propagate etag/mtime + recompute size on the files_versions
+        // chain after renaming version files.  Runs LAST so root and
+        // files_versions share the final etag (matching PHP — the version
+        // file renames' `copyOrRenameFromStorage` propagations are the last
+        // to fire via the post-rename hook → `Storage::renameOrCopy`).
+        let to_rel = to_fc.strip_prefix("files/").unwrap_or(&to_fc);
+        let versions_fc = format!("files_versions/{to_rel}");
+        if let Err(e) = self.propagator.propagate_change(&versions_fc, now, 0).await {
+            tracing::warn!(path = %versions_fc, error = %e, "move: versions propagation failed");
+        }
+        if let Err(e) = self
+            .propagator
+            .correct_folder_size_chain(&versions_fc)
+            .await
+        {
+            tracing::warn!(path = %versions_fc, error = %e, "move: versions size recompute failed");
+        }
+
         Ok(())
     }
 
@@ -720,11 +738,15 @@ impl NcFileSystem {
 
                     // §9.4: insert oc_files_versions for the copied file.
                     // Matches PHP NodeCreatedEvent → created() → createVersionEntity().
+                    // The timestamp is the file's mtime (createVersionEntity uses
+                    // $file->getMTime()), and the metadata is {"author":uid} —
+                    // PHP's VersionAuthorListener fires on NodeWrittenEvent (which
+                    // copy dispatches via postWrite) and sets the author metadata.
                     crate::versions::insert_version_entity(
                         &self.state.pool,
                         &self.state.table_prefix,
                         fid,
-                        now,
+                        from_row.mtime,
                         from_row.size,
                         copy_mid,
                         &self.uid,
@@ -758,21 +780,78 @@ impl NcFileSystem {
         )
         .await;
 
-        // §9.2: COPY propagates the target chain with
+        // §9.4: sync oc_files_versions rows for the copied version files.
+        // PHP's createVersionEntity calls getVersionsForFile, which scans the
+        // filesystem for .v{ts} files and inserts oc_files_versions rows (with
+        // metadata=[]) for any lacking a DB row.  This is the "read that
+        // writes" pattern (AGENTS.md rule 7).  Must run AFTER copy_versions
+        // so the copied .v{ts} files exist on disk.
+        if let Some(copy_row) = row::lookup_by_path(
+            &self.state.pool,
+            &self.state.table_prefix,
+            self.storage_id,
+            &to_fc,
+        )
+        .await
+        {
+            crate::versions::sync_version_entities(
+                &self.state.pool,
+                &self.state.table_prefix,
+                &self.state.data_directory,
+                &self.uid,
+                &self.state.mime_cache,
+                copy_row.fileid,
+                &to_fc,
+            )
+            .await;
+        }
+
+        // §9.2: COPY propagates the target chain FIRST with
         // sizeDifference=0 (etag/mtime only), then corrects the
         // immediate target parent size (PHP Updater.php:195-204).
+        //
+        // §9.4: the versions-chain propagation MUST run AFTER the
+        // target-chain.  PHP's `View::copy` dispatches `copyUpdate` →
+        // `copyOrRenameFromStorage` for the main file FIRST (target
+        // chain), then the post-copy hooks fire → `copy_hook` →
+        // `Storage::renameOrCopy('copy')` → `View::copy` for each version
+        // file → another `copyOrRenameFromStorage` for the versions
+        // subtree.  Since `propagateChange` generates a new etag per call
+        // and the versions-chain runs last, root and `files_versions`
+        // share the final etag — not root and `files`.
         let now = now_secs();
         if let Err(e) = self.propagator.propagate_change(&to_fc, now, 0).await {
             tracing::warn!(path = %to_fc, error = %e, "copy: propagation failed");
         }
         // Size-ONLY (PHP correctFolderSize never touches etag/mtime — the
         // standalone correct_folder_size would re-stamp the root after
-        // the target-chain etag and break `root == files`).  Chained on
+        // the target-chain etag and break `root == files_versions`).  Chained on
         // the TARGET so the copy's own parent (e.g. a freshly-created
         // subdir) gets its size recomputed from the new child
         // (live-verified: the oracle's copy-dir carries the copy's size).
         if let Err(e) = self.propagator.correct_folder_size_chain(&to_fc).await {
             tracing::warn!(path = %to_fc, error = %e, "copy: correct_folder_size_chain failed");
+        }
+
+        // §9.4: propagate etag/mtime + recompute size on the files_versions
+        // chain AFTER copying version files.  Runs LAST so root and
+        // files_versions share the final etag (matching PHP — the version
+        // file copies' `copyOrRenameFromStorage` propagations are the last
+        // to fire).  The copied .v{ts} file's filecache row was inserted
+        // by clone_version_file; the parent dir needs etag/mtime
+        // propagation (size_difference=0) and a size recompute from its
+        // children.
+        let to_rel = to_fc.strip_prefix("files/").unwrap_or(&to_fc);
+        let versions_fc = format!("files_versions/{to_rel}");
+        if let Err(e) = self.propagator.propagate_change(&versions_fc, now, 0).await {
+            tracing::warn!(path = %versions_fc, error = %e, "copy: versions propagation failed");
+        }
+        if let Err(e) = self
+            .propagator
+            .correct_folder_size_chain(&versions_fc)
+            .await
+        {
+            tracing::warn!(path = %versions_fc, error = %e, "copy: versions size recompute failed");
         }
 
         Ok(())
