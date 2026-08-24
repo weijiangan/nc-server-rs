@@ -16,6 +16,17 @@ pub(crate) fn new_etag() -> String {
     format!("{:032x}", uuid::Uuid::new_v4().as_u128())
 }
 
+/// PHP's global DAV file id — `DavUtil::getDavFileId()`
+/// (`lib/public/Files/DavUtil.php:26-30`): the fileid zero-padded to 8
+/// digits followed by the instance id, e.g. `"00408337ocecf7uk5jlr"`.
+///
+/// This is the value PHP puts in the `OC-FileId` response header on every
+/// write (PUT/COPY/MOVE via `FilesPlugin::sendFileIdHeader`), and it is the
+/// string the iOS client uses as the `ocId` primary key of its local rows.
+pub(crate) fn dav_file_id(fileid: i64, instance_id: &str) -> String {
+    format!("{:08}{}", fileid, instance_id)
+}
+
 /// A file's mtime as Unix seconds, or `None` when it cannot be read.
 pub(crate) fn disk_mtime(path: impl AsRef<Path>) -> Option<i64> {
     std::fs::metadata(path)
@@ -132,7 +143,7 @@ pub(crate) fn parse_iso8601(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extension, is_trash_extension, parse_iso8601};
+    use super::{dav_file_id, extension, is_trash_extension, parse_iso8601};
 
     #[test]
     fn iso8601_z_suffix() {
@@ -183,5 +194,28 @@ mod tests {
         assert!(!is_trash_extension("d")); // too short
         assert!(!is_trash_extension("dx123")); // has non-digit
         assert!(!is_trash_extension("")); // empty
+    }
+
+    // ── OC-FileId global DAV id (note 07) ────────────────────────────────
+
+    #[test]
+    fn dav_file_id_zero_pads_to_8_digits() {
+        assert_eq!(
+            dav_file_id(408337, "ocecf7uk5jlr"),
+            "00408337ocecf7uk5jlr"
+        );
+    }
+
+    #[test]
+    fn dav_file_id_keeps_wide_ids_unaltered() {
+        assert_eq!(
+            dav_file_id(123456789, "ocabc"),
+            "123456789ocabc"
+        );
+    }
+
+    #[test]
+    fn dav_file_id_empty_instance() {
+        assert_eq!(dav_file_id(42, ""), "00000042");
     }
 }

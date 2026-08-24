@@ -975,19 +975,26 @@ async fn handle_move(
         StatusCode::CREATED
     };
 
+    // OC-FileId: PHP's global DAV id — zero-padded fileid + instance id
+    // (`DavUtil::getDavFileId`, lib/public/Files/DavUtil.php:26-30), NOT the
+    // bare numeric id.  The iOS client keys its local media rows on this
+    // header, so a bare id makes it diverge from the SEARCH/PROPFIND `oc:id`
+    // and duplicates the Media-tab cell (note 07).
+    let dav_file_id = crate::path_utils::dav_file_id(
+        existing_row
+            .as_ref()
+            .map(|r| r.fileid)
+            .unwrap_or(fid),
+        &state.instance_id,
+    );
+
     let mut builder = http::Response::builder()
         .status(status)
         .header(
             H_CSP.clone(),
             HeaderValue::from_static("default-src 'none';"),
         )
-        .header(
-            HeaderName::from_static("oc-fileid"),
-            existing_row
-                .as_ref()
-                .map(|r| r.fileid.to_string())
-                .unwrap_or_else(|| fid.to_string()),
-        )
+        .header(HeaderName::from_static("oc-fileid"), dav_file_id)
         .header(HeaderName::from_static("etag"), format!("\"{}\"", &etag))
         .header(HeaderName::from_static("oc-etag"), format!("\"{}\"", &etag));
 

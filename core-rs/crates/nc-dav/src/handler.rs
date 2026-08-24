@@ -523,6 +523,7 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
     let prefix_ref = state.table_prefix.clone();
     let strip_ref = strip_prefix.clone();
     let mime_cache_ref = state.mime_cache.clone();
+    let instance_id_ref = state.instance_id.as_ref().clone();
 
     // ── Intercept DELETE for directories ──────────────────────────────────
     //
@@ -743,7 +744,14 @@ pub async fn dav_handler(State(state): State<NcDavState>, req: Request) -> Respo
     // dav-server from the pre-write metadata is overwritten with the fresh one.
     if let Ok(guard) = write_result.lock() {
         if let Some(ref wr) = *guard {
-            if let Ok(v) = HeaderValue::from_str(&wr.fileid.to_string()) {
+            // OC-FileId: PHP's global DAV id — zero-padded fileid + instance
+            // id (`DavUtil::getDavFileId`, lib/public/Files/DavUtil.php:26-30),
+            // NOT the bare numeric id.  The iOS client keys its local media
+            // rows on this header, so a bare id makes it diverge from the
+            // SEARCH/PROPFIND `oc:id` and duplicates the Media-tab cell
+            // (note 07).
+            let dav_file_id = crate::path_utils::dav_file_id(wr.fileid, &instance_id_ref);
+            if let Ok(v) = HeaderValue::from_str(&dav_file_id) {
                 parts.headers.insert(H_OC_FILEID.clone(), v);
             }
             // ETag: quoted, per RFC 4918 §8.8 (PHASE-5.3)

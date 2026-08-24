@@ -502,7 +502,7 @@ async fn write_file(
     .await;
 
     // fileid: PHP DavUtil::getDavFileId() formats as zero-padded 8-char id + instanceId.
-    let dav_file_id = format!("{:08}{}", fid, instance_id);
+    let dav_file_id = crate::path_utils::dav_file_id(fid, instance_id);
 
     // permissions: for a newly created file owned by the user, perms=27
     // (READ|UPDATE|DELETE|SHARE), file, not shared, not mounted, renamable.
