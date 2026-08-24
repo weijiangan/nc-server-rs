@@ -1,0 +1,167 @@
+# Phase-24 scaling probe — DELETE a deeply nested tree (50 files, 5 levels) to trash.
+# Stresses the set-based descendant rekey into the trash prefix and the batched
+# trash_versions filecache UPDATE (24.5). Same tree shape as 33_deep_move_50.
+name: 34_deep_delete_50
+ops:
+  - op: mkcol
+    path: /remote.php/dav/files/admin/deep-root
+  - op: mkcol
+    path: /remote.php/dav/files/admin/deep-root/d1
+  - op: mkcol
+    path: /remote.php/dav/files/admin/deep-root/d1/d2
+  - op: mkcol
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3
+  - op: mkcol
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/d4
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/f00.txt
+    body: "file 0\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/f01.txt
+    body: "file 1\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/f02.txt
+    body: "file 2\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/f03.txt
+    body: "file 3\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/f04.txt
+    body: "file 4\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/f05.txt
+    body: "file 5\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/f06.txt
+    body: "file 6\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/f07.txt
+    body: "file 7\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/f08.txt
+    body: "file 8\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/f09.txt
+    body: "file 9\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/f10.txt
+    body: "file 10\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/f11.txt
+    body: "file 11\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/f12.txt
+    body: "file 12\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/f13.txt
+    body: "file 13\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/f14.txt
+    body: "file 14\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/f15.txt
+    body: "file 15\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/f16.txt
+    body: "file 16\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/f17.txt
+    body: "file 17\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/f18.txt
+    body: "file 18\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/f19.txt
+    body: "file 19\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/f20.txt
+    body: "file 20\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/f21.txt
+    body: "file 21\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/f22.txt
+    body: "file 22\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/f23.txt
+    body: "file 23\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/f24.txt
+    body: "file 24\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/f25.txt
+    body: "file 25\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/f26.txt
+    body: "file 26\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/f27.txt
+    body: "file 27\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/f28.txt
+    body: "file 28\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/f29.txt
+    body: "file 29\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/f30.txt
+    body: "file 30\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/f31.txt
+    body: "file 31\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/f32.txt
+    body: "file 32\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/f33.txt
+    body: "file 33\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/f34.txt
+    body: "file 34\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/f35.txt
+    body: "file 35\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/f36.txt
+    body: "file 36\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/f37.txt
+    body: "file 37\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/f38.txt
+    body: "file 38\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/f39.txt
+    body: "file 39\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/d4/f40.txt
+    body: "file 40\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/d4/f41.txt
+    body: "file 41\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/d4/f42.txt
+    body: "file 42\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/d4/f43.txt
+    body: "file 43\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/d4/f44.txt
+    body: "file 44\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/d4/f45.txt
+    body: "file 45\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/d4/f46.txt
+    body: "file 46\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/d4/f47.txt
+    body: "file 47\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/d4/f48.txt
+    body: "file 48\n"
+  - op: put
+    path: /remote.php/dav/files/admin/deep-root/d1/d2/d3/d4/f49.txt
+    body: "file 49\n"
+  - op: delete
+    path: /remote.php/dav/files/admin/deep-root

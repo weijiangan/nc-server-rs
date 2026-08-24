@@ -1,0 +1,41 @@
+# Phase-24 perf probe — MOVE a populated directory.
+# Exercises the set-based subtree rekey (row::rekey_subtree_paths) where the
+# old per-row SELECT+UPDATE loop was replaced by one bulk UPDATE on Postgres.
+# A single-file MOVE (scenario 12) does not trigger the descendant rekey;
+# this one carries 5 files + 1 nested dir (3 files) = 8 descendant rows.
+name: 31_move_dir_subtree
+ops:
+  - op: mkcol
+    path: /remote.php/dav/files/admin/subtree-src
+  - op: put
+    path: /remote.php/dav/files/admin/subtree-src/a.txt
+    body: "a\n"
+  - op: put
+    path: /remote.php/dav/files/admin/subtree-src/b.txt
+    body: "bb\n"
+  - op: put
+    path: /remote.php/dav/files/admin/subtree-src/c.txt
+    body: "ccc\n"
+  - op: put
+    path: /remote.php/dav/files/admin/subtree-src/d.txt
+    body: "dddd\n"
+  - op: put
+    path: /remote.php/dav/files/admin/subtree-src/e.txt
+    body: "eeeee\n"
+  - op: mkcol
+    path: /remote.php/dav/files/admin/subtree-src/inner
+  - op: put
+    path: /remote.php/dav/files/admin/subtree-src/inner/f.txt
+    body: "ffffff\n"
+  - op: put
+    path: /remote.php/dav/files/admin/subtree-src/inner/g.txt
+    body: "ggggggg\n"
+  - op: put
+    path: /remote.php/dav/files/admin/subtree-src/inner/h.txt
+    body: "hhhhhhhh\n"
+  - op: move
+    from: /remote.php/dav/files/admin/subtree-src
+    to: /remote.php/dav/files/admin/subtree-dst
+cleanup:
+  - op: delete
+    path: /remote.php/dav/files/admin/subtree-dst

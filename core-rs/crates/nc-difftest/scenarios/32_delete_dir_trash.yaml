@@ -1,0 +1,37 @@
+# Phase-24 perf probe — DELETE a populated directory to trash.
+# Exercises the set-based descendant rekey into the trash prefix
+# (trashbin.rs trash_directory -> row::rekey_subtree_paths) and the
+# batched trash_versions filecache UPDATE (24.5). Same populated shape
+# as 31_move_dir_subtree so the two are directly comparable.
+name: 32_delete_dir_trash
+ops:
+  - op: mkcol
+    path: /remote.php/dav/files/admin/trash-src
+  - op: put
+    path: /remote.php/dav/files/admin/trash-src/a.txt
+    body: "a\n"
+  - op: put
+    path: /remote.php/dav/files/admin/trash-src/b.txt
+    body: "bb\n"
+  - op: put
+    path: /remote.php/dav/files/admin/trash-src/c.txt
+    body: "ccc\n"
+  - op: put
+    path: /remote.php/dav/files/admin/trash-src/d.txt
+    body: "dddd\n"
+  - op: put
+    path: /remote.php/dav/files/admin/trash-src/e.txt
+    body: "eeeee\n"
+  - op: mkcol
+    path: /remote.php/dav/files/admin/trash-src/inner
+  - op: put
+    path: /remote.php/dav/files/admin/trash-src/inner/f.txt
+    body: "ffffff\n"
+  - op: put
+    path: /remote.php/dav/files/admin/trash-src/inner/g.txt
+    body: "ggggggg\n"
+  - op: put
+    path: /remote.php/dav/files/admin/trash-src/inner/h.txt
+    body: "hhhhhhhh\n"
+  - op: delete
+    path: /remote.php/dav/files/admin/trash-src
