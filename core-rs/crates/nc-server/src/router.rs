@@ -466,6 +466,16 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
         .route("/dav", axum::routing::any(dav_arbiter_handler))
         .route("/dav/", axum::routing::any(dav_arbiter_handler))
         .route("/dav/{*path}", axum::routing::any(dav_arbiter_handler))
+        // Direct-download tokens (Phase 7.6): `POST /ocs/v2.php/.../direct`
+        // mints a token, then the client streams `GET /remote.php/direct/{token}`.
+        // Rust serves the hot DAV files tree natively; this cold token path is
+        // delegated to PHP-FPM, which resolves `oc_directlink` through
+        // DirectHome/DirectFile (incl. the view-only event) and streams the file.
+        .route("/remote.php/direct", axum::routing::any(php_fpm_fallback))
+        .route(
+            "/remote.php/direct/{*path}",
+            axum::routing::any(php_fpm_fallback),
+        )
         // Static PHP-FPM routes — always forwarded regardless of registry
         .route("/public.php/{*path}", axum::routing::any(php_fpm_fallback))
         .route("/.well-known/{*path}", axum::routing::any(php_fpm_fallback))
@@ -559,6 +569,17 @@ mod tests {
         // Non-files remote.php paths (webdav alias etc.) → PHP.
         assert!(!dav_served_by_rust("/remote.php/webdav/test.txt", "GET"));
         assert!(!dav_served_by_rust("/index.php/apps/files", "GET"));
+    }
+
+    /// `/remote.php/direct` is a cold, PHP-owned token path — Rust must not
+    /// claim it natively.  The router registers it as `php_fpm_fallback`
+    /// (see `build`), so this guard only needs to assert the classification
+    /// stays out of the native DAV tree; the fallback route itself is covered
+    /// by the exact route registration below.
+    #[test]
+    fn dav_served_by_rust_direct_is_not_native() {
+        assert!(!dav_served_by_rust("/remote.php/direct/token123", "GET"));
+        assert!(!dav_served_by_rust("/remote.php/direct/", "GET"));
     }
 
     /// Build a config whose `apps_paths` contains one entry per url.
