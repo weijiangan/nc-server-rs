@@ -224,6 +224,23 @@ pub fn session_cookie_value<'a>(instanceid: &str, cookies: &'a str) -> Option<&'
     }
 }
 
+/// Whether the remember-me login cookies are all present.
+///
+/// PHP's `OC::handleLogin()` (base.php:1225-1249) re-logs-in a request with
+/// the remember-me path only when ALL THREE of `nc_username`, `nc_token`,
+/// and `nc_session_id` are set (base.php:1239-1242).  The Rust auth
+/// middleware uses this to decide whether a failed `__session_resolve` is
+/// definitive: a read-only resolve (`login = false`, proxied path) that
+/// fails while remember-me is present must NOT be negative-cached, because
+/// the real PHP request that follows will attempt the remember-me login and
+/// may succeed — caching the failure masks that re-login for the negative
+/// TTL and 401s the next Rust-native DAV request (live incident 2026-09-02).
+pub fn has_remember_me_cookies(cookies: &str) -> bool {
+    cookie_value(cookies, "nc_username").is_some()
+        && cookie_value(cookies, "nc_token").is_some()
+        && cookie_value(cookies, "nc_session_id").is_some()
+}
+
 /// Resolved identity from a PHP session.
 ///
 /// Populated by the FastCGI `__session_resolve` endpoint (Phase 7.9.3) after
@@ -377,6 +394,42 @@ mod tests {
     fn session_cookie_value_returns_none_when_both_absent() {
         let cookies = "nc_session_id=sid; foo=bar";
         assert_eq!(session_cookie_value("oc1abc", cookies), None);
+    }
+
+    // ── has_remember_me_cookies ────────────────────────────────────────────
+
+    /// All three remember-me cookies present → true.
+    #[test]
+    fn remember_me_present_with_all_three() {
+        let cookies =
+            "nc_username=alice; nc_token=tok123; nc_session_id=sid123; nc_sameSiteCookielax=true";
+        assert!(has_remember_me_cookies(cookies));
+    }
+
+    /// Missing any one of the three → false (PHP's remember-me branch needs
+    /// all three; base.php:1241-1245).
+    #[test]
+    fn remember_me_missing_username() {
+        let cookies = "nc_token=tok123; nc_session_id=sid123";
+        assert!(!has_remember_me_cookies(cookies));
+    }
+
+    #[test]
+    fn remember_me_missing_token() {
+        let cookies = "nc_username=alice; nc_session_id=sid123";
+        assert!(!has_remember_me_cookies(cookies));
+    }
+
+    #[test]
+    fn remember_me_missing_session_id() {
+        let cookies = "nc_username=alice; nc_token=tok123";
+        assert!(!has_remember_me_cookies(cookies));
+    }
+
+    /// No remember-me cookies at all → false.
+    #[test]
+    fn remember_me_absent() {
+        assert!(!has_remember_me_cookies("oc1abc=somesessionid"));
     }
 
     // ── cookie_value (internal helper) ────────────────────────────────────

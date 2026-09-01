@@ -12,10 +12,10 @@ pub mod twofa;
 use nc_db::{db_dispatch, db_scalar_opt};
 
 pub use session::{
-    cache_evict_expired, cache_insert, cache_insert_negative, cache_lookup, make_cache_key,
-    new_session_cache, CacheLookup, SessionCache, SessionIdentity, SessionResolveResult,
-    SharedSessionCache, SESSION_CACHE_EVICT_INTERVAL, SESSION_CACHE_TTL,
-    SESSION_NEGATIVE_CACHE_TTL,
+    cache_evict_expired, cache_insert, cache_insert_negative, cache_lookup,
+    has_remember_me_cookies, make_cache_key, new_session_cache, CacheLookup, SessionCache,
+    SessionIdentity, SessionResolveResult, SharedSessionCache, SESSION_CACHE_EVICT_INTERVAL,
+    SESSION_CACHE_TTL, SESSION_NEGATIVE_CACHE_TTL,
 };
 pub use token::{new_token_cache, SharedTokenCache};
 

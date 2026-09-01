@@ -587,7 +587,11 @@ async fn session_auth(state: &AppState, cookie_header: &str, login: bool) -> Opt
         // expired session resolved within the last 5 s — is treated
         // exactly like a fresh failed resolution (anonymous) without
         // touching PHP-FPM.  This is what absorbs an attacker's
-        // request burst.
+        // request burst.  Negative entries are written only when the
+        // failure is definitive (see `should_cache_negative_resolve`):
+        // native-path resolves, or proxied resolves whose remember-me
+        // cookies are absent.  A proxied read-only resolve WITH the
+        // remember-me triple present never poisons the cache.
         nc_auth::CacheLookup::Negative => return None,
         nc_auth::CacheLookup::Miss => {
             // No PHP-FPM configured — nothing to resolve against.
@@ -635,16 +639,64 @@ async fn session_auth(state: &AppState, cookie_header: &str, login: bool) -> Opt
                 None => {
                     // PHP says the session is invalid or unauthenticated.
                     // Cache the negative result (5 s TTL) so a burst of
-                    // junk cookies hits memory, not FPM (F3) — and fall
-                    // through as anonymous; the route handler decides
-                    // whether to reject with 401.
-                    nc_auth::cache_insert_negative(session_cache, cache_key);
+                    // junk cookies hits memory, not FPM (F3) — but only
+                    // when the failure is DEFINITIVE.  Two cases are:
+                    //
+                    // - `login = true` (Rust-native path): this resolve is
+                    //   the request's only login chance, so the failure is
+                    //   final — cache it.
+                    // - remember-me cookies absent: the real PHP request
+                    //   (proxied paths, `login = false`) cannot re-login
+                    //   either — OC::handleLogin()'s remember-me branch
+                    //   requires all three of nc_username / nc_token /
+                    //   nc_session_id (base.php:1239-1242), so this failure
+                    //   is also final — cache it.
+                    //
+                    // A read-only resolve (`login = false`) with the
+                    // remember-me triple present must NOT be cached: the
+                    // real PHP request that follows re-runs handleLogin()
+                    // and may restore the session, but the negative entry
+                    // masks that for its TTL and 401s the next Rust-native
+                    // DAV request (live incident 2026-09-02: idle gap →
+                    // expired session → page-load resolve failed read-only
+                    // → 0 ms native PROPFIND 401 with a Basic-auth prompt).
+                    if should_cache_negative_resolve(
+                        login,
+                        nc_auth::session::has_remember_me_cookies(cookie_header),
+                    ) {
+                        nc_auth::cache_insert_negative(session_cache, cache_key);
+                    }
                     return None;
                 }
             }
         }
     };
     Some(SessionAuth { identity, set_cookies })
+}
+
+/// Whether a failed `__session_resolve` should be written to the negative
+/// session cache (F3, Wave 2.1).
+///
+/// A negative entry makes the cache report "anonymous" for its TTL without
+/// re-consulting PHP-FPM — the anti-abuse guarantee.  But caching a failure
+/// that the *real* PHP request could still recover from masks that recovery
+/// and turns it into a spurious 401:
+///
+/// - `login = true` (Rust-native path): the resolve is the request's only
+///   login chance; the failure is final — cache it.
+/// - `login = false` (proxied path) with the remember-me cookies absent:
+///   the real PHP request cannot re-login either (`OC::handleLogin()`'s
+///   remember-me branch needs all three of `nc_username` / `nc_token` /
+///   `nc_session_id`, base.php:1239-1242) — also final — cache it.
+/// - `login = false` with the remember-me triple present: the real PHP
+///   request re-runs `handleLogin()` and may restore the session, so the
+///   failure is NOT definitive — do not cache it (live incident 2026-09-02).
+///
+/// Extracted as a standalone function solely to allow unit testing without
+/// a live `AppState` or PHP-FPM socket — the logic is otherwise a boolean
+/// AND used exactly once in `session_auth`.
+fn should_cache_negative_resolve(login: bool, has_remember_me: bool) -> bool {
+    login || !has_remember_me
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────
@@ -880,6 +932,38 @@ mod tests {
             AuthMethod::Bearer => "Bearer",
             AuthMethod::Session => "Session",
         }
+    }
+
+    // ── should_cache_negative_resolve (2026-09-02) ─────────────────────────
+    //
+    // A failed `__session_resolve` is negative-cached only when the failure
+    // is definitive.  Live incident 2026-09-02: a proxied page-load resolve
+    // (`login = false`) failed read-only after an idle-gap session expiry,
+    // got negative-cached, and the next Rust-native DAV PROPFIND 401'd in
+    // 0 ms with a Basic-auth prompt — even though PHP's real request then
+    // restored the session via remember-me.  These pin the decision logic
+    // without a live FPM connection.
+
+    /// Native-path resolve (`login = true`) failure is definitive — cache.
+    #[test]
+    fn cache_negative_when_native_resolve_fails() {
+        assert!(should_cache_negative_resolve(true, true));
+        assert!(should_cache_negative_resolve(true, false));
+    }
+
+    /// Proxied read-only resolve with no remember-me cookies cannot recover
+    /// (PHP's remember-me branch needs all three cookies) — cache.
+    #[test]
+    fn cache_negative_when_proxied_and_no_remember_me() {
+        assert!(should_cache_negative_resolve(false, false));
+    }
+
+    /// Proxied read-only resolve WITH the remember-me triple present is not
+    /// definitive — the real PHP request may re-login — so do NOT cache.
+    /// This is the regression pin for the 2026-09-02 incident.
+    #[test]
+    fn no_cache_negative_when_proxied_with_remember_me() {
+        assert!(!should_cache_negative_resolve(false, true));
     }
 
     /// No `{instanceid}` cookie and no `nc_token` → the middleware treats the
