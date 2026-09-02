@@ -29,6 +29,9 @@ const CORE_MAX_AGE_SECS: u64 = 86400;
 pub enum RouteKind {
     /// `/core/preview` and `/core/preview.png` — `cacheFor(86400, private, immutable)`.
     Core,
+    /// `/apps/photos/api/v1/preview/{fileId}` — same `cacheFor(86400, private, immutable)`
+    /// policy as Core (`Photos\PreviewController::index` calls `cacheFor(3600*24, false, true)`).
+    Photos,
     /// `/apps/files/api/v1/thumbnail/{x}/{y}/{file}` — framework default (no `cacheFor`).
     FilesThumbnail,
 }
@@ -105,7 +108,7 @@ pub fn build_preview_response(
 ) -> PreviewResponse {
     let not_modified = is_not_modified(if_none_match, if_modified_since, etag_unquoted, mtime_unix);
     let (cache_control, expires) = match kind {
-        RouteKind::Core => (
+        RouteKind::Core | RouteKind::Photos => (
             CACHE_CORE.to_string(),
             Some(httpdate::fmt_http_date(
                 now + Duration::from_secs(CORE_MAX_AGE_SECS),
@@ -240,6 +243,28 @@ mod tests {
             Some(rfc7231(1_700_000_000 + 86400)).as_deref()
         );
         assert_eq!(r.content_length, 4096);
+    }
+
+    #[test]
+    fn photos_route_caches_24h_immutable() {
+        let r = build_preview_response(
+            RouteKind::Photos,
+            "image/jpeg",
+            "srcetag",
+            1_700_000_000,
+            "256-256.jpg",
+            4096,
+            None,
+            None,
+            fixed_now(),
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(r.content_type, "image/jpeg");
+        assert_eq!(r.cache_control, "private, max-age=86400, immutable");
+        assert_eq!(
+            r.expires.as_deref(),
+            Some(rfc7231(1_700_000_000 + 86400)).as_deref()
+        );
     }
 
     #[test]

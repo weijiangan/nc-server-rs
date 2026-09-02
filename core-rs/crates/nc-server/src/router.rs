@@ -87,8 +87,8 @@ pub(crate) fn static_prefixes_from_config(cfg: &NcConfig, nc_root: &std::path::P
     prefixes
 }
 
-/// Path prefixes where the edge SameSite gate applies — the Rust-native
-/// surface (every route whose handler is NOT `php_fpm_fallback`).
+/// Path prefixes where the edge SameSite gate applies — a subset of the
+/// Rust-native surface (every route whose handler is NOT `php_fpm_fallback`).
 ///
 /// PHP enforces the strict-cookie check in two layers:
 /// 1. `base.php` `performSameSiteCookieProtection` (base.php:560-611,
@@ -101,21 +101,25 @@ pub(crate) fn static_prefixes_from_config(cfg: &NcConfig, nc_root: &std::path::P
 /// Rust replicates layer 1 at the edge for the scripts it serves natively:
 /// remote.php (DAV), the OCS scripts, and the native index.php preview /
 /// thumbnail routes (PHP's middleware gates those too — none of the native
-/// handlers is `@NoCSRFRequired`).  Requests proxied to PHP-FPM are exempt
-/// on purpose — PHP's own pipeline decides there, with annotation knowledge
-/// the edge cannot have.  Gating a proxied index.php route 412s cross-site
-/// flows PHP passes: the OIDC login callback `/index.php/apps/user_oidc/code`
-/// is `#[NoCSRFRequired]` (the `state` param is the CSRF protection), and
-/// browsers withhold the SameSite=Strict guard cookie on the cross-site
-/// redirect from the identity provider — an edge gate would break every
-/// Safari OIDC login.
+/// handlers is `@NoCSRFRequired`).  The native Photos preview route is the
+/// deliberate exception: `Photos\PreviewController::index` is
+/// `@NoCSRFRequired`, so the edge must not gate it either.  Requests proxied
+/// to PHP-FPM are exempt on purpose — PHP's own pipeline decides there, with
+/// annotation knowledge the edge cannot have.  Gating a proxied index.php
+/// route 412s cross-site flows PHP passes: the OIDC login callback
+/// `/index.php/apps/user_oidc/code` is `#[NoCSRFRequired]` (the `state` param
+/// is the CSRF protection), and browsers withhold the SameSite=Strict guard
+/// cookie on the cross-site redirect from the identity provider — an edge gate
+/// would break every Safari OIDC login.
 ///
 /// Must be kept in sync with the native route registrations in [`build`]:
 /// /remote.php* (webdav, dav arbiter incl. uploads), /dav*, /ocs/v1.php,
 /// /ocs/v2.php (native OCS routes and the proxy catch-all — PHP gates the
 /// v1.php/v2.php scripts at base.php either way), and the native preview /
-/// thumbnail routes.  `/status.php` and `/heartbeat` are absent because
-/// `auth_check` returns before the gate for them.
+/// thumbnail routes — except `/apps/photos/api/v1/preview/{fileId}`, which is
+/// native but ungated because the Photos controller is `@NoCSRFRequired`.
+/// `/status.php` and `/heartbeat` are absent because `auth_check` returns
+/// before the gate for them.
 pub(crate) fn samesite_gated_prefixes() -> Vec<String> {
     vec![
         "/remote.php".to_string(),
@@ -422,6 +426,14 @@ pub fn build(state: AppState, php_routes: Vec<nc_fastcgi::RouteEntry>) -> Router
             "/index.php/apps/files/api/v1/thumbnail/{x}/{y}/{*file}",
             get(crate::preview::files_thumbnail),
         )
+        .route(
+            "/apps/photos/api/v1/preview/{file_id}",
+            get(crate::preview::photos_preview),
+        )
+        .route(
+            "/index.php/apps/photos/api/v1/preview/{file_id}",
+            get(crate::preview::photos_preview),
+        )
         // DAV (Phase 4) — native handlers; all mount points share the same
         // handler which resolves the strip prefix from the request path.
         //
@@ -699,12 +711,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The edge SameSite gate's scope must cover exactly the native surface:
-    /// remote.php (webdav + dav arbiter + uploads), the /dav alias, the OCS
-    /// scripts (native routes AND the proxy catch-all — PHP gates the
+    /// The edge SameSite gate's scope must cover exactly the gated native
+    /// surface: remote.php (webdav + dav arbiter + uploads), the /dav alias,
+    /// the OCS scripts (native routes AND the proxy catch-all — PHP gates the
     /// v1.php/v2.php scripts at base.php either way), and the native preview /
-    /// thumbnail routes.  Proxied index.php / app / public.php / login / root /
-    /// well-known paths are deliberately absent (PHP's annotation-aware
+    /// thumbnail routes except the Photos API (its controller is
+    /// `@NoCSRFRequired`).  Proxied index.php / app / public.php / login /
+    /// root / well-known paths are deliberately absent (PHP's annotation-aware
     /// middleware decides there).
     #[test]
     fn samesite_gated_prefixes_cover_the_native_surface() {
@@ -727,8 +740,12 @@ mod tests {
                 "{native} must be SameSite-gated"
             );
         }
-        for proxied in [
+        // Native-but-ungated (Photos `@NoCSRFRequired`) and proxied routes both
+        // defer the edge gate to PHP's annotation-aware middleware.
+        for ungated in [
             "/index.php/apps/user_oidc/code",
+            "/index.php/apps/photos/api/v1/preview/42",
+            "/apps/photos/api/v1/preview/42",
             "/index.php/login",
             "/index.php",
             "/public.php/webdav",
@@ -739,8 +756,8 @@ mod tests {
             "/ocs-provider/index.php",
         ] {
             assert!(
-                !prefixes.iter().any(|p| proxied.starts_with(p)),
-                "{proxied} must defer the SameSite gate to PHP"
+                !prefixes.iter().any(|p| ungated.starts_with(p)),
+                "{ungated} must defer the SameSite gate to PHP"
             );
         }
     }

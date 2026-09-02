@@ -1,6 +1,7 @@
 //! Native preview / thumbnail handlers (Phase 11.2 — "serve cache hits natively").
 //!
 //! Routes: `/core/preview` (by fileId), `/core/preview.png` (by path),
+//! `/apps/photos/api/v1/preview/{fileId}` (Photos grid), and
 //! `/apps/files/api/v1/thumbnail/{x}/{y}/{file}` (deprecated, crop forced).
 //!
 //! ## Design: fast-path hits, proxy everything else
@@ -20,7 +21,7 @@
 //! engages PHP's `isAvailable` gate before serving.
 
 use axum::{
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{header, HeaderName, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     Extension,
@@ -125,6 +126,52 @@ pub async fn preview_by_path(
         y,
         !a,
         mode,
+        inm,
+        ims,
+        req,
+    )
+    .await
+}
+
+/// `GET /apps/photos/api/v1/preview/{fileId}` — Photos grid per-photo preview
+/// (`Photos\PreviewController::index`).  Same cache-hit fast path as `/core/preview`
+/// (crop=false, fill), with every non-hit case delegated to PHP-FPM so the
+/// controller's album/share resolution and error bodies remain authoritative.
+pub async fn photos_preview(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthInfo>>,
+    Path(file_id): Path<String>,
+    req: Request,
+) -> Response {
+    let Ok(file_id) = file_id.parse::<i64>() else {
+        return proxy(&state, req).await;
+    };
+    let q = query_map(req.uri());
+    let x = q_i64(&q, "x", 32);
+    let y = q_i64(&q, "y", 32);
+    if x == 0 || y == 0 {
+        return proxy(&state, req).await;
+    }
+
+    let Some(uid) = auth.map(|e| e.0.uid) else {
+        return proxy(&state, req).await;
+    };
+    let Some(row) = resolve_by_id(&state, &uid, file_id).await else {
+        // Not the caller's own home-storage file → PHP resolves albums/shares and
+        // returns the correct 403/404.
+        return proxy(&state, req).await;
+    };
+    let inm = header_str(&req, header::IF_NONE_MATCH);
+    let ims = header_str(&req, header::IF_MODIFIED_SINCE);
+    serve_preview(
+        &state,
+        RouteKind::Photos,
+        row,
+        &uid,
+        x,
+        y,
+        false,
+        Mode::Fill,
         inm,
         ims,
         req,
@@ -366,6 +413,8 @@ fn build_304(pr: response::PreviewResponse) -> Response {
 fn not_found(kind: RouteKind) -> Response {
     match kind {
         RouteKind::Core => StatusCode::NOT_FOUND.into_response(),
+        // Photos' DataResponse renders `[]` with the framework default headers.
+        RouteKind::Photos => json_error(StatusCode::NOT_FOUND),
         RouteKind::FilesThumbnail => (
             StatusCode::NOT_FOUND,
             axum::Json(serde_json::json!({"message": "File not found."})),
@@ -378,6 +427,7 @@ fn forbidden(kind: RouteKind) -> Response {
     match kind {
         // Core maps NotPermitted → 403; files maps it → 404 JSON.
         RouteKind::Core => StatusCode::FORBIDDEN.into_response(),
+        RouteKind::Photos => json_error(StatusCode::FORBIDDEN),
         RouteKind::FilesThumbnail => not_found(kind),
     }
 }
@@ -385,6 +435,7 @@ fn forbidden(kind: RouteKind) -> Response {
 fn bad_request(kind: RouteKind) -> Response {
     match kind {
         RouteKind::Core => StatusCode::BAD_REQUEST.into_response(),
+        RouteKind::Photos => json_error(StatusCode::BAD_REQUEST),
         RouteKind::FilesThumbnail => (
             StatusCode::BAD_REQUEST,
             axum::Json(
@@ -393,6 +444,19 @@ fn bad_request(kind: RouteKind) -> Response {
         )
             .into_response(),
     }
+}
+
+/// Photos' `DataResponse([], $status)` — empty JSON array with the framework
+/// default `Cache-Control`/`X-Robots-Tag` headers (`JSONResponse::__construct`,
+/// `Response::getHeaders`).
+fn json_error(status: StatusCode) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+        .header("X-Robots-Tag", response::X_ROBOTS_TAG)
+        .body(axum::body::Body::from("[]"))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn proxy(state: &AppState, req: Request) -> Response {
@@ -513,9 +577,10 @@ mod tests {
     }
 
     /// The native preview routes must coexist with the PHP-FPM wildcard routes the
-    /// registry adds (`/apps/files/{*tail}`, and `/core/{*tail}` if `/core` is a
-    /// registry base).  Building the router panics on an ambiguous/duplicate route,
-    /// so this test guards the registration in `router::build`.
+    /// registry adds (`/apps/files/{*tail}`, `/apps/photos/{*tail}`, and
+    /// `/core/{*tail}` if `/core` is a registry base).  Building the router panics
+    /// on an ambiguous/duplicate route, so this test guards the registration in
+    /// `router::build`.
     #[test]
     fn native_routes_coexist_with_php_wildcards() {
         use axum::{routing::get, Router};
@@ -526,9 +591,15 @@ mod tests {
             .route("/core/preview", get(h))
             .route("/core/preview.png", get(h))
             .route("/apps/files/api/v1/thumbnail/{x}/{y}/{*file}", get(h))
+            .route("/apps/photos/api/v1/preview/{file_id}", get(h))
+            .route("/index.php/apps/photos/api/v1/preview/{file_id}", get(h))
             .route("/core/{*tail}", get(h))
             .route("/core", get(h))
             .route("/apps/files/{*tail}", get(h))
-            .route("/apps/files", get(h));
+            .route("/apps/files", get(h))
+            .route("/apps/photos/{*tail}", get(h))
+            .route("/apps/photos", get(h))
+            .route("/index.php/{*path}", get(h))
+            .route("/index.php", get(h));
     }
 }
